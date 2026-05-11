@@ -1,0 +1,168 @@
+//! Per-run state that lives inside the step payload between transitions.
+//!
+//! The runner is stateless across calls; everything it needs to advance
+//! the next step is serialized into [`ResearchState`] and returned via
+//! [`taquba_workflow::StepOutcome::Continue`].
+
+use std::collections::{BTreeMap, VecDeque};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+use crate::search::SearchResult;
+
+/// Configuration the user passes to a research run. All fields have
+/// sensible defaults via [`Default`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchConfig {
+    /// Number of sub-questions the planning step should decompose the
+    /// query into. The planner is free to return fewer if the query
+    /// doesn't warrant `depth` distinct sub-questions.
+    pub depth: usize,
+    /// Hard cap on URLs queued for fetching. Search results beyond this
+    /// cap are dropped before the fetch phase starts.
+    pub max_sources: usize,
+    /// Model identifier passed to Rig (provider-specific, e.g.
+    /// `"gpt-4o-mini"`).
+    pub model: String,
+    /// Maximum tokens per single LLM call.
+    pub max_tokens_per_call: u64,
+    /// Per-page text limit fed to the summarization step (UTF-8 chars).
+    /// Larger pages are truncated.
+    pub max_page_chars: usize,
+}
+
+impl Default for ResearchConfig {
+    fn default() -> Self {
+        Self {
+            depth: 6,
+            max_sources: 30,
+            model: "gpt-4o-mini".to_string(),
+            max_tokens_per_call: 4096,
+            max_page_chars: 16_000,
+        }
+    }
+}
+
+/// Lifecycle phase of a research run. Each step advances the state
+/// machine through these phases; some phases iterate (e.g. `Searching`
+/// pops one item off `search_queue` per step).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Phase {
+    /// Decomposing the user query into sub-questions via the LLM.
+    Planning,
+    /// Running the search backend once per sub-question.
+    Searching,
+    /// Fetching each unique URL via HTTP.
+    Fetching,
+    /// Summarizing each fetched page via the LLM.
+    Summarizing,
+    /// Combining per-page summaries into a single narrative via the LLM.
+    Synthesizing,
+    /// Writing the final markdown report via the LLM.
+    Writing,
+}
+
+/// Per-page fetched text, plus the title we'll use in citations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchedPage {
+    /// Best-effort page title (from `<title>` or the original search result).
+    pub title: String,
+    /// Extracted plain text, truncated to
+    /// [`ResearchConfig::max_page_chars`].
+    pub text: String,
+}
+
+/// Per-page summary produced by the summarization step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Summary {
+    /// Title carried forward from the fetched page.
+    pub title: String,
+    /// One-paragraph summary keyed to the user's query.
+    pub text: String,
+    /// LLM-assigned relevance score, 0.0–1.0.
+    pub relevance: f32,
+}
+
+/// The entire bytes-in / bytes-out state the runner threads between
+/// steps. Serialized as JSON so a `taquba-research show` against a future
+/// version can still decode old runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResearchState {
+    /// User query that started the run.
+    pub query: String,
+    /// Configuration captured at submission time.
+    pub config: ResearchConfig,
+    /// Current phase of the state machine.
+    pub phase: Phase,
+    /// Wall-clock instant the run was submitted (for `RunStats`).
+    pub started_at: DateTime<Utc>,
+    /// Monotonically counted steps the runner has executed, separate from
+    /// the workflow runtime's `step_number` (which counts queue
+    /// transitions including ones that returned `ContinueAfter`).
+    pub steps_completed: u32,
+    /// Sub-questions produced by the planning step.
+    pub sub_questions: Vec<String>,
+    /// Queue of sub-question indices yet to be searched.
+    pub search_queue: VecDeque<usize>,
+    /// Search results per sub-question (key = sub-question index).
+    pub search_results: BTreeMap<usize, Vec<SearchResult>>,
+    /// Queue of URLs yet to be fetched. Deduplicated against
+    /// `fetched.keys()` before insertion.
+    pub fetch_queue: VecDeque<Url>,
+    /// Successfully fetched pages keyed by URL.
+    pub fetched: BTreeMap<String, FetchedPage>,
+    /// Queue of URLs yet to be summarized.
+    pub summarize_queue: VecDeque<Url>,
+    /// Per-page summaries.
+    pub summaries: BTreeMap<String, Summary>,
+    /// Synthesized narrative produced by the synthesizing step.
+    pub synthesis: Option<String>,
+}
+
+impl ResearchState {
+    /// Build the initial state for a fresh run.
+    pub fn new(query: impl Into<String>, config: ResearchConfig) -> Self {
+        Self {
+            query: query.into(),
+            config,
+            phase: Phase::Planning,
+            started_at: Utc::now(),
+            steps_completed: 0,
+            sub_questions: Vec::new(),
+            search_queue: VecDeque::new(),
+            search_results: BTreeMap::new(),
+            fetch_queue: VecDeque::new(),
+            fetched: BTreeMap::new(),
+            summarize_queue: VecDeque::new(),
+            summaries: BTreeMap::new(),
+            synthesis: None,
+        }
+    }
+
+    /// Encode the state into the bytes carried as the step payload.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("ResearchState is serde-derivable")
+    }
+
+    /// Decode a state from a step payload.
+    pub fn from_bytes(bytes: &[u8]) -> serde_json::Result<Self> {
+        serde_json::from_slice(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_serde() {
+        let s = ResearchState::new("a query", ResearchConfig::default());
+        let bytes = s.to_bytes();
+        let back = ResearchState::from_bytes(&bytes).unwrap();
+        assert_eq!(back.query, "a query");
+        assert_eq!(back.phase, Phase::Planning);
+        assert_eq!(back.steps_completed, 0);
+    }
+}

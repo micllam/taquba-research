@@ -1,0 +1,57 @@
+[package]
+name = "taquba-research"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Durable Rust research agent built on Rig and taquba-workflow."
+repository = "https://github.com/micllam/taquba-research"
+homepage = "https://github.com/micllam/taquba-research"
+readme = "README.md"
+keywords = ["agent", "research", "rig", "taquba", "durable"]
+
+[features]
+# No cloud backend by default; the in-memory and local-disk stores work
+# without any feature. Pick exactly one for cloud builds. These mirror
+# taquba's mutually-exclusive cloud feature flags.
+default = []
+aws = ["taquba/aws"]
+gcp = ["taquba/gcp"]
+azure = ["taquba/azure"]
+
+[lib]
+name = "taquba_research"
+path = "src/lib.rs"
+
+[[bin]]
+name = "taquba-research"
+path = "src/bin/taquba_research.rs"
+
+[package.metadata.docs.rs]
+# Build docs with one cloud backend on so cloud-store wiring is visible
+# on docs.rs.
+features = ["aws"]
+
+[dependencies]
+taquba = "0.3"
+taquba-workflow = "0.2"
+rig-core = "0.36"
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+url = { version = "2", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+ulid = "1"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+anyhow = "1"
+dirs = "5"
+futures-util = { version = "0.3", default-features = false }
+schemars = "1"
+html2text = "0.17"
+
