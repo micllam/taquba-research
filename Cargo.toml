@@ -55,3 +55,9 @@ futures-util = { version = "0.3", default-features = false }
 schemars = "1"
 html2text = "0.17"
 
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` for
+# deterministic, non-real-time scheduling in tests that exercise
+# the runner's polling/timeout paths.
+tokio = { version = "1", features = ["test-util"] }
+

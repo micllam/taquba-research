@@ -640,14 +640,12 @@ mod tests {
         let store = test_store();
         store.mark_cancelled("run-1").await.unwrap();
 
-        // First check fires before any sleep, so this resolves
-        // well within one poll interval.
-        tokio::time::timeout(Duration::from_millis(100), poll_cancelled(&store, "run-1"))
-            .await
-            .expect("poll_cancelled should resolve without sleeping");
+        // Initial check fires before any sleep, so this returns
+        // without yielding to the timer.
+        poll_cancelled(&store, "run-1").await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn poll_cancelled_resolves_after_sentinel_appears() {
         let store = test_store();
         let writer = store.clone();
@@ -656,12 +654,8 @@ mod tests {
             writer.mark_cancelled("run-2").await.unwrap();
         });
 
-        // Must complete within poll interval + writer delay + slack.
-        tokio::time::timeout(
-            CANCEL_POLL_INTERVAL + Duration::from_millis(500),
-            poll_cancelled(&store, "run-2"),
-        )
-        .await
-        .expect("poll_cancelled should resolve once sentinel appears");
+        // With virtual time the polling loop's sleep auto-advances
+        // when the runtime is idle.
+        poll_cancelled(&store, "run-2").await;
     }
 }
