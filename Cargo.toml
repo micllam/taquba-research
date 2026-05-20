@@ -33,8 +33,8 @@ path = "src/bin/taquba_research.rs"
 features = ["aws"]
 
 [dependencies]
-taquba = "0.3"
-taquba-workflow = "0.2"
+taquba = "0.6"
+taquba-workflow = "0.4"
 rig-core = "0.37"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util"] }
