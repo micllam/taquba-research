@@ -487,7 +487,7 @@ async fn cmd_run(
     let (runtime, handles) = spawn_runtime(queue, runner);
 
     let input = ResearchStepRunner::initial_state(query.clone(), config);
-    let handle = runtime
+    let submit_outcome = runtime
         .submit(RunSpec {
             input,
             ..Default::default()
@@ -499,7 +499,7 @@ async fn cmd_run(
     // immediately and a process crash leaves a visible breadcrumb.
     let now = Utc::now();
     let entry = taquba_research::store::RunIndexEntry {
-        run_id: handle.run_id.clone(),
+        run_id: submit_outcome.run_id.clone(),
         query: query.clone(),
         submitted_at: now,
         status: taquba_research::store::RunIndexStatus::Running,
@@ -514,10 +514,18 @@ async fn cmd_run(
 
     println!(
         "Run {} started. (Ctrl+C to interrupt; resume with `taquba-research resume {}`)",
-        handle.run_id, handle.run_id
+        submit_outcome.run_id, submit_outcome.run_id
     );
 
-    finalize(cli, store_ctx, run_store, handles, &handle.run_id, &query).await
+    finalize(
+        cli,
+        store_ctx,
+        run_store,
+        handles,
+        &submit_outcome.run_id,
+        &query,
+    )
+    .await
 }
 
 async fn cmd_resume(

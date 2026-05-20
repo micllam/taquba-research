@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Re-export `taquba_workflow::SubmitOutcome` from the `workflow`
+  module, alongside the other types users need to call
+  `WorkflowRuntime::submit` directly.
+
 ### Changed
 - Bumped `rig-core` to 0.37. The crate's lib name changed from
   `rig` to `rig_core`.

@@ -139,6 +139,6 @@ pub use store::RunStore;
 pub mod workflow {
     pub use taquba_workflow::{
         NoopTerminalHook, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner,
-        TerminalHook, TerminalStatus, WorkflowRuntime,
+        SubmitOutcome, TerminalHook, TerminalStatus, WorkflowRuntime,
     };
 }

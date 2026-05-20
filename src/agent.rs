@@ -61,7 +61,7 @@ impl ResearchAgent {
         });
 
         let input = ResearchStepRunner::initial_state(query.clone(), self.config.clone());
-        let handle = runtime
+        runtime
             .submit(RunSpec {
                 input,
                 ..Default::default()
@@ -91,14 +91,12 @@ impl ResearchAgent {
                     .ok_or_else(|| anyhow!("succeeded RunRecord without report"))
             }
             TerminalStatus::Failed => {
-                let _ = handle;
                 bail!(
                     "research run failed: {}",
                     outcome.error.unwrap_or_else(|| "(no reason)".to_string())
                 );
             }
             TerminalStatus::Cancelled => {
-                let _ = handle;
                 bail!(
                     "research run cancelled: {}",
                     outcome.error.unwrap_or_else(|| "(no reason)".to_string())
