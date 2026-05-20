@@ -91,7 +91,7 @@ queue, so an S3-backed deployment keeps everything in one bucket.
 
 ```rust
 use std::sync::Arc;
-use rig::client::ProviderClient;
+use rig_core::client::ProviderClient;
 use taquba::{Queue, object_store::local::LocalFileSystem};
 use taquba_research::{ResearchAgent, ResearchConfig, search::Tavily};
 
@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let queue = Arc::new(Queue::open(store, "research").await?);
 
     let agent = ResearchAgent::builder()
-        .openai(rig::providers::openai::Client::from_env()?)
+        .openai(rig_core::providers::openai::Client::from_env()?)
         .search(Tavily::from_env()?)
         .config(ResearchConfig::default())
         .build()?;

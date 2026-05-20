@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use rig::client::CompletionClient;
-use rig::completion::{CompletionError, Prompt, PromptError, StructuredOutputError, TypedPrompt};
-use rig::http_client;
-use rig::providers::openai;
+use rig_core::client::CompletionClient;
+use rig_core::completion::{
+    CompletionError, Prompt, PromptError, StructuredOutputError, TypedPrompt,
+};
+use rig_core::http_client;
+use rig_core::providers::openai;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

@@ -19,7 +19,7 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use rig::client::ProviderClient;
+//! use rig_core::client::ProviderClient;
 //! use taquba::{Queue, object_store::local::LocalFileSystem};
 //! use taquba_research::{ResearchAgent, ResearchConfig, search::Tavily};
 //!
@@ -27,7 +27,7 @@
 //! let store = Arc::new(LocalFileSystem::new_with_prefix("./store")?);
 //! let queue = Arc::new(Queue::open(store, "taquba-research").await?);
 //!
-//! let rig = rig::providers::openai::Client::from_env()?;
+//! let rig = rig_core::providers::openai::Client::from_env()?;
 //!
 //! let agent = ResearchAgent::builder()
 //!     .openai(rig)

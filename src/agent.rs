@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rig::providers::openai;
+use rig_core::providers::openai;
 use taquba::Queue;
 use taquba_workflow::{RunOutcome, RunSpec, TerminalHook, TerminalStatus, WorkflowRuntime};
 use tokio::sync::Mutex;
