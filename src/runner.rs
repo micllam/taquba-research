@@ -45,10 +45,15 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// [`WorkflowRuntime`]: taquba_workflow::WorkflowRuntime
 #[derive(Clone)]
 pub struct ResearchStepRunner {
-    rig: Arc<openai::Client>,
+    provider: Arc<ProviderClient>,
     search: Arc<dyn SearchBackend>,
     http: reqwest::Client,
     run_store: Option<RunStore>,
+}
+
+/// Per-provider LLM client.
+enum ProviderClient {
+    OpenAI(openai::Client),
 }
 
 /// What the terminal hook persists for a finished run. Distinct from the
@@ -75,7 +80,7 @@ impl ResearchStepRunner {
             .build()
             .expect("reqwest client builder cannot fail with default config");
         Self {
-            rig: Arc::new(rig),
+            provider: Arc::new(ProviderClient::OpenAI(rig)),
             search,
             http,
             run_store: None,
@@ -424,32 +429,40 @@ impl ResearchStepRunner {
         })
     }
 
-    /// Run a single OpenAI completion via Rig.
+    /// Run a single completion via Rig, dispatched to the configured
+    /// provider.
     async fn llm_prompt(&self, prompt: &str, state: &ResearchState) -> Result<String, StepError> {
-        let agent = self
-            .rig
-            .agent(&state.config.model)
-            .preamble(AGENT_PREAMBLE)
-            .max_tokens(state.config.max_tokens_per_call)
-            .build();
-        agent.prompt(prompt).await.map_err(classify_rig_err)
+        match self.provider.as_ref() {
+            ProviderClient::OpenAI(client) => {
+                let agent = client
+                    .agent(&state.config.model)
+                    .preamble(AGENT_PREAMBLE)
+                    .max_tokens(state.config.max_tokens_per_call)
+                    .build();
+                agent.prompt(prompt).await.map_err(classify_rig_err)
+            }
+        }
     }
 
-    /// Run a structured completion via Rig's `prompt_typed`.
+    /// Run a structured completion via Rig's `prompt_typed`, dispatched
+    /// to the configured provider.
     async fn llm_prompt_typed<T>(&self, prompt: &str, state: &ResearchState) -> Result<T, StepError>
     where
         T: JsonSchema + DeserializeOwned + Send + 'static,
     {
-        let agent = self
-            .rig
-            .agent(&state.config.model)
-            .preamble(AGENT_PREAMBLE)
-            .max_tokens(state.config.max_tokens_per_call)
-            .build();
-        agent
-            .prompt_typed::<T>(prompt)
-            .await
-            .map_err(classify_structured_err)
+        match self.provider.as_ref() {
+            ProviderClient::OpenAI(client) => {
+                let agent = client
+                    .agent(&state.config.model)
+                    .preamble(AGENT_PREAMBLE)
+                    .max_tokens(state.config.max_tokens_per_call)
+                    .build();
+                agent
+                    .prompt_typed::<T>(prompt)
+                    .await
+                    .map_err(classify_structured_err)
+            }
+        }
     }
 }
 
