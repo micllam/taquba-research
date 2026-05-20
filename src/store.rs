@@ -14,8 +14,9 @@
 //!   [`RunIndexEntry`](crate::store::RunIndexEntry): query, status, and
 //!   the rendered [`crate::Report`] once the run finishes.
 //! - `<store>/runs/<run_id>.cancel`: sentinel object written by the
-//!   `cancel` command. The runner checks for it at the top of every
-//!   step and fails the run with `Cancelled` if present.
+//!   `cancel` command. The runner polls for it concurrently with the
+//!   in-flight phase work and fails the run with `Cancelled` once it
+//!   appears.
 
 use std::sync::Arc;
 

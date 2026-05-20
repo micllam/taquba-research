@@ -31,6 +31,10 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Preamble applied to every Rig agent built by the runner. Kept
 /// terse: the per-phase prompts carry the task-specific instructions.
 const AGENT_PREAMBLE: &str = "Be precise and concise.";
+/// Cadence at which a step polls its cancellation sentinel while
+/// phase work is in flight. Sets the upper bound on how long an LLM
+/// or HTTP call keeps running after the CLI's `cancel` lands.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Drives a research run through plan -> search -> fetch -> summarize ->
 /// synthesize -> write phases.
@@ -78,8 +82,11 @@ impl ResearchStepRunner {
         }
     }
 
-    /// Attach a [`RunStore`] used to check cancellation sentinels at the
-    /// start of each step. When unset, the runner ignores cancellation.
+    /// Attach a [`RunStore`] used to check cancellation sentinels
+    /// throughout each step. The runner polls the sentinel concurrently
+    /// with the phase work, so a long-running LLM or HTTP call is
+    /// dropped within ~1 second of the sentinel appearing. When unset,
+    /// the runner ignores cancellation.
     pub fn with_run_store(mut self, store: RunStore) -> Self {
         self.run_store = Some(store);
         self
@@ -101,28 +108,57 @@ impl StepRunner for ResearchStepRunner {
         let mut state = ResearchState::from_bytes(&step.payload)
             .map_err(|e| StepError::permanent(format!("malformed research state: {e}")))?;
 
-        // Cancellation gate: cross-process cancellation via a sentinel
-        // object the CLI writes. The CLI's `cancel` subcommand runs in
-        // a separate process from the worker, so the runtime's
-        // in-process registry doesn't contain the run. We keep the
-        // sentinel for that cross-process path and translate it into
-        // the `Cancel` outcome.
-        if let Some(store) = &self.run_store
-            && store.is_cancelled(&step.run_id).await
-        {
-            return Ok(StepOutcome::Cancel {
-                reason: "Cancelled by user".to_string(),
-            });
+        // Cross-process cancellation: the CLI's `cancel` subcommand
+        // writes a sentinel object the runner watches for. The
+        // workflow runtime's in-process registry doesn't see the
+        // cross-process cancel, so we surface it as `StepOutcome::Cancel`
+        // here. The watcher races the phase work, so a long LLM or HTTP
+        // call is dropped within `CANCEL_POLL_INTERVAL` of the sentinel
+        // appearing instead of blocking until the call completes.
+        let work = self.dispatch_phase(step, &mut state);
+        match &self.run_store {
+            Some(store) => {
+                tokio::select! {
+                    res = work => res,
+                    () = poll_cancelled(store, &step.run_id) => Ok(StepOutcome::Cancel {
+                        reason: "Cancelled by user".to_string(),
+                    }),
+                }
+            }
+            None => work.await,
         }
+    }
+}
 
+/// Resolves when the run's cancellation sentinel appears. Polls at
+/// [`CANCEL_POLL_INTERVAL`] cadence; the initial check fires immediately
+/// so an already-cancelled run short-circuits before any phase work runs.
+async fn poll_cancelled(store: &RunStore, run_id: &str) {
+    loop {
+        if store.is_cancelled(run_id).await {
+            return;
+        }
+        tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+    }
+}
+
+impl ResearchStepRunner {
+    /// Runs the phase indicated by `state.phase` and returns the
+    /// resulting `StepOutcome`. Separated from `run_step` so it can be
+    /// raced against the cancellation watcher via `tokio::select!`.
+    async fn dispatch_phase(
+        &self,
+        step: &Step,
+        state: &mut ResearchState,
+    ) -> Result<StepOutcome, StepError> {
         match state.phase {
-            Phase::Planning => self.run_planning(&mut state).await?,
-            Phase::Searching => self.run_searching(&mut state).await?,
-            Phase::Fetching => self.run_fetching(&mut state).await?,
-            Phase::Summarizing => self.run_summarizing(&mut state).await?,
-            Phase::Synthesizing => self.run_synthesizing(&mut state).await?,
+            Phase::Planning => self.run_planning(state).await?,
+            Phase::Searching => self.run_searching(state).await?,
+            Phase::Fetching => self.run_fetching(state).await?,
+            Phase::Summarizing => self.run_summarizing(state).await?,
+            Phase::Synthesizing => self.run_synthesizing(state).await?,
             Phase::Writing => {
-                let report = self.run_writing(&state, &step.run_id).await?;
+                let report = self.run_writing(state, &step.run_id).await?;
                 let record = RunRecord {
                     report: Some(report),
                     run_id: step.run_id.clone(),
@@ -139,9 +175,7 @@ impl StepRunner for ResearchStepRunner {
             payload: state.to_bytes(),
         })
     }
-}
 
-impl ResearchStepRunner {
     async fn run_planning(&self, state: &mut ResearchState) -> Result<(), StepError> {
         tracing::info!("planning sub-questions");
         let prompt = format!(
@@ -584,6 +618,12 @@ fn extract_tag_content(html: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use taquba::object_store::memory::InMemory;
+    use taquba::object_store::path::Path;
+
+    fn test_store() -> RunStore {
+        RunStore::new(Arc::new(InMemory::new()), &Path::default())
+    }
 
     #[test]
     fn extract_html_yields_title_and_visible_body() {
@@ -593,5 +633,35 @@ mod tests {
         assert_eq!(title, "Hi");
         assert!(text.contains("Hello & welcome"));
         assert!(!text.contains("alert"));
+    }
+
+    #[tokio::test]
+    async fn poll_cancelled_returns_immediately_if_already_cancelled() {
+        let store = test_store();
+        store.mark_cancelled("run-1").await.unwrap();
+
+        // First check fires before any sleep, so this resolves
+        // well within one poll interval.
+        tokio::time::timeout(Duration::from_millis(100), poll_cancelled(&store, "run-1"))
+            .await
+            .expect("poll_cancelled should resolve without sleeping");
+    }
+
+    #[tokio::test]
+    async fn poll_cancelled_resolves_after_sentinel_appears() {
+        let store = test_store();
+        let writer = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            writer.mark_cancelled("run-2").await.unwrap();
+        });
+
+        // Must complete within poll interval + writer delay + slack.
+        tokio::time::timeout(
+            CANCEL_POLL_INTERVAL + Duration::from_millis(500),
+            poll_cancelled(&store, "run-2"),
+        )
+        .await
+        .expect("poll_cancelled should resolve once sentinel appears");
     }
 }
