@@ -110,6 +110,8 @@ async fn main() -> anyhow::Result<()> {
 
     let agent = ResearchAgent::builder()
         .openai(rig_core::providers::openai::Client::from_env()?)
+        // ...or .anthropic(rig_core::providers::anthropic::Client::from_env()?)
+        //       and a matching model id, e.g. "claude-haiku-4-5"
         .search(Tavily::from_env()?)
         .config(ResearchConfig::new("gpt-4o-mini"))
         .build()?;

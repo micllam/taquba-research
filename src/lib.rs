@@ -42,6 +42,8 @@
 //!
 //! let rig = rig_core::providers::openai::Client::from_env()?;
 //!
+//! // ...or .anthropic(rig_core::providers::anthropic::Client::from_env()?)
+//! //       paired with a matching model id (e.g. "claude-haiku-4-5").
 //! let agent = ResearchAgent::builder()
 //!     .openai(rig)
 //!     .search(Tavily::from_env()?)
