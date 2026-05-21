@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ANTHROPIC_API_KEY` alone selects Anthropic; otherwise OpenAI. The
   `--model` flag becomes optional and defaults to a
   provider-appropriate identifier when unset.
+- Per-run token usage tracking. Every LLM call's `Usage` (input,
+  output, total, cached-input, cache-creation, reasoning tokens) is
+  logged at info level and accumulated into
+  `ResearchState::token_usage` (persisted as part of the durable
+  state so resumes don't lose the running tally) and the final
+  `RunStats::token_usage`. The rendered report's stats line now
+  includes a `tokens: <in> in / <out> out / <total>` suffix when the
+  provider reported usage. New public type
+  [`TokenUsage`](struct.TokenUsage.html).
 
 ### Removed
 - **Breaking:** `ResearchStepRunner::new` is renamed to

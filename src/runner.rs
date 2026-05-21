@@ -8,7 +8,7 @@ use std::time::Duration;
 use chrono::Utc;
 use rig_core::client::CompletionClient;
 use rig_core::completion::{
-    CompletionError, Prompt, PromptError, StructuredOutputError, TypedPrompt,
+    CompletionError, Prompt, PromptError, StructuredOutputError, TypedPrompt, Usage,
 };
 use rig_core::http_client;
 use rig_core::providers::{anthropic, openai};
@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::report::{Citation, Report, RunStats, render_markdown};
 use crate::search::{SearchBackend, SearchError};
-use crate::state::{FetchedPage, Phase, ResearchConfig, ResearchState, Summary};
+use crate::state::{FetchedPage, Phase, ResearchConfig, ResearchState, Summary, TokenUsage};
 use crate::store::RunStore;
 
 /// Maximum bytes we'll read from a single fetch response, before
@@ -381,7 +381,11 @@ impl ResearchStepRunner {
         Ok(())
     }
 
-    async fn run_writing(&self, state: &ResearchState, run_id: &str) -> Result<Report, StepError> {
+    async fn run_writing(
+        &self,
+        state: &mut ResearchState,
+        run_id: &str,
+    ) -> Result<Report, StepError> {
         tracing::info!("writing final report");
         let synthesis = state.synthesis.clone().unwrap_or_default();
 
@@ -427,6 +431,7 @@ impl ResearchStepRunner {
             wall_time,
             started_at: state.started_at,
             finished_at,
+            token_usage: state.token_usage,
         };
 
         let markdown = render_markdown(&state.query, run_id, &body, &citations, &stats);
@@ -440,16 +445,25 @@ impl ResearchStepRunner {
     }
 
     /// Run a single completion via Rig, dispatched to the configured
-    /// provider.
-    async fn llm_prompt(&self, prompt: &str, state: &ResearchState) -> Result<String, StepError> {
-        match self.provider.as_ref() {
+    /// provider. Records this call's token usage on `state.token_usage`
+    /// and logs the per-call counts at info level.
+    async fn llm_prompt(
+        &self,
+        prompt: &str,
+        state: &mut ResearchState,
+    ) -> Result<String, StepError> {
+        let response = match self.provider.as_ref() {
             ProviderClient::OpenAi(client) => {
                 let agent = client
                     .agent(&state.config.model)
                     .preamble(AGENT_PREAMBLE)
                     .max_tokens(state.config.max_tokens_per_call)
                     .build();
-                agent.prompt(prompt).await.map_err(classify_rig_err)
+                agent
+                    .prompt(prompt)
+                    .extended_details()
+                    .await
+                    .map_err(classify_rig_err)?
             }
             ProviderClient::Anthropic(client) => {
                 let agent = client
@@ -457,28 +471,41 @@ impl ResearchStepRunner {
                     .preamble(AGENT_PREAMBLE)
                     .max_tokens(state.config.max_tokens_per_call)
                     .build();
-                agent.prompt(prompt).await.map_err(classify_rig_err)
+                agent
+                    .prompt(prompt)
+                    .extended_details()
+                    .await
+                    .map_err(classify_rig_err)?
             }
-        }
+        };
+        record_usage(&mut state.token_usage, &response.usage);
+        Ok(response.output)
     }
 
     /// Run a structured completion via Rig's `prompt_typed`, dispatched
-    /// to the configured provider.
-    async fn llm_prompt_typed<T>(&self, prompt: &str, state: &ResearchState) -> Result<T, StepError>
+    /// to the configured provider. Same usage-tracking behaviour as
+    /// [`Self::llm_prompt`].
+    async fn llm_prompt_typed<T>(
+        &self,
+        prompt: &str,
+        state: &mut ResearchState,
+    ) -> Result<T, StepError>
     where
         T: JsonSchema + DeserializeOwned + Send + 'static,
     {
-        match self.provider.as_ref() {
+        let (output, usage) = match self.provider.as_ref() {
             ProviderClient::OpenAi(client) => {
                 let agent = client
                     .agent(&state.config.model)
                     .preamble(AGENT_PREAMBLE)
                     .max_tokens(state.config.max_tokens_per_call)
                     .build();
-                agent
+                let response = agent
                     .prompt_typed::<T>(prompt)
+                    .extended_details()
                     .await
-                    .map_err(classify_structured_err)
+                    .map_err(classify_structured_err)?;
+                (response.output, response.usage)
             }
             ProviderClient::Anthropic(client) => {
                 let agent = client
@@ -486,13 +513,40 @@ impl ResearchStepRunner {
                     .preamble(AGENT_PREAMBLE)
                     .max_tokens(state.config.max_tokens_per_call)
                     .build();
-                agent
+                let response = agent
                     .prompt_typed::<T>(prompt)
+                    .extended_details()
                     .await
-                    .map_err(classify_structured_err)
+                    .map_err(classify_structured_err)?;
+                (response.output, response.usage)
             }
-        }
+        };
+        record_usage(&mut state.token_usage, &usage);
+        Ok(output)
     }
+}
+
+/// Accumulate one call's `Usage` into the run-aggregate `TokenUsage`,
+/// logging the per-call counts at info level.
+fn record_usage(total: &mut TokenUsage, call: &Usage) {
+    tracing::info!(
+        input = call.input_tokens,
+        output = call.output_tokens,
+        total = call.total_tokens,
+        cached_input = call.cached_input_tokens,
+        reasoning = call.reasoning_tokens,
+        "LLM call usage",
+    );
+    total.input_tokens = total.input_tokens.saturating_add(call.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(call.output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(call.total_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(call.cached_input_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(call.cache_creation_input_tokens);
+    total.reasoning_tokens = total.reasoning_tokens.saturating_add(call.reasoning_tokens);
 }
 
 /// Classify a Rig prompt error as transient or permanent.

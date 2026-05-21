@@ -7,6 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::state::TokenUsage;
+
 /// Final result of a successful research run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
@@ -49,6 +51,8 @@ pub struct RunStats {
     pub started_at: DateTime<Utc>,
     /// UTC instant the terminal hook fired.
     pub finished_at: DateTime<Utc>,
+    /// Aggregate token usage across every LLM call in the run.
+    pub token_usage: TokenUsage,
 }
 
 mod duration_secs {
@@ -83,9 +87,10 @@ pub(crate) fn render_markdown(
         stats.finished_at.to_rfc3339()
     ));
     out.push_str(&format!(
-        "**Stats:** {} steps · {}\n\n",
+        "**Stats:** {} steps · {}{}\n\n",
         stats.steps_completed,
         format_duration(stats.wall_time),
+        format_tokens(&stats.token_usage),
     ));
     out.push_str("---\n\n");
     out.push_str(body.trim());
@@ -98,6 +103,19 @@ pub(crate) fn render_markdown(
         }
     }
     out
+}
+
+/// Render a compact " · tokens: <in> in / <out> out / <total>" suffix
+/// for the stats line. Returns an empty string when no provider
+/// reported usage (all-zero `TokenUsage`).
+fn format_tokens(u: &TokenUsage) -> String {
+    if u.is_zero() {
+        return String::new();
+    }
+    format!(
+        " · tokens: {} in / {} out / {} total",
+        u.input_tokens, u.output_tokens, u.total_tokens
+    )
 }
 
 fn format_duration(d: Duration) -> String {

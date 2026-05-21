@@ -53,6 +53,38 @@ impl ResearchConfig {
     }
 }
 
+/// Aggregate token usage across every LLM call in a run. Mirrors the
+/// fields of `rig_core::completion::Usage` but lives in this crate
+/// so the on-disk JSON layout of the persisted run state doesn't
+/// depend on Rig's struct definition. All zeros means either "no
+/// calls yet" or "the provider didn't report usage."
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Sum of input ("prompt") tokens reported across all calls.
+    pub input_tokens: u64,
+    /// Sum of output ("completion") tokens reported across all calls.
+    pub output_tokens: u64,
+    /// Sum of provider-reported `total_tokens` across all calls. Some
+    /// providers report only this aggregate.
+    pub total_tokens: u64,
+    /// Input tokens read from a provider-managed prompt cache.
+    pub cached_input_tokens: u64,
+    /// Input tokens written into a provider-managed prompt cache.
+    pub cache_creation_input_tokens: u64,
+    /// Tokens consumed by internal reasoning / "thinking" by
+    /// reasoning-capable models.
+    pub reasoning_tokens: u64,
+}
+
+impl TokenUsage {
+    /// `true` when all fields are zero. Means either no LLM calls
+    /// have been recorded yet or the provider didn't report usage
+    /// for any of them.
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Lifecycle phase of a research run. Each step advances the state
 /// machine through these phases; some phases iterate (e.g. `Searching`
 /// pops one item off `search_queue` per step).
@@ -127,6 +159,8 @@ pub struct ResearchState {
     pub summaries: BTreeMap<String, Summary>,
     /// Synthesized narrative produced by the synthesizing step.
     pub synthesis: Option<String>,
+    /// Aggregate token usage across every LLM call made by this run.
+    pub token_usage: TokenUsage,
 }
 
 impl ResearchState {
@@ -146,6 +180,7 @@ impl ResearchState {
             summarize_queue: VecDeque::new(),
             summaries: BTreeMap::new(),
             synthesis: None,
+            token_usage: TokenUsage::default(),
         }
     }
 

@@ -144,7 +144,7 @@ pub mod store;
 pub use agent::{ResearchAgent, ResearchAgentBuilder};
 pub use report::{Citation, Report, RunStats};
 pub use runner::{ResearchStepRunner, RunRecord};
-pub use state::ResearchConfig;
+pub use state::{ResearchConfig, TokenUsage};
 pub use store::RunStore;
 
 /// Re-exports of the workflow runtime types most users will need to wire a
