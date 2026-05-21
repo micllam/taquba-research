@@ -158,6 +158,7 @@ pub struct ResearchState {
     /// Per-page summaries.
     pub summaries: BTreeMap<String, Summary>,
     /// Synthesized narrative produced by the synthesizing step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthesis: Option<String>,
     /// Aggregate token usage across every LLM call made by this run.
     pub token_usage: TokenUsage,

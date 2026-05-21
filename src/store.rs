@@ -40,8 +40,10 @@ pub struct RunIndexEntry {
     /// Lifecycle status of the run.
     pub status: RunIndexStatus,
     /// Rendered report (`Some` once `status == Succeeded`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<Report>,
     /// Failure reason (`Some` once `status == Failed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Last instant the index entry was rewritten.
     pub updated_at: DateTime<Utc>,

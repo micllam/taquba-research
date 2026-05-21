@@ -65,6 +65,7 @@ pub(crate) enum ProviderClient {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     /// Final report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<Report>,
     /// Run identifier.
     pub run_id: String,
