@@ -51,11 +51,18 @@ The mapping helpers in `runner.rs` — `classify_rig_err`, `classify_structured_
 
 `taquba-workflow` reserves `workflow.*` on step-job headers. Use a different namespace (e.g. `research.*`) for custom headers; submission with reserved keys fails at `WorkflowRuntime::submit`.
 
+## LLM providers
+
+OpenAI and Anthropic dispatch through the internal `ProviderClient` enum in `runner.rs`; both are compiled in unconditionally (Rig doesn't feature-gate providers, so neither do we). The CLI's `--provider` flag auto-detects from env keys when unset (`ANTHROPIC_API_KEY` alone → Anthropic; otherwise OpenAI). Default model identifiers live on `CliProvider::default_model`; keep them in sync with the constants exported from `rig_core::providers::<p>::completion`.
+
 ## Don't re-add without discussion
 
-- Token / USD cost accounting — deferred until Rig surfaces per-call usage metadata. Char-count estimates dressed as USD mislead more than help.
-- Brave / Serper search backends — first-party impls planned for v0.2; the `SearchBackend` trait is public so downstreams can implement them today.
-- Multi-provider models — OpenAI only via Rig for v0.1.
+- **USD cost accounting** — would require maintaining provider pricing tables. Token counts are surfaced via `RunStats::token_usage`; leave $ to downstream tooling.
+- **Brave / Serper search backends** — first-party impls planned for v0.2; the `SearchBackend` trait is public so downstreams can implement them today.
+
+## Docstring style
+
+Keep docstrings about the code, not the conversation. State what a type or function is and any non-obvious behaviour or invariant; omit rationale that only makes sense in context of the change that introduced it (specific call sites, design history, debate that landed here). Where the *why* matters and is non-obvious, prefer a short note in this file (CLAUDE.md) over a docstring that will drift as the code evolves.
 
 ## Content parity
 
