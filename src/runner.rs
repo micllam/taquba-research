@@ -53,7 +53,7 @@ pub struct ResearchStepRunner {
 
 /// Per-provider LLM client.
 pub(crate) enum ProviderClient {
-    OpenAI(openai::Client),
+    OpenAi(openai::Client),
     Anthropic(anthropic::Client),
 }
 
@@ -75,7 +75,7 @@ pub struct RunRecord {
 impl ResearchStepRunner {
     /// Build a runner from a Rig OpenAI client and a search backend.
     pub fn new_openai(client: openai::Client, search: Arc<dyn SearchBackend>) -> Self {
-        Self::from_provider(ProviderClient::OpenAI(client), search)
+        Self::from_provider(ProviderClient::OpenAi(client), search)
     }
 
     /// Build a runner from a Rig Anthropic client and a search backend.
@@ -443,7 +443,7 @@ impl ResearchStepRunner {
     /// provider.
     async fn llm_prompt(&self, prompt: &str, state: &ResearchState) -> Result<String, StepError> {
         match self.provider.as_ref() {
-            ProviderClient::OpenAI(client) => {
+            ProviderClient::OpenAi(client) => {
                 let agent = client
                     .agent(&state.config.model)
                     .preamble(AGENT_PREAMBLE)
@@ -469,7 +469,7 @@ impl ResearchStepRunner {
         T: JsonSchema + DeserializeOwned + Send + 'static,
     {
         match self.provider.as_ref() {
-            ProviderClient::OpenAI(client) => {
+            ProviderClient::OpenAi(client) => {
                 let agent = client
                     .agent(&state.config.model)
                     .preamble(AGENT_PREAMBLE)

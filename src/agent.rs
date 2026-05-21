@@ -180,7 +180,7 @@ pub struct ResearchAgentBuilder {
 impl ResearchAgentBuilder {
     /// Set the Rig OpenAI client.
     pub fn openai(mut self, client: openai::Client) -> Self {
-        self.provider = Some(ProviderClient::OpenAI(client));
+        self.provider = Some(ProviderClient::OpenAi(client));
         self
     }
 
