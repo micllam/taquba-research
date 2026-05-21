@@ -715,11 +715,35 @@ fn extract_tag_content(html: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::StatusCode;
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
+    use taquba_workflow::StepErrorKind;
 
     fn test_store() -> RunStore {
         RunStore::new(Arc::new(InMemory::new()), &Path::default())
+    }
+
+    fn assert_transient(err: &StepError) {
+        assert!(
+            matches!(err.kind, StepErrorKind::Transient),
+            "expected transient, got {:?}: {}",
+            err.kind,
+            err.message
+        );
+    }
+
+    fn assert_permanent(err: &StepError) {
+        assert!(
+            matches!(err.kind, StepErrorKind::Permanent),
+            "expected permanent, got {:?}: {}",
+            err.kind,
+            err.message
+        );
+    }
+
+    fn http_status(code: u16) -> http_client::Error {
+        http_client::Error::InvalidStatusCode(StatusCode::from_u16(code).unwrap())
     }
 
     #[test]
@@ -754,5 +778,77 @@ mod tests {
         // With virtual time the polling loop's sleep auto-advances
         // when the runtime is idle.
         poll_cancelled(&store, "run-2").await;
+    }
+
+    #[test]
+    fn is_transient_status_retries_rate_limit_and_5xx() {
+        assert!(is_transient_status(429));
+        assert!(is_transient_status(500));
+        assert!(is_transient_status(502));
+        assert!(is_transient_status(503));
+        assert!(is_transient_status(504));
+    }
+
+    #[test]
+    fn is_transient_status_marks_non_429_4xx_as_permanent() {
+        assert!(!is_transient_status(400));
+        assert!(!is_transient_status(401));
+        assert!(!is_transient_status(403));
+        assert!(!is_transient_status(404));
+        assert!(!is_transient_status(422));
+    }
+
+    #[test]
+    fn is_transient_status_defaults_outside_4xx_to_transient() {
+        // Codes outside the standard 4xx range fall back to transient.
+        assert!(is_transient_status(200));
+        assert!(is_transient_status(0));
+    }
+
+    #[test]
+    fn classify_http_routes_401_403_to_permanent() {
+        assert_permanent(&classify_http(&http_status(401), "unauthorized"));
+        assert_permanent(&classify_http(&http_status(403), "forbidden"));
+    }
+
+    #[test]
+    fn classify_http_routes_other_4xx_to_permanent() {
+        assert_permanent(&classify_http(&http_status(400), "bad request"));
+        assert_permanent(&classify_http(&http_status(404), "not found"));
+        assert_permanent(&classify_http(&http_status(422), "unprocessable"));
+    }
+
+    #[test]
+    fn classify_http_routes_rate_limit_and_5xx_to_transient() {
+        assert_transient(&classify_http(&http_status(429), "rate limited"));
+        assert_transient(&classify_http(&http_status(500), "server error"));
+        assert_transient(&classify_http(&http_status(503), "unavailable"));
+    }
+
+    #[test]
+    fn classify_structured_err_empty_response_is_transient() {
+        assert_transient(&classify_structured_err(
+            StructuredOutputError::EmptyResponse,
+        ));
+    }
+
+    #[test]
+    fn classify_structured_err_deserialize_failure_is_permanent() {
+        let json_err: serde_json::Error = serde_json::from_str::<i32>("nope").unwrap_err();
+        assert_permanent(&classify_structured_err(
+            StructuredOutputError::DeserializationError(json_err),
+        ));
+    }
+
+    #[test]
+    fn classify_rig_err_http_401_is_permanent() {
+        let err = PromptError::CompletionError(CompletionError::HttpError(http_status(401)));
+        assert_permanent(&classify_rig_err(err));
+    }
+
+    #[test]
+    fn classify_rig_err_http_429_is_transient() {
+        let err = PromptError::CompletionError(CompletionError::HttpError(http_status(429)));
+        assert_transient(&classify_rig_err(err));
     }
 }
