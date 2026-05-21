@@ -5,14 +5,14 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rig_core::providers::openai;
+use rig_core::providers::{anthropic, openai};
 use taquba::Queue;
 use taquba_workflow::{RunOutcome, RunSpec, TerminalHook, TerminalStatus, WorkflowRuntime};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
 use crate::Report;
-use crate::runner::{ResearchStepRunner, RunRecord};
+use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
 use crate::store::RunStore;
@@ -160,7 +160,8 @@ async fn persist_outcome(store: &RunStore, outcome: &RunOutcome, query: &str) ->
 
 /// Builder for [`ResearchAgent`]. Required fields:
 ///
-/// - [`Self::openai`]: a Rig OpenAI client.
+/// - A provider client (call [`Self::openai`] *or* [`Self::anthropic`]).
+///   Last call wins if both are invoked.
 /// - [`Self::search`]: a [`SearchBackend`] implementation.
 /// - [`Self::config`]: a [`ResearchConfig`] built via
 ///   [`ResearchConfig::new`] with the model identifier you want.
@@ -170,7 +171,7 @@ async fn persist_outcome(store: &RunStore, outcome: &RunOutcome, query: &str) ->
 /// - [`Self::run_store`]: filesystem index for CLI-style `list`/`status`.
 #[derive(Default)]
 pub struct ResearchAgentBuilder {
-    rig: Option<openai::Client>,
+    provider: Option<ProviderClient>,
     search: Option<Arc<dyn SearchBackend>>,
     config: Option<ResearchConfig>,
     run_store: Option<RunStore>,
@@ -179,7 +180,13 @@ pub struct ResearchAgentBuilder {
 impl ResearchAgentBuilder {
     /// Set the Rig OpenAI client.
     pub fn openai(mut self, client: openai::Client) -> Self {
-        self.rig = Some(client);
+        self.provider = Some(ProviderClient::OpenAI(client));
+        self
+    }
+
+    /// Set the Rig Anthropic client.
+    pub fn anthropic(mut self, client: anthropic::Client) -> Self {
+        self.provider = Some(ProviderClient::Anthropic(client));
         self
     }
 
@@ -210,16 +217,16 @@ impl ResearchAgentBuilder {
 
     /// Finalize the builder.
     pub fn build(self) -> Result<ResearchAgent> {
-        let rig = self
-            .rig
-            .ok_or_else(|| anyhow!("ResearchAgent requires an OpenAI Rig client"))?;
+        let provider = self.provider.ok_or_else(|| {
+            anyhow!("ResearchAgent requires a provider client (call .openai() or .anthropic())")
+        })?;
         let search = self
             .search
             .ok_or_else(|| anyhow!("ResearchAgent requires a SearchBackend"))?;
         let config = self
             .config
             .ok_or_else(|| anyhow!("ResearchAgent requires a ResearchConfig"))?;
-        let mut runner = ResearchStepRunner::new_openai(rig, search);
+        let mut runner = ResearchStepRunner::from_provider(provider, search);
         if let Some(store) = &self.run_store {
             runner = runner.with_run_store(store.clone());
         }

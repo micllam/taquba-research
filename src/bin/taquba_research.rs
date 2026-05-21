@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rig_core::client::ProviderClient;
-use rig_core::providers::openai;
+use rig_core::providers::{anthropic, openai};
 use taquba::Queue;
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
@@ -38,6 +38,45 @@ use url::Url;
 
 const QUEUE_DB_NAME: &str = "queue";
 const REPORTS_PREFIX: &str = "reports";
+
+/// Provider choice surfaced through `--provider`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliProvider {
+    #[value(name = "openai")]
+    OpenAi,
+    Anthropic,
+}
+
+impl CliProvider {
+    /// Default model identifier when the user doesn't pass `--model`.
+    fn default_model(self) -> &'static str {
+        match self {
+            CliProvider::OpenAi => "gpt-4o-mini",
+            CliProvider::Anthropic => "claude-haiku-4-5",
+        }
+    }
+
+    /// Resolve `--provider` against env vars. If the user passed
+    /// `--provider <p>` explicitly, that wins. Otherwise: if
+    /// `ANTHROPIC_API_KEY` is set and `OPENAI_API_KEY` is not, pick
+    /// Anthropic; otherwise default to OpenAI.
+    fn resolve(explicit: Option<CliProvider>) -> CliProvider {
+        if let Some(p) = explicit {
+            return p;
+        }
+        let has_openai = std::env::var("OPENAI_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let has_anthropic = std::env::var("ANTHROPIC_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if has_anthropic && !has_openai {
+            CliProvider::Anthropic
+        } else {
+            CliProvider::OpenAi
+        }
+    }
+}
 
 /// Durable research agent; single-binary CLI.
 #[derive(Debug, Parser)]
@@ -70,13 +109,18 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     max_sources: usize,
 
-    /// Provider: only `openai` is implemented in v0.1.
-    #[arg(long, default_value = "openai")]
-    provider: String,
+    /// LLM provider. If unset, the CLI picks one based on which
+    /// `*_API_KEY` env var is set: `ANTHROPIC_API_KEY` alone selects
+    /// `anthropic`; otherwise `openai` is used. Pass `--provider` to
+    /// force a specific choice.
+    #[arg(long, value_enum)]
+    provider: Option<CliProvider>,
 
-    /// Specific model identifier passed to the provider.
-    #[arg(long, default_value = "gpt-4o-mini")]
-    model: String,
+    /// Specific model identifier passed to the provider. If unset,
+    /// the CLI picks a provider-appropriate default
+    /// (`gpt-4o-mini` for OpenAI, `claude-haiku-4-5` for Anthropic).
+    #[arg(long)]
+    model: Option<String>,
 
     /// Search backend: only `tavily` is wired in v0.1.
     #[arg(long, default_value = "tavily")]
@@ -394,29 +438,38 @@ fn build_default_report_path(prefix: &ObjectPath, run_id: &str) -> ObjectPath {
 }
 
 fn build_runner(cli: &Cli, run_store: &RunStore) -> Result<ResearchStepRunner> {
-    if cli.provider != "openai" {
-        bail!(
-            "provider `{}` is not implemented in v0.1 (only `openai` is); see --help",
-            cli.provider
-        );
-    }
     if cli.search != "tavily" {
         bail!(
             "search backend `{}` is not wired in v0.1 (only `tavily` is); see --help",
             cli.search
         );
     }
-    let rig = openai::Client::from_env().context("OPENAI_API_KEY missing or invalid")?;
     let tavily = Tavily::from_env().context("TAVILY_API_KEY not set or empty")?;
     let search: Arc<dyn SearchBackend> = Arc::new(tavily);
-    Ok(ResearchStepRunner::new_openai(rig, search).with_run_store(run_store.clone()))
+    let runner = match CliProvider::resolve(cli.provider) {
+        CliProvider::OpenAi => {
+            let client = openai::Client::from_env().context("OPENAI_API_KEY missing or invalid")?;
+            ResearchStepRunner::new_openai(client, search)
+        }
+        CliProvider::Anthropic => {
+            let client =
+                anthropic::Client::from_env().context("ANTHROPIC_API_KEY missing or invalid")?;
+            ResearchStepRunner::new_anthropic(client, search)
+        }
+    };
+    Ok(runner.with_run_store(run_store.clone()))
 }
 
 fn build_config(cli: &Cli) -> ResearchConfig {
+    let provider = CliProvider::resolve(cli.provider);
+    let model = cli
+        .model
+        .clone()
+        .unwrap_or_else(|| provider.default_model().to_string());
     ResearchConfig {
         depth: cli.depth,
         max_sources: cli.max_sources,
-        ..ResearchConfig::new(cli.model.clone())
+        ..ResearchConfig::new(model)
     }
 }
 

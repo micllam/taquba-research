@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ResearchConfig::new(model)` constructor: takes the
   provider-specific model identifier explicitly and applies the
   standard defaults to every other field.
+- CLI `--provider openai|anthropic` flag and matching
+  `ResearchAgentBuilder::anthropic(...)` method. Provider selection
+  through the high-level builder and the CLI is now end-to-end. When
+  `--provider` is omitted, the CLI auto-detects from env vars:
+  `ANTHROPIC_API_KEY` alone selects Anthropic; otherwise OpenAI. The
+  `--model` flag becomes optional and defaults to a
+  provider-appropriate identifier when unset.
 
 ### Removed
 - **Breaking:** `ResearchStepRunner::new` is renamed to

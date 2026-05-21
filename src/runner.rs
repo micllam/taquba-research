@@ -52,7 +52,7 @@ pub struct ResearchStepRunner {
 }
 
 /// Per-provider LLM client.
-enum ProviderClient {
+pub(crate) enum ProviderClient {
     OpenAI(openai::Client),
     Anthropic(anthropic::Client),
 }
@@ -83,7 +83,7 @@ impl ResearchStepRunner {
         Self::from_provider(ProviderClient::Anthropic(client), search)
     }
 
-    fn from_provider(provider: ProviderClient, search: Arc<dyn SearchBackend>) -> Self {
+    pub(crate) fn from_provider(provider: ProviderClient, search: Arc<dyn SearchBackend>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
             .user_agent(concat!("taquba-research/", env!("CARGO_PKG_VERSION")))

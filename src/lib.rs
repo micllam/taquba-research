@@ -18,9 +18,15 @@
 //! # Providers
 //!
 //! OpenAI and Anthropic are both supported via Rig.
-//! `ResearchAgent` and the CLI use OpenAI today; Anthropic is
-//! reachable at the runner level via
-//! [`ResearchStepRunner::new_anthropic`].
+//!
+//! - **CLI**: pass `--provider openai` (default) or
+//!   `--provider anthropic`. If unset, the CLI picks based on which
+//!   `*_API_KEY` env var is set: `ANTHROPIC_API_KEY` alone selects
+//!   Anthropic; otherwise OpenAI.
+//! - **Library**: build the runner via
+//!   [`ResearchStepRunner::new_openai`] or
+//!   [`ResearchStepRunner::new_anthropic`], or use the
+//!   [`ResearchAgent::builder`]'s `.openai(...)` / `.anthropic(...)`.
 //!
 //! # Quick start
 //!
@@ -66,8 +72,9 @@
 //! ```
 //!
 //! `run` and `resume` are **foreground processes** that stay alive for
-//! the duration of the work and need `OPENAI_API_KEY` and
-//! `TAVILY_API_KEY` set. The other subcommands (`list`, `status`,
+//! the duration of the work and need `TAVILY_API_KEY` plus either
+//! `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` depending on the chosen
+//! `--provider`. The other subcommands (`list`, `status`,
 //! `show`, `cancel`, `init`, `gc`) are inspection and maintenance
 //! commands you run from **another shell** while a run is in flight
 //! (or any time after); they only touch the shared store and need

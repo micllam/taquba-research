@@ -12,14 +12,17 @@ stopped without re-paying for completed steps.
 cargo install taquba-research
 ```
 
-The CLI currently
-uses OpenAI; Anthropic is reachable at the library level via
-`ResearchStepRunner::new_anthropic`.
+OpenAI and Anthropic are both supported via Rig. The CLI picks based
+on which `*_API_KEY` env var is set (`ANTHROPIC_API_KEY` alone selects
+Anthropic; otherwise OpenAI); pass `--provider openai|anthropic` to
+force a choice. The library exposes `ResearchStepRunner::new_openai`
+and `ResearchStepRunner::new_anthropic` plus matching
+`.openai(...)` / `.anthropic(...)` builder methods on `ResearchAgent`.
 
 ## Run
 
 ```bash
-export OPENAI_API_KEY=...
+export OPENAI_API_KEY=...      # or: export ANTHROPIC_API_KEY=...
 export TAVILY_API_KEY=...
 taquba-research "your research question"
 ```
@@ -32,8 +35,9 @@ taquba-research resume <RUN_ID>
 ```
 
 `run` and `resume` are foreground commands that stay alive for the
-duration of the work and need `OPENAI_API_KEY` and `TAVILY_API_KEY`
-set. Everything below is inspection or maintenance; run them from
+duration of the work and need `TAVILY_API_KEY` plus either
+`OPENAI_API_KEY` or `ANTHROPIC_API_KEY` depending on the chosen
+`--provider`. Everything below is inspection or maintenance; run them from
 another shell while a run is in flight (or any time after); they only
 touch the shared store and need neither key. Object-store credentials
 (the standard `AWS_*` / `GOOGLE_*` / `AZURE_*` env vars) are read
