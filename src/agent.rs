@@ -162,10 +162,11 @@ async fn persist_outcome(store: &RunStore, outcome: &RunOutcome, query: &str) ->
 ///
 /// - [`Self::openai`]: a Rig OpenAI client.
 /// - [`Self::search`]: a [`SearchBackend`] implementation.
+/// - [`Self::config`]: a [`ResearchConfig`] built via
+///   [`ResearchConfig::new`] with the model identifier you want.
 ///
 /// Optional:
 ///
-/// - [`Self::config`]: defaults to [`ResearchConfig::default`].
 /// - [`Self::run_store`]: filesystem index for CLI-style `list`/`status`.
 #[derive(Default)]
 pub struct ResearchAgentBuilder {
@@ -215,8 +216,10 @@ impl ResearchAgentBuilder {
         let search = self
             .search
             .ok_or_else(|| anyhow!("ResearchAgent requires a SearchBackend"))?;
-        let config = self.config.unwrap_or_default();
-        let mut runner = ResearchStepRunner::new(rig, search);
+        let config = self
+            .config
+            .ok_or_else(|| anyhow!("ResearchAgent requires a ResearchConfig"))?;
+        let mut runner = ResearchStepRunner::new_openai(rig, search);
         if let Some(store) = &self.run_store {
             runner = runner.with_run_store(store.clone());
         }

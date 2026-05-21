@@ -12,6 +12,10 @@ stopped without re-paying for completed steps.
 cargo install taquba-research
 ```
 
+The CLI currently
+uses OpenAI; Anthropic is reachable at the library level via
+`ResearchStepRunner::new_anthropic`.
+
 ## Run
 
 ```bash
@@ -103,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
     let agent = ResearchAgent::builder()
         .openai(rig_core::providers::openai::Client::from_env()?)
         .search(Tavily::from_env()?)
-        .config(ResearchConfig::default())
+        .config(ResearchConfig::new("gpt-4o-mini"))
         .build()?;
 
     let report = agent.run(queue, "Postgres vs SQLite for read-heavy workloads").await?;

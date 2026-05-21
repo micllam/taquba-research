@@ -12,8 +12,10 @@ use url::Url;
 
 use crate::search::SearchResult;
 
-/// Configuration the user passes to a research run. All fields have
-/// sensible defaults via [`Default`].
+/// Configuration the user passes to a research run. Build with
+/// [`ResearchConfig::new`], passing the provider-specific model
+/// identifier explicitly; the other fields take their defaults from
+/// `new` and can be overridden field by field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchConfig {
     /// Number of sub-questions the planning step should decompose the
@@ -23,8 +25,11 @@ pub struct ResearchConfig {
     /// Hard cap on URLs queued for fetching. Search results beyond this
     /// cap are dropped before the fetch phase starts.
     pub max_sources: usize,
-    /// Model identifier passed to Rig (provider-specific, e.g.
-    /// `"gpt-4o-mini"`).
+    /// Model identifier passed to Rig. Provider-specific: e.g.
+    /// `"gpt-4o-mini"` for OpenAI, `"claude-haiku-4-5"` for Anthropic.
+    /// Must be a valid identifier for whichever provider the runner
+    /// was built against (see [`crate::ResearchStepRunner::new_openai`]
+    /// / [`crate::ResearchStepRunner::new_anthropic`]).
     pub model: String,
     /// Maximum tokens per single LLM call.
     pub max_tokens_per_call: u64,
@@ -33,12 +38,15 @@ pub struct ResearchConfig {
     pub max_page_chars: usize,
 }
 
-impl Default for ResearchConfig {
-    fn default() -> Self {
+impl ResearchConfig {
+    /// Build a `ResearchConfig` with the given model identifier and
+    /// the standard defaults for every other field. The model string
+    /// must match the provider you'll construct the runner against.
+    pub fn new(model: impl Into<String>) -> Self {
         Self {
             depth: 6,
             max_sources: 30,
-            model: "gpt-4o-mini".to_string(),
+            model: model.into(),
             max_tokens_per_call: 4096,
             max_page_chars: 16_000,
         }
@@ -158,7 +166,7 @@ mod tests {
 
     #[test]
     fn round_trip_serde() {
-        let s = ResearchState::new("a query", ResearchConfig::default());
+        let s = ResearchState::new("a query", ResearchConfig::new("gpt-4o-mini"));
         let bytes = s.to_bytes();
         let back = ResearchState::from_bytes(&bytes).unwrap();
         assert_eq!(back.query, "a query");

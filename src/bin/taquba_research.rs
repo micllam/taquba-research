@@ -409,15 +409,14 @@ fn build_runner(cli: &Cli, run_store: &RunStore) -> Result<ResearchStepRunner> {
     let rig = openai::Client::from_env().context("OPENAI_API_KEY missing or invalid")?;
     let tavily = Tavily::from_env().context("TAVILY_API_KEY not set or empty")?;
     let search: Arc<dyn SearchBackend> = Arc::new(tavily);
-    Ok(ResearchStepRunner::new(rig, search).with_run_store(run_store.clone()))
+    Ok(ResearchStepRunner::new_openai(rig, search).with_run_store(run_store.clone()))
 }
 
 fn build_config(cli: &Cli) -> ResearchConfig {
     ResearchConfig {
         depth: cli.depth,
         max_sources: cli.max_sources,
-        model: cli.model.clone(),
-        ..ResearchConfig::default()
+        ..ResearchConfig::new(cli.model.clone())
     }
 }
 

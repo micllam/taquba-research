@@ -15,6 +15,13 @@
 //! - **Low-level**: [`ResearchStepRunner`] - a [`taquba_workflow::StepRunner`]
 //!   you can drop into your own [`taquba_workflow::WorkflowRuntime`].
 //!
+//! # Providers
+//!
+//! OpenAI and Anthropic are both supported via Rig.
+//! `ResearchAgent` and the CLI use OpenAI today; Anthropic is
+//! reachable at the runner level via
+//! [`ResearchStepRunner::new_anthropic`].
+//!
 //! # Quick start
 //!
 //! ```no_run
@@ -32,7 +39,7 @@
 //! let agent = ResearchAgent::builder()
 //!     .openai(rig)
 //!     .search(Tavily::from_env()?)
-//!     .config(ResearchConfig::default())
+//!     .config(ResearchConfig::new("gpt-4o-mini"))
 //!     .build()?;
 //!
 //! let report = agent.run(queue, "Postgres vs SQLite for read-heavy workloads").await?;

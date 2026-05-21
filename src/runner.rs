@@ -11,7 +11,7 @@ use rig_core::completion::{
     CompletionError, Prompt, PromptError, StructuredOutputError, TypedPrompt,
 };
 use rig_core::http_client;
-use rig_core::providers::openai;
+use rig_core::providers::{anthropic, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,7 @@ pub struct ResearchStepRunner {
 /// Per-provider LLM client.
 enum ProviderClient {
     OpenAI(openai::Client),
+    Anthropic(anthropic::Client),
 }
 
 /// What the terminal hook persists for a finished run. Distinct from the
@@ -73,14 +74,23 @@ pub struct RunRecord {
 
 impl ResearchStepRunner {
     /// Build a runner from a Rig OpenAI client and a search backend.
-    pub fn new(rig: openai::Client, search: Arc<dyn SearchBackend>) -> Self {
+    pub fn new_openai(client: openai::Client, search: Arc<dyn SearchBackend>) -> Self {
+        Self::from_provider(ProviderClient::OpenAI(client), search)
+    }
+
+    /// Build a runner from a Rig Anthropic client and a search backend.
+    pub fn new_anthropic(client: anthropic::Client, search: Arc<dyn SearchBackend>) -> Self {
+        Self::from_provider(ProviderClient::Anthropic(client), search)
+    }
+
+    fn from_provider(provider: ProviderClient, search: Arc<dyn SearchBackend>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
             .user_agent(concat!("taquba-research/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("reqwest client builder cannot fail with default config");
         Self {
-            provider: Arc::new(ProviderClient::OpenAI(rig)),
+            provider: Arc::new(provider),
             search,
             http,
             run_store: None,
@@ -441,6 +451,14 @@ impl ResearchStepRunner {
                     .build();
                 agent.prompt(prompt).await.map_err(classify_rig_err)
             }
+            ProviderClient::Anthropic(client) => {
+                let agent = client
+                    .agent(&state.config.model)
+                    .preamble(AGENT_PREAMBLE)
+                    .max_tokens(state.config.max_tokens_per_call)
+                    .build();
+                agent.prompt(prompt).await.map_err(classify_rig_err)
+            }
         }
     }
 
@@ -452,6 +470,17 @@ impl ResearchStepRunner {
     {
         match self.provider.as_ref() {
             ProviderClient::OpenAI(client) => {
+                let agent = client
+                    .agent(&state.config.model)
+                    .preamble(AGENT_PREAMBLE)
+                    .max_tokens(state.config.max_tokens_per_call)
+                    .build();
+                agent
+                    .prompt_typed::<T>(prompt)
+                    .await
+                    .map_err(classify_structured_err)
+            }
+            ProviderClient::Anthropic(client) => {
                 let agent = client
                     .agent(&state.config.model)
                     .preamble(AGENT_PREAMBLE)

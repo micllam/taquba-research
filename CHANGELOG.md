@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Re-export `taquba_workflow::SubmitOutcome` from the `workflow`
   module, alongside the other types users need to call
   `WorkflowRuntime::submit` directly.
+- Anthropic LLM provider support via Rig. The runner now dispatches
+  per-provider via an internal enum;
+  `ResearchStepRunner::new_anthropic` constructs a runner against an
+  `anthropic::Client`.
+- `ResearchConfig::new(model)` constructor: takes the
+  provider-specific model identifier explicitly and applies the
+  standard defaults to every other field.
+
+### Removed
+- **Breaking:** `ResearchStepRunner::new` is renamed to
+  `new_openai` so the OpenAI and Anthropic constructors are
+  symmetric without any default.
+- **Breaking:** `impl Default for ResearchConfig` removed. The
+  previous default returned `"gpt-4o-mini"`.
+  `ResearchAgent`'s builder now requires a `config(...)` call as a
+  consequence.
 
 ### Changed
 - Bumped `rig-core` to 0.37. The crate's lib name changed from
