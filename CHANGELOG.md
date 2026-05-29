@@ -38,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Phase::Fetching`.
 - New public re-export module `taquba_research::jobs` exposing
   `JobRunner` and `RunnerHandle`.
+- Public `ResearchStepRunner::with_queue(Arc<Queue>)` builder method
+  to attach the underlying queue. Required by the fetching phase so
+  it can call `Queue::cancel(job_id)` on in-flight FetchPage jobs
+  when the surrounding run is cancelled.
+- Cancellation now cascades from the workflow run to its in-flight
+  FetchPage jobs. When the cancel sentinel fires mid-fetch,
+  `run_fetching`'s drop guard cancels every still-pending job via
+  `Queue::cancel`, and `FetchPage::run` races the HTTP fetch against
+  `JobContext::cancel_token`, so the actual reqwest call aborts
+  instead of running out the per-fetch HTTP timeout. New
+  `FetchError::Cancelled` variant; classified permanent.
 
 ### Changed
 - **Breaking:** `ResearchAgent::run` now takes an additional

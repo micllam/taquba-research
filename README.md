@@ -149,7 +149,11 @@ on step retry; no URL is fetched twice across attempts.
 `JobRunner`; both `ResearchAgent::run` and the CLI construct it
 internally, but callers driving a custom `WorkflowRuntime` need to
 call it themselves and attach the runner via
-`ResearchStepRunner::with_job_runner`.
+`ResearchStepRunner::with_job_runner` together with
+`ResearchStepRunner::with_queue` (the latter lets the fetching step
+cancel in-flight `FetchPage` jobs via `Queue::cancel` when the
+surrounding run is cancelled, instead of letting them run out to
+the per-fetch HTTP timeout).
 
 ## License
 

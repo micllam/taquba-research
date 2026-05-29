@@ -111,6 +111,12 @@ pub(crate) enum FetchError {
     /// text. Treated as permanent.
     #[error("empty extracted text")]
     Empty,
+    /// The job's cancel-token fired mid-fetch (via `Queue::cancel`,
+    /// triggered when the surrounding research run is cancelled).
+    /// Treated as permanent so the job dead-letters cleanly rather
+    /// than retrying after the owning run is already gone.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl Job for FetchPage {
@@ -120,7 +126,15 @@ impl Job for FetchPage {
 
     async fn run(&self, ctx: JobContext<'_>) -> Result<FetchedPage, FetchError> {
         let http = ctx.state::<Arc<reqwest::Client>>();
-        fetch_and_extract(http, &self.url, self.max_chars).await
+        // Race the HTTP fetch against the job's cooperative
+        // cancellation. When the surrounding run is cancelled,
+        // run_fetching calls `Queue::cancel(job_id)`, which fires
+        // this token; we abort the in-flight HTTP request instead
+        // of running it out to the reqwest timeout.
+        tokio::select! {
+            result = fetch_and_extract(http, &self.url, self.max_chars) => result,
+            _ = ctx.cancel_token().cancelled() => Err(FetchError::Cancelled),
+        }
     }
 
     fn idempotency_key(&self) -> Option<String> {
@@ -131,9 +145,10 @@ impl Job for FetchPage {
         match error {
             FetchError::Transport(_) | FetchError::ReadBody(_) => ErrorKind::Transient,
             FetchError::HttpStatus(code) if is_transient_status(*code) => ErrorKind::Transient,
-            FetchError::HttpStatus(_) | FetchError::NonText(_) | FetchError::Empty => {
-                ErrorKind::Permanent
-            }
+            FetchError::HttpStatus(_)
+            | FetchError::NonText(_)
+            | FetchError::Empty
+            | FetchError::Cancelled => ErrorKind::Permanent,
         }
     }
 }
@@ -283,5 +298,6 @@ mod tests {
             ErrorKind::Permanent
         );
         assert_eq!(job.classify(&FetchError::Empty), ErrorKind::Permanent);
+        assert_eq!(job.classify(&FetchError::Cancelled), ErrorKind::Permanent);
     }
 }

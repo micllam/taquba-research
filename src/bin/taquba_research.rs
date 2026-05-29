@@ -501,7 +501,7 @@ fn spawn_runtime(
     // Stand up the JobRunner the Fetching step submits FetchPage
     // jobs to.
     let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store)?;
-    let runner = runner.with_job_runner(job_runner);
+    let runner = runner.with_job_runner(job_runner).with_queue(queue.clone());
 
     // Sequential workflow: one claimer is enough. See agent.rs for
     // context.

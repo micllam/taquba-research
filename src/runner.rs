@@ -16,6 +16,7 @@ use rig_core::providers::{anthropic, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use taquba::Queue;
 use taquba_jobs::{JobRunner, JoinError};
 use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
 use url::Url;
@@ -55,6 +56,7 @@ pub struct ResearchStepRunner {
     search: Arc<dyn SearchBackend>,
     run_store: Option<RunStore>,
     job_runner: Option<Arc<JobRunner>>,
+    queue: Option<Arc<Queue>>,
 }
 
 /// Per-provider LLM client.
@@ -96,6 +98,7 @@ impl ResearchStepRunner {
             search,
             run_store: None,
             job_runner: None,
+            queue: None,
         }
     }
 
@@ -118,6 +121,16 @@ impl ResearchStepRunner {
     /// both already attached.
     pub fn with_job_runner(mut self, job_runner: Arc<JobRunner>) -> Self {
         self.job_runner = Some(job_runner);
+        self
+    }
+
+    /// Attach the underlying [`Queue`] so the fetching phase can call
+    /// `Queue::cancel(job_id)` on in-flight `FetchPage` jobs when the
+    /// surrounding run is cancelled. Without this, those jobs run to
+    /// completion (or to their reqwest timeout) after the run has
+    /// already terminated.
+    pub fn with_queue(mut self, queue: Arc<Queue>) -> Self {
+        self.queue = Some(queue);
         self
     }
 
@@ -168,6 +181,57 @@ async fn poll_cancelled(store: &RunStore, run_id: &str) {
             return;
         }
         tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+    }
+}
+
+/// Drop-guard that fires `Queue::cancel` on a non-empty set of
+/// in-flight job IDs when dropped. Used by `run_fetching` to make
+/// FetchPage jobs stop running when the surrounding research run
+/// is cancelled mid-step, rather than running to the reqwest
+/// timeout after the run has already terminated. Call
+/// [`Self::disarm`] (which empties the ID list) on every controlled
+/// exit so normal flows don't issue spurious `Queue::cancel` calls.
+///
+/// `Queue::cancel` is fire-and-forget here: the surrounding step is
+/// being cancelled anyway, and a cancel call against an already-
+/// terminal job is a no-op, so any individual failure to cancel is
+/// logged at `warn` and ignored.
+struct PendingJobsGuard {
+    queue: Arc<Queue>,
+    job_ids: Vec<String>,
+}
+
+impl PendingJobsGuard {
+    fn new(queue: Arc<Queue>, job_ids: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            queue,
+            job_ids: job_ids.into_iter().collect(),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.job_ids.clear();
+    }
+}
+
+impl Drop for PendingJobsGuard {
+    fn drop(&mut self) {
+        if self.job_ids.is_empty() {
+            return;
+        }
+        let queue = self.queue.clone();
+        let ids = std::mem::take(&mut self.job_ids);
+        // Drop is sync; defer the awaits onto a background task.
+        // The task survives the current step's cancellation and
+        // gets the cancels to taquba before in-flight handlers
+        // can run to completion.
+        tokio::spawn(async move {
+            for id in ids {
+                if let Err(e) = queue.cancel(&id).await {
+                    tracing::warn!(job_id = %id, error = %e, "failed to cancel fetch job");
+                }
+            }
+        });
     }
 }
 
@@ -299,6 +363,10 @@ impl ResearchStepRunner {
             .job_runner
             .as_ref()
             .ok_or_else(|| StepError::permanent("fetching phase requires a JobRunner"))?;
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or_else(|| StepError::permanent("fetching phase requires a Queue"))?;
 
         // Submit one FetchPage job per URL. Result-aware idempotent
         // submit means a retry of this step re-submits the same
@@ -321,6 +389,15 @@ impl ResearchStepRunner {
             handles.push(handle);
         }
 
+        // Arm a guard that cancels any still-in-flight jobs if this
+        // future is dropped before completing, i.e. the surrounding
+        // run was cancelled and the outer `run_step` is propagating
+        // `StepOutcome::Cancel`. Disarmed on every controlled exit
+        // (success, infra error) so normal flows don't issue
+        // spurious `Queue::cancel` calls.
+        let mut guard =
+            PendingJobsGuard::new(queue.clone(), handles.iter().map(|h| h.id().to_string()));
+
         // Await all the handles. A per-URL handler failure
         // (`JoinError::Job`) is logged and skipped; an infrastructure
         // error (`JoinError::Infra`) fails the step transiently so
@@ -335,11 +412,16 @@ impl ResearchStepRunner {
                     tracing::warn!(url = %url, error = %je, "fetch failed, skipping page");
                 }
                 Err(JoinError::Infra(infra)) => {
+                    // Step will be retried; let the still-in-flight
+                    // jobs finish so the retry's idempotent submits
+                    // short-circuit to their cached results.
+                    guard.disarm();
                     return Err(StepError::transient(format!("fetch infra: {infra}")));
                 }
             }
         }
 
+        guard.disarm();
         state.fetch_queue.clear();
         state.phase = Phase::Summarizing;
         Ok(())

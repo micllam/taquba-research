@@ -66,7 +66,11 @@ impl ResearchAgent {
         // to. It shares the same Queue + ObjectStore as the workflow
         // runtime, distinguished by queue_name.
         let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store)?;
-        let runner = self.runner.clone().with_job_runner(job_runner);
+        let runner = self
+            .runner
+            .clone()
+            .with_job_runner(job_runner)
+            .with_queue(queue.clone());
 
         // The research workflow is strictly sequential: each
         // `StepOutcome::Continue` enqueues the next step only after the

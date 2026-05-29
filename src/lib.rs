@@ -141,7 +141,11 @@
 //! internally, but callers driving a custom
 //! [`WorkflowRuntime`](taquba_workflow::WorkflowRuntime) need to call
 //! it themselves and attach the runner via
-//! [`ResearchStepRunner::with_job_runner`].
+//! [`ResearchStepRunner::with_job_runner`] together with
+//! [`ResearchStepRunner::with_queue`] (the latter lets the fetching
+//! step cancel in-flight `FetchPage` jobs via `Queue::cancel` when
+//! the surrounding run is cancelled, instead of letting them run
+//! out to the per-fetch HTTP timeout).
 //!
 //! See [taquba-workflow's docs] for the underlying runtime semantics.
 //!
