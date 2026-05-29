@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Memoization of every LLM call via
+  [`taquba_workflow::Memo`](https://docs.rs/taquba-workflow). The
+  planning, summarizing, synthesizing, and writing phases each cache
+  their structured or text response under a
+  `(run_id, step_number)`-scoped key, so an at-least-once retry of any
+  of these steps short-circuits to the prior attempt's cached output
+  instead of re-paying for the same prompt.
+- Parallel fetching as a single fan-out workflow step. `Phase::Fetching`
+  now submits one `FetchPage` taquba-job per URL to a `JobRunner`
+  sharing the queue (under the `research-fetch-jobs` queue-name) and
+  `try_join_all`s the handles. The job's `idempotency_key` derives from
+  `(run_id, url)`, so taquba-jobs's result-aware idempotent submit
+  short-circuits to cached result blobs on step retry; no URL is
+  fetched twice across attempts. Per-URL handler failures classify
+  transient (5xx, 429, transport) for queue-level retries or permanent
+  (other 4xx, non-text, empty) for immediate dead-letter; on
+  exhaustion the surrounding step skips the URL, preserving the prior
+  best-effort semantic. Infrastructure errors from the JobRunner
+  propagate as transient `StepError`.
+- Public `spawn_fetch_runner(queue, object_store)` helper that builds
+  and spawns the fetch `JobRunner` (registers `FetchPage`, attaches an
+  `Arc<reqwest::Client>` on its state) and returns it alongside a
+  `RunnerHandle` for graceful shutdown. Used internally by both
+  `ResearchAgent::run` and the CLI's `spawn_runtime`.
+- Public `ResearchStepRunner::with_job_runner(...)` builder method to
+  attach the runner returned by `spawn_fetch_runner`. Required for any
+  caller driving a custom `WorkflowRuntime` that advances into
+  `Phase::Fetching`.
+- New public re-export module `taquba_research::jobs` exposing
+  `JobRunner` and `RunnerHandle`.
+
+### Changed
+- **Breaking:** `ResearchAgent::run` now takes an additional
+  `object_store: Arc<dyn ObjectStore>` argument; the new signature is
+  `run(queue, object_store, query)`. The store backs the workflow
+  runtime's per-step memo store; the common case is to pass the same
+  store the `Queue` was opened with.
+- Bumped `taquba` to 0.7 and `taquba-workflow` to 0.5; added
+  `taquba-jobs` 0.3 as a new dependency.
+
 ## [0.2.0] - 2026-05-21
 
 ### Added
