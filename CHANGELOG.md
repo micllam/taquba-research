@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-29
+
 ### Added
 - Memoization of every LLM call via
   [`taquba_workflow::Memo`](https://docs.rs/taquba-workflow). The
