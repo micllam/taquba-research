@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -40,6 +41,10 @@ use url::Url;
 
 const QUEUE_DB_NAME: &str = "queue";
 const REPORTS_PREFIX: &str = "reports";
+/// How long workflow memo blobs are retained after the run reaches a
+/// terminal state. Matches the value used by the library's
+/// `ResearchAgent::run`; keep in sync.
+const MEMO_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Provider choice surfaced through `--provider`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -502,6 +507,7 @@ fn spawn_runtime(
     // context.
     let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
         .max_concurrent_steps(1)
+        .memo_retention(MEMO_RETENTION)
         .build();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

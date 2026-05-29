@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run(queue, object_store, query)`. The store backs the workflow
   runtime's per-step memo store; the common case is to pass the same
   store the `Queue` was opened with.
+- Workflow memo blobs and fetch-job result blobs now auto-sweep 7
+  days after their owning run/job reaches a terminal state.
+  `ResearchAgent::run` and the CLI's `spawn_runtime` set
+  `WorkflowRuntimeBuilder::memo_retention`, and `spawn_fetch_runner`
+  sets `JobRunnerBuilder::result_retention`.
 - Bumped `taquba` to 0.7 and `taquba-workflow` to 0.5; added
   `taquba-jobs` 0.3 as a new dependency.
 

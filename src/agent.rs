@@ -3,6 +3,7 @@
 //! exposed through a single `run(queue, query)` call.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rig_core::providers::{anthropic, openai};
@@ -18,6 +19,12 @@ use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
 use crate::store::RunStore;
+
+/// How long workflow memo blobs are retained after the run reaches a
+/// terminal state. Any in-process at-least-once retry happens well
+/// before this elapses; the window only needs to outlive the longest
+/// realistic run wall-time plus an inspection buffer.
+const MEMO_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// High-level convenience for running a research agent once and getting
 /// back a [`Report`] without managing the workflow runtime yourself.
@@ -67,6 +74,7 @@ impl ResearchAgent {
         // claim transaction conflicts.
         let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
             .max_concurrent_steps(1)
+            .memo_retention(MEMO_RETENTION)
             .build();
 
         let worker_runtime = runtime.clone();

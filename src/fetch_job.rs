@@ -36,6 +36,13 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Logical queue name for fetch jobs. Distinct from the workflow
 /// runtime's queue so retention policies can diverge if needed.
 const FETCH_QUEUE_NAME: &str = "research-fetch-jobs";
+/// How long a `FetchPage` result blob is retained after the job
+/// reaches a terminal state. Any in-process idempotent re-submission
+/// (workflow-step retry) of the same `(run_id, url)` short-circuits
+/// to the cached blob until this window elapses; after that the
+/// blob is swept and a re-submission falls through to a fresh fetch.
+/// One week covers every realistic run wall-time + inspection gap.
+const FETCH_RESULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Build a [`JobRunner`] with the internal `FetchPage` job
 /// registered and an `Arc<reqwest::Client>` on its state, then spawn
@@ -62,6 +69,7 @@ pub fn spawn_fetch_runner(
         .object_store(object_store.clone())
         .queue_name(FETCH_QUEUE_NAME)
         .state(http)
+        .result_retention(FETCH_RESULT_RETENTION)
         .build()
         .context("building fetch JobRunner")?;
     job_runner.register::<FetchPage>();
