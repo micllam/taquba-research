@@ -2,6 +2,7 @@
 //! through its six phases.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use rig_core::providers::{anthropic, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use taquba_workflow::{Step, StepError, StepOutcome, StepRunner};
+use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
 use url::Url;
 
 use crate::report::{Citation, Report, RunStats, render_markdown};
@@ -35,6 +36,14 @@ const AGENT_PREAMBLE: &str = "Be precise and concise.";
 /// phase work is in flight. Sets the upper bound on how long an LLM
 /// or HTTP call keeps running after the CLI's `cancel` lands.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Memo user-keys for each phase's cached LLM response. Each is
+/// scoped per `(run_id, step_number)` by [`taquba_workflow::Memo`],
+/// so a plain string suffices.
+const MEMO_KEY_PLANNING: &str = "planning";
+const MEMO_KEY_SUMMARIZING: &str = "summarizing";
+const MEMO_KEY_SYNTHESIZING: &str = "synthesizing";
+const MEMO_KEY_WRITING: &str = "writing";
 
 /// Drives a research run through plan -> search -> fetch -> summarize ->
 /// synthesize -> write phases.
@@ -168,13 +177,13 @@ impl ResearchStepRunner {
         state: &mut ResearchState,
     ) -> Result<StepOutcome, StepError> {
         match state.phase {
-            Phase::Planning => self.run_planning(state).await?,
+            Phase::Planning => self.run_planning(step, state).await?,
             Phase::Searching => self.run_searching(state).await?,
             Phase::Fetching => self.run_fetching(state).await?,
-            Phase::Summarizing => self.run_summarizing(state).await?,
-            Phase::Synthesizing => self.run_synthesizing(state).await?,
+            Phase::Summarizing => self.run_summarizing(step, state).await?,
+            Phase::Synthesizing => self.run_synthesizing(step, state).await?,
             Phase::Writing => {
-                let report = self.run_writing(state, &step.run_id).await?;
+                let report = self.run_writing(step, state).await?;
                 let record = RunRecord {
                     report: Some(report),
                     run_id: step.run_id.clone(),
@@ -192,7 +201,7 @@ impl ResearchStepRunner {
         })
     }
 
-    async fn run_planning(&self, state: &mut ResearchState) -> Result<(), StepError> {
+    async fn run_planning(&self, step: &Step, state: &mut ResearchState) -> Result<(), StepError> {
         tracing::info!("planning sub-questions");
         let prompt = format!(
             "You are a research planner. Decompose the user's query into at most {} \
@@ -200,7 +209,14 @@ impl ResearchStepRunner {
              Query: {}",
             state.config.depth, state.query
         );
-        let plan: Plan = self.llm_prompt_typed(&prompt, state).await?;
+
+        // Memoize the LLM call so an at-least-once retry of this step
+        // (lease expiry, worker restart) reuses the prior attempt's
+        // response instead of re-paying for the same prompt.
+        let plan: Plan = memoized(&step.memo, MEMO_KEY_PLANNING, async {
+            self.llm_prompt_typed(&prompt, state).await
+        })
+        .await?;
 
         let questions: Vec<String> = plan
             .sub_questions
@@ -298,7 +314,11 @@ impl ResearchStepRunner {
         Ok(())
     }
 
-    async fn run_summarizing(&self, state: &mut ResearchState) -> Result<(), StepError> {
+    async fn run_summarizing(
+        &self,
+        step: &Step,
+        state: &mut ResearchState,
+    ) -> Result<(), StepError> {
         let Some(url) = state.summarize_queue.pop_front() else {
             state.phase = Phase::Synthesizing;
             return Ok(());
@@ -327,7 +347,10 @@ impl ResearchStepRunner {
             title = page.title,
             text = page.text,
         );
-        let parsed: SummaryResp = self.llm_prompt_typed(&prompt, state).await?;
+        let parsed: SummaryResp = memoized(&step.memo, MEMO_KEY_SUMMARIZING, async {
+            self.llm_prompt_typed(&prompt, state).await
+        })
+        .await?;
 
         state.summaries.insert(
             url_key,
@@ -344,7 +367,11 @@ impl ResearchStepRunner {
         Ok(())
     }
 
-    async fn run_synthesizing(&self, state: &mut ResearchState) -> Result<(), StepError> {
+    async fn run_synthesizing(
+        &self,
+        step: &Step,
+        state: &mut ResearchState,
+    ) -> Result<(), StepError> {
         tracing::info!("synthesizing from {} sources", state.summaries.len());
         let mut sources = String::new();
         let mut sorted: Vec<(&String, &Summary)> = state.summaries.iter().collect();
@@ -376,7 +403,10 @@ impl ResearchStepRunner {
             q = state.query,
             s = sources,
         );
-        let synthesis = self.llm_prompt(&prompt, state).await?;
+        let synthesis: String = memoized(&step.memo, MEMO_KEY_SYNTHESIZING, async {
+            self.llm_prompt(&prompt, state).await
+        })
+        .await?;
         state.synthesis = Some(synthesis);
         state.phase = Phase::Writing;
         Ok(())
@@ -384,8 +414,8 @@ impl ResearchStepRunner {
 
     async fn run_writing(
         &self,
+        step: &Step,
         state: &mut ResearchState,
-        run_id: &str,
     ) -> Result<Report, StepError> {
         tracing::info!("writing final report");
         let synthesis = state.synthesis.clone().unwrap_or_default();
@@ -421,7 +451,10 @@ impl ResearchStepRunner {
             syn = synthesis,
         );
 
-        let body = self.llm_prompt(&prompt, state).await?;
+        let body: String = memoized(&step.memo, MEMO_KEY_WRITING, async {
+            self.llm_prompt(&prompt, state).await
+        })
+        .await?;
 
         let finished_at = Utc::now();
         let wall_time = (finished_at - state.started_at)
@@ -435,9 +468,9 @@ impl ResearchStepRunner {
             token_usage: state.token_usage,
         };
 
-        let markdown = render_markdown(&state.query, run_id, &body, &citations, &stats);
+        let markdown = render_markdown(&state.query, &step.run_id, &body, &citations, &stats);
         Ok(Report {
-            run_id: run_id.to_string(),
+            run_id: step.run_id.clone(),
             query: state.query.clone(),
             markdown,
             citations,
@@ -550,6 +583,27 @@ fn record_usage(total: &mut TokenUsage, call: &Usage) {
     total.reasoning_tokens = total.reasoning_tokens.saturating_add(call.reasoning_tokens);
 }
 
+/// Returns the JSON-decoded value previously written to `memo`
+/// under `key`. If none exists, awaits `compute`, JSON-encodes its
+/// result into the memo, and returns it; an at-least-once retry of
+/// the surrounding step then finds the cached value and skips the
+/// compute call entirely.
+async fn memoized<T, F>(memo: &Memo, key: &str, compute: F) -> Result<T, StepError>
+where
+    T: Serialize + DeserializeOwned,
+    F: Future<Output = Result<T, StepError>>,
+{
+    if let Some(bytes) = memo.get(key).await? {
+        return serde_json::from_slice(&bytes)
+            .map_err(|e| StepError::permanent(format!("memo[{key}] decode: {e}")));
+    }
+    let fresh = compute.await?;
+    let bytes = serde_json::to_vec(&fresh)
+        .map_err(|e| StepError::permanent(format!("memo[{key}] encode: {e}")))?;
+    memo.put(key, &bytes).await?;
+    Ok(fresh)
+}
+
 /// Classify a Rig prompt error as transient or permanent.
 fn classify_rig_err(err: PromptError) -> StepError {
     let msg = err.to_string();
@@ -616,12 +670,13 @@ impl From<SearchError> for StepError {
 }
 
 /// Planning step response schema.
-#[derive(Deserialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Plan {
     sub_questions: Vec<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+/// Summarizing step response schema.
+#[derive(Serialize, Deserialize, JsonSchema)]
 struct SummaryResp {
     summary: String,
     relevance: f32,
@@ -716,12 +771,31 @@ fn extract_tag_content(html: &str, tag: &str) -> Option<String> {
 mod tests {
     use super::*;
     use reqwest::StatusCode;
+    use std::collections::HashMap;
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
-    use taquba_workflow::StepErrorKind;
+    use taquba_workflow::{MemoStore, StepErrorKind};
+    use tokio_util::sync::CancellationToken;
 
     fn test_store() -> RunStore {
         RunStore::new(Arc::new(InMemory::new()), &Path::default())
+    }
+
+    /// Build a `Step` with a fresh in-memory `Memo` and otherwise
+    /// inert fields, suitable for exercising memo-using helpers.
+    fn test_step(run_id: &str, step_number: u32) -> Step {
+        let memo =
+            MemoStore::new(Arc::new(InMemory::new()), "test-memo").new_memo(run_id, step_number);
+        Step {
+            run_id: run_id.to_string(),
+            step_number,
+            payload: Vec::new(),
+            headers: HashMap::new(),
+            job_id: String::new(),
+            attempts: 1,
+            cancel_token: CancellationToken::new(),
+            memo,
+        }
     }
 
     fn assert_transient(err: &StepError) {
@@ -850,5 +924,45 @@ mod tests {
     fn classify_rig_err_http_429_is_transient() {
         let err = PromptError::CompletionError(CompletionError::HttpError(http_status(429)));
         assert_transient(&classify_rig_err(err));
+    }
+
+    #[tokio::test]
+    async fn memoized_invokes_compute_once_and_caches_the_result() {
+        let step = test_step("run-1", 3);
+        let calls = std::cell::Cell::new(0);
+        let make_plan = || Plan {
+            sub_questions: vec!["q1".into(), "q2".into()],
+        };
+
+        let first: Plan = memoized(&step.memo, MEMO_KEY_PLANNING, async {
+            calls.set(calls.get() + 1);
+            Ok(make_plan())
+        })
+        .await
+        .unwrap();
+
+        let second: Plan = memoized(&step.memo, MEMO_KEY_PLANNING, async {
+            calls.set(calls.get() + 1);
+            panic!("compute must not run on a cache hit");
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first.sub_questions, make_plan().sub_questions);
+        assert_eq!(second.sub_questions, make_plan().sub_questions);
+    }
+
+    #[tokio::test]
+    async fn memoized_rejects_corrupt_cached_bytes_as_permanent() {
+        let step = test_step("run-1", 0);
+        step.memo.put(MEMO_KEY_PLANNING, b"not json").await.unwrap();
+
+        let err = memoized::<Plan, _>(&step.memo, MEMO_KEY_PLANNING, async {
+            panic!("compute must not run when cached bytes exist");
+        })
+        .await
+        .expect_err("corrupt bytes must surface as an error");
+        assert_permanent(&err);
     }
 }
