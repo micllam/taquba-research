@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Single-crate repo (`[lib]` + `[[bin]]`) built on the [`taquba`](https://crates.io/crates/taquba) workspace's `taquba` and `taquba-workflow` crates. Audience: Rust developers using [Rig](https://crates.io/crates/rig-core).
+Single-crate repo (`[lib]` + `[[bin]]`) built on the [`taquba`](https://crates.io/crates/taquba) workspace's `taquba`, `taquba-workflow`, and `taquba-jobs` crates. Audience: Rust developers using [Rig](https://crates.io/crates/rig-core).
 
 ## Build / test
 
@@ -31,7 +31,15 @@ These constrain almost every design decision; violating them breaks correctness.
 
 ## Storage model
 
-A single `Arc<dyn ObjectStore>` backs the queue (`<store>/queue/`), run index (`<store>/runs/`), reports (`<store>/reports/`), and cancellation sentinels (`<store>/runs/<id>.cancel`). When adding a new persisted artifact, derive its path from the same store so cloud users don't end up with split state across two backends.
+A single `Arc<dyn ObjectStore>` backs the queue (`<store>/queue/`), run index (`<store>/runs/`), reports (`<store>/reports/`), workflow memo blobs (`<store>/workflow-memo/<run>/<step>/<key-hash>`), fetch-job result blobs (`<store>/research-fetch-jobs-results/<job-id>`), and cancellation sentinels (`<store>/runs/<id>.cancel`). When adding a new persisted artifact, derive its path from the same store so cloud users don't end up with split state across two backends.
+
+Memo and fetch-job result blobs auto-sweep 7 days after their owning run/job terminates (set via `WorkflowRuntimeBuilder::memo_retention` and `JobRunnerBuilder::result_retention`); run-index entries, reports, and cancellation sentinels are user-managed via the CLI's `gc` subcommand.
+
+## Fetching is the one fan-out phase
+
+`Phase::Fetching` is a single workflow step that submits one `FetchPage` taquba-job per URL to a `JobRunner` sharing the queue (under the `research-fetch-jobs` queue-name), then `try_join_all`s the handles. The `FetchPage` job's `idempotency_key` is derived from `(run_id, url)`, so taquba-jobs's result-aware idempotent submit short-circuits to the cached result blob on step retry; no URL is fetched twice. Per-URL handler failures classify transient (5xx, 429, transport) or permanent (other 4xx, non-text, empty); after exhaustion they surface as `JoinError::Job` and the surrounding step skips that URL (best-effort), while `JoinError::Infra` propagates as a transient step error.
+
+The JobRunner is constructed via `spawn_fetch_runner(&queue, &object_store)` in both `agent.rs::run` and the bin's `spawn_runtime`; it must be shut down only **after** the workflow worker has drained, since the workflow step submitting a job awaits its handle before returning.
 
 ## Adding a new phase
 
@@ -59,6 +67,7 @@ OpenAI and Anthropic dispatch through the internal `ProviderClient` enum in `run
 
 - **USD cost accounting** — would require maintaining provider pricing tables. Token counts are surfaced via `RunStats::token_usage`; leave $ to downstream tooling.
 - **Brave / Serper search backends** — first-party impls planned for v0.2; the `SearchBackend` trait is public so downstreams can implement them today.
+- **Per-URL Fetching workflow steps** — the old shape (one URL per workflow step, popping `fetch_queue`) was replaced by the fan-out-to-jobs step.
 
 ## Docstring style
 
@@ -67,3 +76,7 @@ Keep docstrings about the code, not the conversation. State what a type or funct
 ## Content parity
 
 Substantive content in `lib.rs`'s top-level `//!` docstring should mirror `README.md`: anything new (sections, design notes, semantics callouts) lands in both. Format may differ — `lib.rs` uses intra-doc `[Foo]` links and `# `-hidden rustdoc lines inside doctests; `README.md` uses URL links and full `#[tokio::main]` blocks so code is copy-pasteable.
+
+## CHANGELOG hygiene
+
+Any user-visible change — new or renamed public API, breaking signature change, behaviour change, dependency bump with downstream consequences — earns a one-bullet entry under `## [Unreleased]` in `CHANGELOG.md`, in the same commit as the code change. Use the Keep-a-Changelog section names already in use (`Added`, `Changed`, `Removed`, `Fixed`); prefix breaking changes with `**Breaking:**` so the next release-notes pass can spot them. Internal refactors and test-only changes don't need entries.
