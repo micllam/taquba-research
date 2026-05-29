@@ -135,6 +135,22 @@ async fn main() -> anyhow::Result<()> {
 - **Per-transition durability.** Every step's state change is a
   SlateDB write.
 
+### Fetching is the one fan-out phase
+
+Most phases are one workflow step per unit of work. Fetching is the
+exception: a single workflow step submits one `FetchPage` taquba-job
+per URL to a `JobRunner` sharing the queue (under a distinct
+queue-name), then `try_join_all`s the handles. The per-URL
+`idempotency_key` derives from `(run_id, url)`, so taquba-jobs's
+result-aware idempotent submit short-circuits to cached result blobs
+on step retry; no URL is fetched twice across attempts.
+
+`spawn_fetch_runner` is the helper that builds and spawns this
+`JobRunner`; both `ResearchAgent::run` and the CLI construct it
+internally, but callers driving a custom `WorkflowRuntime` need to
+call it themselves and attach the runner via
+`ResearchStepRunner::with_job_runner`.
+
 ## License
 
 Dual-licensed under either

@@ -25,12 +25,14 @@ use taquba::Queue;
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
 use taquba::object_store::{ObjectStore, PutPayload, parse_url};
+use taquba_research::jobs::RunnerHandle;
 use taquba_research::workflow::{
     RunOutcome, RunSpec, TerminalHook, TerminalStatus, WorkflowRuntime,
 };
 use taquba_research::{
     ResearchConfig, ResearchStepRunner, RunRecord, RunStore,
     search::{SearchBackend, Tavily},
+    spawn_fetch_runner,
 };
 use tokio::sync::{Mutex, oneshot};
 use tracing_subscriber::EnvFilter;
@@ -483,14 +485,19 @@ fn spawn_runtime(
     queue: Arc<Queue>,
     object_store: Arc<dyn ObjectStore>,
     runner: ResearchStepRunner,
-) -> (
+) -> Result<(
     WorkflowRuntime<ResearchStepRunner, CaptureHook>,
     WorkerHandles,
-) {
+)> {
     let (tx, rx) = oneshot::channel::<RunOutcome>();
     let hook = CaptureHook {
         tx: Mutex::new(Some(tx)),
     };
+    // Stand up the JobRunner the Fetching step submits FetchPage
+    // jobs to.
+    let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store)?;
+    let runner = runner.with_job_runner(job_runner);
+
     // Sequential workflow: one claimer is enough. See agent.rs for
     // context.
     let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
@@ -517,14 +524,15 @@ fn spawn_runtime(
             .await
     });
 
-    (
+    Ok((
         runtime,
         WorkerHandles {
             rx,
             worker,
             shutdown_tx,
+            job_handle,
         },
-    )
+    ))
 }
 
 async fn cmd_run(
@@ -537,7 +545,7 @@ async fn cmd_run(
     let config = build_config(cli);
     let queue = open_queue(store_ctx).await?;
 
-    let (runtime, handles) = spawn_runtime(queue, store_ctx.object_store.clone(), runner);
+    let (runtime, handles) = spawn_runtime(queue, store_ctx.object_store.clone(), runner)?;
 
     let input = ResearchStepRunner::initial_state(query.clone(), config);
     let submit_outcome = runtime
@@ -626,7 +634,7 @@ async fn cmd_resume(
 
     // We discard the runtime here: cmd_resume doesn't submit new work,
     // it just starts a worker to process the existing pending step.
-    let (_runtime, handles) = spawn_runtime(queue, store_ctx.object_store.clone(), runner);
+    let (_runtime, handles) = spawn_runtime(queue, store_ctx.object_store.clone(), runner)?;
 
     println!("Resuming {run_id}…");
 
@@ -636,15 +644,21 @@ async fn cmd_resume(
     finalize(cli, store_ctx, run_store, handles, &run_id, &existing.query).await
 }
 
-/// Handles tied to a running `WorkflowRuntime` worker task.
+/// Handles tied to a running `WorkflowRuntime` worker task and its
+/// paired fetch-job `JobRunner`.
 struct WorkerHandles {
     /// Terminal-hook signal.
     rx: oneshot::Receiver<RunOutcome>,
-    /// Spawned worker task.
+    /// Spawned workflow worker task.
     worker: tokio::task::JoinHandle<taquba_workflow::Result<()>>,
-    /// Sends a clean-shutdown signal so the worker stops polling once the
-    /// run is done (without waiting for Ctrl+C).
+    /// Sends a clean-shutdown signal so the workflow worker stops
+    /// polling once the run is done (without waiting for Ctrl+C).
     shutdown_tx: oneshot::Sender<()>,
+    /// Handle to the fetch JobRunner's worker task. Shutdown only
+    /// after the workflow worker has drained (any in-flight
+    /// FetchPage was awaited by the workflow step that submitted it),
+    /// so there's no work left at that point.
+    job_handle: RunnerHandle,
 }
 
 async fn finalize(
@@ -662,8 +676,9 @@ async fn finalize(
         mut rx,
         mut worker,
         shutdown_tx,
+        job_handle,
     } = handles;
-    tokio::select! {
+    let result = tokio::select! {
         out = &mut rx => {
             // Run reached a terminal step. Tell the worker to stop so it
             // doesn't keep polling the queue, then await its clean exit
@@ -681,7 +696,11 @@ async fn finalize(
             print_interrupted(run_id);
             Ok(())
         }
-    }
+    };
+    // Workflow worker has stopped (terminal or Ctrl+C). Drain the
+    // fetch JobRunner so its task exits before this fn returns.
+    let _ = job_handle.shutdown().await;
+    result
 }
 
 async fn handle_terminal(

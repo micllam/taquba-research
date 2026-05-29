@@ -125,6 +125,24 @@
 //! - **Per-transition durability.** Each step's state-change is a SlateDB
 //!   write to the configured object store (local FS / S3 / GCS / Azure).
 //!
+//! ## Fetching is the one fan-out phase
+//!
+//! Most phases are one workflow step per unit of work. Fetching is the
+//! exception: a single workflow step submits one `FetchPage` taquba-job
+//! per URL to a [`JobRunner`](taquba_jobs::JobRunner) sharing the
+//! queue (under a distinct queue-name), then `try_join_all`s the
+//! handles. The per-URL `idempotency_key` derives from
+//! `(run_id, url)`, so taquba-jobs's result-aware idempotent submit
+//! short-circuits to cached result blobs on step retry; no URL is
+//! fetched twice across attempts.
+//!
+//! [`spawn_fetch_runner`] is the helper that builds and spawns this
+//! `JobRunner`; both `ResearchAgent::run` and the CLI construct it
+//! internally, but callers driving a custom
+//! [`WorkflowRuntime`](taquba_workflow::WorkflowRuntime) need to call
+//! it themselves and attach the runner via
+//! [`ResearchStepRunner::with_job_runner`].
+//!
 //! See [taquba-workflow's docs] for the underlying runtime semantics.
 //!
 //! [Rig]: https://crates.io/crates/rig-core
@@ -135,6 +153,7 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+mod fetch_job;
 mod report;
 mod runner;
 /// Pluggable web-search backends used by the fetch phase. Implement
@@ -148,6 +167,7 @@ mod state;
 pub mod store;
 
 pub use agent::{ResearchAgent, ResearchAgentBuilder};
+pub use fetch_job::spawn_fetch_runner;
 pub use report::{Citation, Report, RunStats};
 pub use runner::{ResearchStepRunner, RunRecord};
 pub use state::{ResearchConfig, TokenUsage};
@@ -161,4 +181,11 @@ pub mod workflow {
         NoopTerminalHook, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner,
         SubmitOutcome, TerminalHook, TerminalStatus, WorkflowRuntime,
     };
+}
+
+/// Re-exports of the [`taquba_jobs`] types callers need to manage the
+/// fetch [`JobRunner`](taquba_jobs::JobRunner) returned by
+/// [`spawn_fetch_runner`].
+pub mod jobs {
+    pub use taquba_jobs::{JobRunner, RunnerHandle};
 }

@@ -3153,6 +3153,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "taquba-jobs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61221663cab02f8f30917df07035373063c9f31c72d9d9831e150298b19ba5d6"
+dependencies = [
+ "futures-util",
+ "rmp-serde",
+ "serde",
+ "sha2",
+ "taquba",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "taquba-research"
 version = "0.2.0"
 dependencies = [
@@ -3169,6 +3187,7 @@ dependencies = [
  "serde",
  "serde_json",
  "taquba",
+ "taquba-jobs",
  "taquba-workflow",
  "thiserror 1.0.69",
  "tokio",

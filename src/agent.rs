@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
 use crate::Report;
+use crate::fetch_job::spawn_fetch_runner;
 use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
@@ -54,11 +55,17 @@ impl ResearchAgent {
             tx: Mutex::new(Some(tx)),
         };
 
+        // Build the JobRunner the Fetching step submits FetchPage jobs
+        // to. It shares the same Queue + ObjectStore as the workflow
+        // runtime, distinguished by queue_name.
+        let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store)?;
+        let runner = self.runner.clone().with_job_runner(job_runner);
+
         // The research workflow is strictly sequential: each
         // `StepOutcome::Continue` enqueues the next step only after the
         // current one acks. One worker is enough and avoids unnecessary
         // claim transaction conflicts.
-        let runtime = WorkflowRuntime::builder(queue, object_store, self.runner.clone(), hook)
+        let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
             .max_concurrent_steps(1)
             .build();
 
@@ -86,6 +93,11 @@ impl ResearchAgent {
             .map_err(|_| anyhow!("terminal hook dropped before signalling"))?;
         let _ = shutdown_tx.send(());
         let _ = worker.await;
+        // Stop the JobRunner only after the workflow worker has
+        // drained: any still-in-flight FetchPage was awaited by the
+        // workflow step that submitted it, so by the time we get here
+        // there's nothing left for the job worker to do.
+        let _ = job_handle.shutdown().await;
 
         if let Some(store) = &self.run_store {
             persist_outcome(store, &outcome, &query).await?;

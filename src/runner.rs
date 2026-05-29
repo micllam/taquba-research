@@ -16,19 +16,16 @@ use rig_core::providers::{anthropic, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use taquba_jobs::{JobRunner, JoinError};
 use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
 use url::Url;
 
+use crate::fetch_job::FetchPage;
 use crate::report::{Citation, Report, RunStats, render_markdown};
 use crate::search::{SearchBackend, SearchError};
-use crate::state::{FetchedPage, Phase, ResearchConfig, ResearchState, Summary, TokenUsage};
+use crate::state::{Phase, ResearchConfig, ResearchState, Summary, TokenUsage};
 use crate::store::RunStore;
 
-/// Maximum bytes we'll read from a single fetch response, before
-/// applying the further `max_page_chars` cap on extracted text.
-const FETCH_RESPONSE_BYTE_CAP: usize = 2 * 1024 * 1024;
-/// Per-fetch HTTP timeout.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Preamble applied to every Rig agent built by the runner. Kept
 /// terse: the per-phase prompts carry the task-specific instructions.
 const AGENT_PREAMBLE: &str = "Be precise and concise.";
@@ -56,8 +53,8 @@ const MEMO_KEY_WRITING: &str = "writing";
 pub struct ResearchStepRunner {
     provider: Arc<ProviderClient>,
     search: Arc<dyn SearchBackend>,
-    http: reqwest::Client,
     run_store: Option<RunStore>,
+    job_runner: Option<Arc<JobRunner>>,
 }
 
 /// Per-provider LLM client.
@@ -94,16 +91,11 @@ impl ResearchStepRunner {
     }
 
     pub(crate) fn from_provider(provider: ProviderClient, search: Arc<dyn SearchBackend>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            .user_agent(concat!("taquba-research/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("reqwest client builder cannot fail with default config");
         Self {
             provider: Arc::new(provider),
             search,
-            http,
             run_store: None,
+            job_runner: None,
         }
     }
 
@@ -114,6 +106,18 @@ impl ResearchStepRunner {
     /// the runner ignores cancellation.
     pub fn with_run_store(mut self, store: RunStore) -> Self {
         self.run_store = Some(store);
+        self
+    }
+
+    /// Attach the [`JobRunner`] the fetching phase submits per-URL
+    /// `FetchPage` jobs to. Required when the workflow advances into
+    /// `Phase::Fetching`: the phase submits one job per URL and
+    /// `try_join_all`s the handles. The runner must already have
+    /// `FetchPage` registered and an `Arc<reqwest::Client>` on its
+    /// state; use [`crate::spawn_fetch_runner`] to build one with
+    /// both already attached.
+    pub fn with_job_runner(mut self, job_runner: Arc<JobRunner>) -> Self {
+        self.job_runner = Some(job_runner);
         self
     }
 
@@ -179,7 +183,7 @@ impl ResearchStepRunner {
         match state.phase {
             Phase::Planning => self.run_planning(step, state).await?,
             Phase::Searching => self.run_searching(state).await?,
-            Phase::Fetching => self.run_fetching(state).await?,
+            Phase::Fetching => self.run_fetching(step, state).await?,
             Phase::Summarizing => self.run_summarizing(step, state).await?,
             Phase::Synthesizing => self.run_synthesizing(step, state).await?,
             Phase::Writing => {
@@ -286,31 +290,58 @@ impl ResearchStepRunner {
         Ok(())
     }
 
-    async fn run_fetching(&self, state: &mut ResearchState) -> Result<(), StepError> {
-        let Some(url) = state.fetch_queue.pop_front() else {
-            state.phase = Phase::Summarizing;
-            return Ok(());
-        };
-        let total = state.fetched.len() + state.fetch_queue.len() + 1;
-        let done = state.fetched.len() + 1;
-        tracing::info!("fetching ({done}/{total}): {url}");
-
-        match fetch_and_extract(&self.http, &url, state.config.max_page_chars).await {
-            Ok(page) => {
-                state.summarize_queue.push_back(url.clone());
-                state.fetched.insert(url.as_str().to_string(), page);
-            }
-            Err(msg) => {
-                // "Best effort" page fetch: skip flaky sources rather than
-                // blocking the whole run on one. A multi-source agent
-                // can drop one URL.
-                tracing::warn!(url = %url, error = %msg, "fetch error, skipping page");
-            }
-        }
-
+    async fn run_fetching(&self, step: &Step, state: &mut ResearchState) -> Result<(), StepError> {
         if state.fetch_queue.is_empty() {
             state.phase = Phase::Summarizing;
+            return Ok(());
         }
+        let job_runner = self
+            .job_runner
+            .as_ref()
+            .ok_or_else(|| StepError::permanent("fetching phase requires a JobRunner"))?;
+
+        // Submit one FetchPage job per URL. Result-aware idempotent
+        // submit means a retry of this step re-submits the same
+        // payloads and either dedup-hits a still-pending submission
+        // or short-circuits to a cached result blob; either way no
+        // URL is fetched twice.
+        let urls: Vec<Url> = state.fetch_queue.iter().cloned().collect();
+        tracing::info!("fetching {} URLs in parallel", urls.len());
+        let mut handles = Vec::with_capacity(urls.len());
+        for url in &urls {
+            let job = FetchPage {
+                run_id: step.run_id.clone(),
+                url: url.clone(),
+                max_chars: state.config.max_page_chars,
+            };
+            let handle = job_runner
+                .submit(job)
+                .await
+                .map_err(|e| StepError::transient(format!("fetch submit: {e}")))?;
+            handles.push(handle);
+        }
+
+        // Await all the handles. A per-URL handler failure
+        // (`JoinError::Job`) is logged and skipped; an infrastructure
+        // error (`JoinError::Infra`) fails the step transiently so
+        // taquba re-delivers it.
+        for (url, handle) in urls.iter().zip(handles) {
+            match handle.await {
+                Ok(page) => {
+                    state.summarize_queue.push_back(url.clone());
+                    state.fetched.insert(url.as_str().to_string(), page);
+                }
+                Err(JoinError::Job(je)) => {
+                    tracing::warn!(url = %url, error = %je, "fetch failed, skipping page");
+                }
+                Err(JoinError::Infra(infra)) => {
+                    return Err(StepError::transient(format!("fetch infra: {infra}")));
+                }
+            }
+        }
+
+        state.fetch_queue.clear();
+        state.phase = Phase::Summarizing;
         Ok(())
     }
 
@@ -699,74 +730,6 @@ fn classify_structured_err(err: StructuredOutputError) -> StepError {
     }
 }
 
-/// Fetch a URL and extract title + plain-text body. Errors are returned
-/// as a single message string; the runner logs them and skips the page
-/// rather than failing the step, so the transient/permanent distinction
-/// the HTTP layer makes isn't acted on at this boundary (a multi-source
-/// agent loses little by dropping one flaky URL).
-async fn fetch_and_extract(
-    http: &reqwest::Client,
-    url: &Url,
-    max_chars: usize,
-) -> Result<FetchedPage, String> {
-    let resp = http
-        .get(url.as_str())
-        .send()
-        .await
-        .map_err(|e| format!("send: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("HTTP {status}"));
-    }
-
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    let is_html = content_type.contains("html") || content_type.is_empty();
-    let is_text = content_type.contains("text") || is_html;
-    if !is_text {
-        return Err(format!("non-text content-type: {content_type}"));
-    }
-
-    let bytes = resp.bytes().await.map_err(|e| format!("read body: {e}"))?;
-    let raw = String::from_utf8_lossy(&bytes[..bytes.len().min(FETCH_RESPONSE_BYTE_CAP)]);
-
-    let (title, text) = if is_html {
-        extract_html(&raw)
-    } else {
-        (String::new(), raw.to_string())
-    };
-    let text: String = text.chars().take(max_chars).collect();
-    if text.trim().is_empty() {
-        return Err("empty extracted text".into());
-    }
-    Ok(FetchedPage { title, text })
-}
-
-/// Extract the page's `<title>` and a plain-text
-/// rendering of the body.
-fn extract_html(html: &str) -> (String, String) {
-    let title = extract_tag_content(html, "title").unwrap_or_default();
-    // Width is intentionally large to avoid injecting newlines
-    // mid-sentence and bloating tokens.
-    let text = html2text::from_read(html.as_bytes(), 100_000).unwrap_or_default();
-    (title.trim().to_string(), text)
-}
-
-fn extract_tag_content(html: &str, tag: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let i = lower.find(&open)?;
-    let after_open = i + html[i..].find('>')? + 1;
-    let j = lower[after_open..].find(&close)?;
-    Some(html[after_open..after_open + j].to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,16 +781,6 @@ mod tests {
 
     fn http_status(code: u16) -> http_client::Error {
         http_client::Error::InvalidStatusCode(StatusCode::from_u16(code).unwrap())
-    }
-
-    #[test]
-    fn extract_html_yields_title_and_visible_body() {
-        let html = r#"<html><head><title>Hi</title><style>body{}</style></head>
-        <body><script>alert(1)</script><p>Hello &amp; welcome</p></body></html>"#;
-        let (title, text) = extract_html(html);
-        assert_eq!(title, "Hi");
-        assert!(text.contains("Hello & welcome"));
-        assert!(!text.contains("alert"));
     }
 
     #[tokio::test]
