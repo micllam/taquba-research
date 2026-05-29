@@ -481,6 +481,7 @@ fn build_config(cli: &Cli) -> ResearchConfig {
 /// experience a silent ~10-30s drain.
 fn spawn_runtime(
     queue: Arc<Queue>,
+    object_store: Arc<dyn ObjectStore>,
     runner: ResearchStepRunner,
 ) -> (
     WorkflowRuntime<ResearchStepRunner, CaptureHook>,
@@ -492,7 +493,7 @@ fn spawn_runtime(
     };
     // Sequential workflow: one claimer is enough. See agent.rs for
     // context.
-    let runtime = WorkflowRuntime::builder(queue, runner, hook)
+    let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
         .max_concurrent_steps(1)
         .build();
 
@@ -536,7 +537,7 @@ async fn cmd_run(
     let config = build_config(cli);
     let queue = open_queue(store_ctx).await?;
 
-    let (runtime, handles) = spawn_runtime(queue, runner);
+    let (runtime, handles) = spawn_runtime(queue, store_ctx.object_store.clone(), runner);
 
     let input = ResearchStepRunner::initial_state(query.clone(), config);
     let submit_outcome = runtime
@@ -625,7 +626,7 @@ async fn cmd_resume(
 
     // We discard the runtime here: cmd_resume doesn't submit new work,
     // it just starts a worker to process the existing pending step.
-    let (_runtime, handles) = spawn_runtime(queue, runner);
+    let (_runtime, handles) = spawn_runtime(queue, store_ctx.object_store.clone(), runner);
 
     println!("Resuming {run_id}…");
 

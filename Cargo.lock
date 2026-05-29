@@ -2920,9 +2920,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slatedb"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "286ec5657d17f3ba70c060becd57a5550ad43973b8480811ad27d3fa4d620a49"
+checksum = "f77abe3a47e3d669877cc9c83c5e853cb34d250cd1953ede8308b69e04e32c9d"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -2967,9 +2967,9 @@ dependencies = [
 
 [[package]]
 name = "slatedb-common"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9caca0e37a5bc4c65c61143cdd9674faa6b9f69f76a02e1edc94d8e2a6da414a"
+checksum = "396a08a34b93becfc72e7d7286f620ac887b48ad37bdaa4768b024df7c0ea7f5"
 dependencies = [
  "chrono",
  "log",
@@ -2979,9 +2979,9 @@ dependencies = [
 
 [[package]]
 name = "slatedb-txn-obj"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9bd80ee7b7f7da1fd4ada17fcf6ee564e76af71254e8189e68bf497856557aa"
+checksum = "37172cf2255b0f0c56f0d2e98dbc865b2f6dd56333ed297147e9bba5d9ecf97a"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3137,9 +3137,9 @@ dependencies = [
 
 [[package]]
 name = "taquba"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaf9303f49d80abdbf18e836807a14e1643350768b1e18b65ef9d849f695c55a"
+checksum = "2520a5c0bbe61759c43167cb7049aa1f67fa30620bb1caf7692ef92958dca202"
 dependencies = [
  "bytes",
  "rmp-serde",
@@ -3180,10 +3180,11 @@ dependencies = [
 
 [[package]]
 name = "taquba-workflow"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2be11f5cf7cef20cbea280cdfbd800f1ddcae34f9b3799d2b679c8284c67fe2c"
+checksum = "6546fa143d79916c1e0b31ce3874730c7d9bcdf07561526fe46884c3987c6364"
 dependencies = [
+ "futures-util",
  "rmp-serde",
  "serde",
  "sha2",

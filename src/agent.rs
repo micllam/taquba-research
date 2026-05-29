@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use rig_core::providers::{anthropic, openai};
 use taquba::Queue;
+use taquba::object_store::ObjectStore;
 use taquba_workflow::{RunOutcome, RunSpec, TerminalHook, TerminalStatus, WorkflowRuntime};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
@@ -35,7 +36,18 @@ impl ResearchAgent {
 
     /// Submit `query` to a fresh run, drive the workflow runtime until
     /// the run terminates, and return the rendered [`Report`].
-    pub async fn run(&self, queue: Arc<Queue>, query: impl Into<String>) -> Result<Report> {
+    ///
+    /// `object_store` backs the workflow runtime's [memo store] used to
+    /// short-circuit at-least-once retries of paid LLM calls. The common
+    /// case is to pass the same store the [`Queue`] was opened with.
+    ///
+    /// [memo store]: taquba_workflow::Memo
+    pub async fn run(
+        &self,
+        queue: Arc<Queue>,
+        object_store: Arc<dyn ObjectStore>,
+        query: impl Into<String>,
+    ) -> Result<Report> {
         let query = query.into();
         let (tx, rx) = oneshot::channel::<RunOutcome>();
         let hook = CaptureOutcome {
@@ -46,7 +58,7 @@ impl ResearchAgent {
         // `StepOutcome::Continue` enqueues the next step only after the
         // current one acks. One worker is enough and avoids unnecessary
         // claim transaction conflicts.
-        let runtime = WorkflowRuntime::builder(queue, self.runner.clone(), hook)
+        let runtime = WorkflowRuntime::builder(queue, object_store, self.runner.clone(), hook)
             .max_concurrent_steps(1)
             .build();
 

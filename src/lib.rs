@@ -11,7 +11,7 @@
 //!
 //! - **High-level**: [`ResearchAgent`] - a builder that wires Rig, a
 //!   [`SearchBackend`](search::SearchBackend), and a [`ResearchConfig`]
-//!   into a `run(queue, query)` helper.
+//!   into a `run(queue, object_store, query)` helper.
 //! - **Low-level**: [`ResearchStepRunner`] - a [`taquba_workflow::StepRunner`]
 //!   you can drop into your own [`taquba_workflow::WorkflowRuntime`].
 //!
@@ -38,7 +38,7 @@
 //!
 //! # async fn run() -> anyhow::Result<()> {
 //! let store = Arc::new(LocalFileSystem::new_with_prefix("./store")?);
-//! let queue = Arc::new(Queue::open(store, "taquba-research").await?);
+//! let queue = Arc::new(Queue::open(store.clone(), "taquba-research").await?);
 //!
 //! let rig = rig_core::providers::openai::Client::from_env()?;
 //!
@@ -50,7 +50,11 @@
 //!     .config(ResearchConfig::new("gpt-4o-mini"))
 //!     .build()?;
 //!
-//! let report = agent.run(queue, "Postgres vs SQLite for read-heavy workloads").await?;
+//! // `store` also backs the workflow's per-step memo, which short-
+//! // circuits LLM-call retries; sharing one store is the common case.
+//! let report = agent
+//!     .run(queue, store, "Postgres vs SQLite for read-heavy workloads")
+//!     .await?;
 //! println!("{}", report.markdown);
 //! # Ok(()) }
 //! ```

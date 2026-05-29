@@ -106,7 +106,7 @@ use taquba_research::{ResearchAgent, ResearchConfig, search::Tavily};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let store = Arc::new(LocalFileSystem::new_with_prefix("./store")?);
-    let queue = Arc::new(Queue::open(store, "research").await?);
+    let queue = Arc::new(Queue::open(store.clone(), "research").await?);
 
     let agent = ResearchAgent::builder()
         .openai(rig_core::providers::openai::Client::from_env()?)
@@ -116,7 +116,11 @@ async fn main() -> anyhow::Result<()> {
         .config(ResearchConfig::new("gpt-4o-mini"))
         .build()?;
 
-    let report = agent.run(queue, "Postgres vs SQLite for read-heavy workloads").await?;
+    // `store` also backs the workflow's per-step memo, which short-
+    // circuits LLM-call retries; sharing one store is the common case.
+    let report = agent
+        .run(queue, store, "Postgres vs SQLite for read-heavy workloads")
+        .await?;
     println!("{}", report.markdown);
     Ok(())
 }
