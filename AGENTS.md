@@ -71,7 +71,7 @@ OpenAI and Anthropic dispatch through the internal `ProviderClient` enum in `run
 
 ## Docstring style
 
-Keep docstrings about the code, not the conversation. State what a type or function is and any non-obvious behaviour or invariant; omit rationale that only makes sense in context of the change that introduced it (specific call sites, design history, debate that landed here). Where the *why* matters and is non-obvious, prefer a short note in this file (AGENTS.md) over a docstring that will drift as the code evolves.
+Keep docstrings about the code, not the conversation. State what a type or function is and any non-obvious behaviour or invariant; omit rationale that only makes sense in context of the change that introduced it (specific call sites, design history, debate that landed here). Where the *why* matters and is non-obvious, prefer a short note in this file (AGENTS.md) over a docstring that will drift as the code evolves. Write doc comments in formal, precise language; avoid colloquial wording.
 
 ## Content parity
 
