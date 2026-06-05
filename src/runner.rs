@@ -335,23 +335,18 @@ impl ResearchStepRunner {
         // the total is capped later by max_sources.
         let results = self.search.search(&q, 5).await?;
 
-        let known: HashSet<String> = state.fetched.keys().cloned().collect();
-        let mut queued: HashSet<String> = state
-            .fetch_queue
-            .iter()
-            .map(|u| u.as_str().to_string())
-            .collect();
+        let known: HashSet<Url> = state.fetched.keys().cloned().collect();
+        let mut queued: HashSet<Url> = state.fetch_queue.iter().cloned().collect();
 
         for h in &results {
-            let s = h.url.as_str().to_string();
-            if known.contains(&s) || queued.contains(&s) {
+            if known.contains(&h.url) || queued.contains(&h.url) {
                 continue;
             }
             if state.fetch_queue.len() >= state.config.max_sources {
                 break;
             }
             state.fetch_queue.push_back(h.url.clone());
-            queued.insert(s);
+            queued.insert(h.url.clone());
         }
         state.search_results.insert(idx, results);
 
@@ -419,7 +414,7 @@ impl ResearchStepRunner {
             match handle.await {
                 Ok(page) => {
                     state.summarize_queue.push_back(url.clone());
-                    state.fetched.insert(url.as_str().to_string(), page);
+                    state.fetched.insert(url.clone(), page);
                 }
                 Err(JoinError::Job(je)) => {
                     tracing::warn!(url = %url, error = %je, "fetch failed, skipping page");
@@ -449,8 +444,7 @@ impl ResearchStepRunner {
             state.phase = Phase::Synthesizing;
             return Ok(());
         };
-        let url_key = url.as_str().to_string();
-        let Some(page) = state.fetched.get(&url_key).cloned() else {
+        let Some(page) = state.fetched.get(&url).cloned() else {
             // Shouldn't happen as summarize_queue is populated only after
             // a successful fetch.
             if state.summarize_queue.is_empty() {
@@ -479,7 +473,7 @@ impl ResearchStepRunner {
         .await?;
 
         state.summaries.insert(
-            url_key,
+            url,
             Summary {
                 title: page.title,
                 text: parsed.summary,
@@ -502,7 +496,7 @@ impl ResearchStepRunner {
         let mut sources = String::new();
         let mut source_documents = Vec::new();
         let mut citations: Vec<Citation> = Vec::new();
-        let mut sorted: Vec<(&String, &Summary)> = state.summaries.iter().collect();
+        let mut sorted: Vec<(&Url, &Summary)> = state.summaries.iter().collect();
         sorted.sort_by(|a, b| {
             b.1.relevance
                 .partial_cmp(&a.1.relevance)
@@ -511,7 +505,7 @@ impl ResearchStepRunner {
         // The 1-based source number is the position in this sorted list and
         // is shared by the prompt text, the citation list, and any cited
         // excerpts. Building all three here keeps that numbering consistent.
-        for (idx, (url, s)) in sorted.iter().enumerate() {
+        for (idx, &(url, s)) in sorted.iter().enumerate() {
             let index = idx + 1;
             sources.push_str(&format!(
                 "Source {n} (relevance {r:.2}, title: {t}, URL: {u}):\n{x}\n\n",
@@ -521,15 +515,12 @@ impl ResearchStepRunner {
                 u = url,
                 x = s.text,
             ));
-            let Ok(parsed) = Url::parse(url) else {
-                continue;
-            };
             let citation = Citation {
                 index,
-                url: parsed,
+                url: (*url).clone(),
                 title: s.title.clone(),
             };
-            if let Some(page) = state.fetched.get(*url) {
+            if let Some(page) = state.fetched.get(url) {
                 source_documents.push(SynthesisDocument {
                     citation: citation.clone(),
                     text: page.text.clone(),

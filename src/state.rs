@@ -178,11 +178,11 @@ pub struct ResearchState {
     /// `fetched.keys()` before insertion.
     pub fetch_queue: VecDeque<Url>,
     /// Successfully fetched pages keyed by URL.
-    pub fetched: BTreeMap<String, FetchedPage>,
+    pub fetched: BTreeMap<Url, FetchedPage>,
     /// Queue of URLs yet to be summarized.
     pub summarize_queue: VecDeque<Url>,
-    /// Per-page summaries.
-    pub summaries: BTreeMap<String, Summary>,
+    /// Per-page summaries keyed by URL.
+    pub summaries: BTreeMap<Url, Summary>,
     /// Synthesized narrative and citation evidence produced by the
     /// synthesizing step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,6 +230,22 @@ mod tests {
     #[test]
     fn round_trip_serde() {
         let mut s = ResearchState::new("a query", ResearchConfig::new("gpt-4o-mini"));
+        let url: Url = "https://example.com/page".parse().unwrap();
+        s.fetched.insert(
+            url.clone(),
+            FetchedPage {
+                title: "Example".to_string(),
+                text: "page text".to_string(),
+            },
+        );
+        s.summaries.insert(
+            url.clone(),
+            Summary {
+                title: "Example".to_string(),
+                text: "summary text".to_string(),
+                relevance: 0.5,
+            },
+        );
         s.synthesis = Some(SynthesisOutput {
             narrative: "synthesized answer".to_string(),
             citations: vec![Citation {
@@ -247,6 +263,14 @@ mod tests {
         assert_eq!(back.query, "a query");
         assert_eq!(back.phase, Phase::Planning);
         assert_eq!(back.steps_completed, 0);
+        assert_eq!(
+            back.fetched.get(&url).map(|p| p.text.as_str()),
+            Some("page text")
+        );
+        assert_eq!(
+            back.summaries.get(&url).map(|m| m.text.as_str()),
+            Some("summary text")
+        );
         assert_eq!(back.synthesis, s.synthesis);
     }
 }
