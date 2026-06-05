@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::report::Citation;
 use crate::search::SearchResult;
 
 /// Configuration the user passes to a research run. Build with
@@ -125,6 +126,31 @@ pub struct Summary {
     pub relevance: f32,
 }
 
+/// A verbatim span quoted from a cited source, keyed to the [`Citation`]
+/// it backs. Only ever populated from provider-returned citation metadata
+/// (currently Anthropic document citations); empty otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SourceQuote {
+    /// 1-based index of the [`Citation`] this quote supports.
+    pub citation_index: usize,
+    /// Verbatim span quoted from the source.
+    pub excerpt: String,
+}
+
+/// Product of the synthesizing step: the narrative, the numbered source
+/// list it references, and any provider-returned excerpts backing those
+/// references.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SynthesisOutput {
+    /// Synthesized narrative produced by the synthesizing step.
+    pub narrative: String,
+    /// Numbered sources referenced by the narrative's `[N]` markers.
+    pub citations: Vec<Citation>,
+    /// Verbatim quotes from cited sources, each keyed to a citation index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<SourceQuote>,
+}
+
 /// The entire bytes-in / bytes-out state the runner threads between
 /// steps. Serialized as JSON so a `taquba-research show` against a future
 /// version can still decode old runs.
@@ -157,9 +183,10 @@ pub struct ResearchState {
     pub summarize_queue: VecDeque<Url>,
     /// Per-page summaries.
     pub summaries: BTreeMap<String, Summary>,
-    /// Synthesized narrative produced by the synthesizing step.
+    /// Synthesized narrative and citation evidence produced by the
+    /// synthesizing step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub synthesis: Option<String>,
+    pub synthesis: Option<SynthesisOutput>,
     /// Aggregate token usage across every LLM call made by this run.
     pub token_usage: TokenUsage,
 }
@@ -202,11 +229,24 @@ mod tests {
 
     #[test]
     fn round_trip_serde() {
-        let s = ResearchState::new("a query", ResearchConfig::new("gpt-4o-mini"));
+        let mut s = ResearchState::new("a query", ResearchConfig::new("gpt-4o-mini"));
+        s.synthesis = Some(SynthesisOutput {
+            narrative: "synthesized answer".to_string(),
+            citations: vec![Citation {
+                index: 1,
+                url: "https://example.com".parse().unwrap(),
+                title: "Example".to_string(),
+            }],
+            evidence: vec![SourceQuote {
+                citation_index: 1,
+                excerpt: "quoted source text".to_string(),
+            }],
+        });
         let bytes = s.to_bytes();
         let back = ResearchState::from_bytes(&bytes).unwrap();
         assert_eq!(back.query, "a query");
         assert_eq!(back.phase, Phase::Planning);
         assert_eq!(back.steps_completed, 0);
+        assert_eq!(back.synthesis, s.synthesis);
     }
 }

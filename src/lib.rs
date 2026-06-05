@@ -27,6 +27,11 @@
 //!   [`ResearchStepRunner::new_openai`] or
 //!   [`ResearchStepRunner::new_anthropic`], or use the
 //!   [`ResearchAgent::builder`]'s `.openai(...)` / `.anthropic(...)`.
+//! - **Citations**: Anthropic runs pass fetched pages as
+//!   citation-enabled document blocks during synthesis; when Claude
+//!   returns citation metadata, the final report includes the cited
+//!   source excerpts. OpenAI runs keep the standard numeric
+//!   source-list citations.
 //!
 //! # Quick start
 //!

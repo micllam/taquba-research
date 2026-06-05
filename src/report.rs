@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::state::TokenUsage;
+use crate::state::{SynthesisOutput, TokenUsage};
 
 /// Final result of a successful research run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +27,7 @@ pub struct Report {
 }
 
 /// A single citation referenced in [`Report::markdown`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Citation {
     /// 1-based index matching the inline `[N]` marker in the markdown body.
     pub index: usize,
@@ -75,7 +75,7 @@ pub(crate) fn render_markdown(
     query: &str,
     run_id: &str,
     body: &str,
-    citations: &[Citation],
+    synthesis: &SynthesisOutput,
     stats: &RunStats,
 ) -> String {
     let mut out = String::with_capacity(body.len() + 1024);
@@ -95,11 +95,21 @@ pub(crate) fn render_markdown(
     out.push_str("---\n\n");
     out.push_str(body.trim());
     out.push_str("\n\n## Citations\n\n");
-    if citations.is_empty() {
+    if synthesis.citations.is_empty() {
         out.push_str("_No sources cited._\n");
     } else {
-        for c in citations {
+        for c in &synthesis.citations {
             out.push_str(&format!("[{}] [{}]({})\n", c.index, c.title, c.url));
+        }
+    }
+    if !synthesis.evidence.is_empty() {
+        out.push_str("\n## Cited Source Excerpts\n\n");
+        for evidence in &synthesis.evidence {
+            out.push_str(&format!(
+                "- [{}]: {}\n",
+                evidence.citation_index,
+                compact_excerpt(&evidence.excerpt)
+            ));
         }
     }
     out
@@ -126,5 +136,31 @@ fn format_duration(d: Duration) -> String {
         format!("{m}m {s}s")
     } else {
         format!("{s}s")
+    }
+}
+
+fn compact_excerpt(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_excerpt_collapses_whitespace_without_truncating() {
+        let text = format!("{}\n\n{}", "a ".repeat(200), "b ".repeat(200));
+        let compact = compact_excerpt(&text);
+
+        assert!(!compact.contains('\n'));
+        assert!(!compact.ends_with("..."));
+        assert_eq!(
+            compact.chars().count(),
+            text.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .count()
+        );
     }
 }

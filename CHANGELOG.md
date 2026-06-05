@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Anthropic synthesis requests now pass fetched pages as citation-enabled
+  document blocks, and rendered reports include the source excerpts
+  Claude cited when citation metadata is returned.
+
 ### Changed
 - Bumped `rig-core` to 0.38.
 

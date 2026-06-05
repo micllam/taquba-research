@@ -18,6 +18,10 @@ Anthropic; otherwise OpenAI); pass `--provider openai|anthropic` to
 force a choice. The library exposes `ResearchStepRunner::new_openai`
 and `ResearchStepRunner::new_anthropic` plus matching
 `.openai(...)` / `.anthropic(...)` builder methods on `ResearchAgent`.
+Anthropic runs pass fetched pages as citation-enabled document blocks
+during synthesis; when Claude returns citation metadata, the final
+report includes the cited source excerpts. OpenAI runs keep the
+standard numeric source-list citations.
 
 ## Run
 

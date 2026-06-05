@@ -7,11 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
 use rig_core::completion::{
     CompletionError, Prompt, PromptError, StructuredOutputError, TypedPrompt, Usage,
+    message::{self, AssistantContent, UserContent},
 };
 use rig_core::http_client;
+use rig_core::providers::anthropic::completion as anthropic_completion;
 use rig_core::providers::{anthropic, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -24,7 +27,9 @@ use url::Url;
 use crate::fetch_job::FetchPage;
 use crate::report::{Citation, Report, RunStats, render_markdown};
 use crate::search::{SearchBackend, SearchError};
-use crate::state::{Phase, ResearchConfig, ResearchState, Summary, TokenUsage};
+use crate::state::{
+    Phase, ResearchConfig, ResearchState, SourceQuote, Summary, SynthesisOutput, TokenUsage,
+};
 use crate::store::RunStore;
 
 /// Preamble applied to every Rig agent built by the runner. Kept
@@ -233,6 +238,14 @@ impl Drop for PendingJobsGuard {
             }
         });
     }
+}
+
+#[derive(Debug, Clone)]
+struct SynthesisDocument {
+    /// The numbered source this document backs.
+    citation: Citation,
+    /// Full fetched body fed to the model for synthesis.
+    text: String,
 }
 
 impl ResearchStepRunner {
@@ -487,20 +500,42 @@ impl ResearchStepRunner {
     ) -> Result<(), StepError> {
         tracing::info!("synthesizing from {} sources", state.summaries.len());
         let mut sources = String::new();
+        let mut source_documents = Vec::new();
+        let mut citations: Vec<Citation> = Vec::new();
         let mut sorted: Vec<(&String, &Summary)> = state.summaries.iter().collect();
         sorted.sort_by(|a, b| {
             b.1.relevance
                 .partial_cmp(&a.1.relevance)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        for (idx, (_url, s)) in sorted.iter().enumerate() {
+        // The 1-based source number is the position in this sorted list and
+        // is shared by the prompt text, the citation list, and any cited
+        // excerpts. Building all three here keeps that numbering consistent.
+        for (idx, (url, s)) in sorted.iter().enumerate() {
+            let index = idx + 1;
             sources.push_str(&format!(
-                "Source {n} (relevance {r:.2}, title: {t}):\n{x}\n\n",
-                n = idx + 1,
+                "Source {n} (relevance {r:.2}, title: {t}, URL: {u}):\n{x}\n\n",
+                n = index,
                 r = s.relevance,
                 t = s.title,
+                u = url,
                 x = s.text,
             ));
+            let Ok(parsed) = Url::parse(url) else {
+                continue;
+            };
+            let citation = Citation {
+                index,
+                url: parsed,
+                title: s.title.clone(),
+            };
+            if let Some(page) = state.fetched.get(*url) {
+                source_documents.push(SynthesisDocument {
+                    citation: citation.clone(),
+                    text: page.text.clone(),
+                });
+            }
+            citations.push(citation);
         }
         if sources.is_empty() {
             sources.push_str("(no sources gathered)\n");
@@ -516,8 +551,15 @@ impl ResearchStepRunner {
             q = state.query,
             s = sources,
         );
-        let synthesis: String = memoized(&step.memo, MEMO_KEY_SYNTHESIZING, async {
-            self.llm_prompt(&prompt, state).await
+        let synthesis: SynthesisOutput = memoized(&step.memo, MEMO_KEY_SYNTHESIZING, async {
+            let (narrative, evidence) = self
+                .llm_synthesis_prompt(&prompt, &source_documents, state)
+                .await?;
+            Ok(SynthesisOutput {
+                narrative,
+                citations,
+                evidence,
+            })
         })
         .await?;
         state.synthesis = Some(synthesis);
@@ -533,24 +575,6 @@ impl ResearchStepRunner {
         tracing::info!("writing final report");
         let synthesis = state.synthesis.clone().unwrap_or_default();
 
-        let mut sorted: Vec<(&String, &Summary)> = state.summaries.iter().collect();
-        sorted.sort_by(|a, b| {
-            b.1.relevance
-                .partial_cmp(&a.1.relevance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let citations: Vec<Citation> = sorted
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (url, s))| {
-                Url::parse(url).ok().map(|u| Citation {
-                    index: i + 1,
-                    url: u,
-                    title: s.title.clone(),
-                })
-            })
-            .collect();
-
         let prompt = format!(
             "You are a technical writer. Produce a polished markdown research \
              report answering the user's query, structured as: a one-sentence \
@@ -561,7 +585,7 @@ impl ResearchStepRunner {
              top-level `# ` header (it will be added by the runner).\n\n\
              User query: {q}\n\nSynthesis to expand:\n\n{syn}",
             q = state.query,
-            syn = synthesis,
+            syn = synthesis.narrative,
         );
 
         let body: String = memoized(&step.memo, MEMO_KEY_WRITING, async {
@@ -581,12 +605,12 @@ impl ResearchStepRunner {
             token_usage: state.token_usage,
         };
 
-        let markdown = render_markdown(&state.query, &step.run_id, &body, &citations, &stats);
+        let markdown = render_markdown(&state.query, &step.run_id, &body, &synthesis, &stats);
         Ok(Report {
             run_id: step.run_id.clone(),
             query: state.query.clone(),
             markdown,
-            citations,
+            citations: synthesis.citations,
             stats,
         })
     }
@@ -627,6 +651,38 @@ impl ResearchStepRunner {
         };
         record_usage(&mut state.token_usage, &response.usage);
         Ok(response.output)
+    }
+
+    async fn llm_synthesis_prompt(
+        &self,
+        prompt: &str,
+        source_documents: &[SynthesisDocument],
+        state: &mut ResearchState,
+    ) -> Result<(String, Vec<SourceQuote>), StepError> {
+        match self.provider.as_ref() {
+            ProviderClient::Anthropic(client) if !source_documents.is_empty() => {
+                let agent = client
+                    .agent(&state.config.model)
+                    .preamble(AGENT_PREAMBLE)
+                    .max_tokens(state.config.max_tokens_per_call)
+                    .build();
+                let message = anthropic_document_message(prompt, source_documents)?;
+                let response = agent
+                    .prompt(message)
+                    .extended_details()
+                    .await
+                    .map_err(classify_rig_err)?;
+                record_usage(&mut state.token_usage, &response.usage);
+                let evidence = response
+                    .messages
+                    .as_deref()
+                    .map(|messages| extract_anthropic_source_quotes(messages, source_documents))
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok((response.output, evidence))
+            }
+            _ => Ok((self.llm_prompt(prompt, state).await?, Vec::new())),
+        }
     }
 
     /// Run a structured completion via Rig's `prompt_typed`, dispatched
@@ -794,6 +850,100 @@ struct Plan {
 struct SummaryResp {
     summary: String,
     relevance: f32,
+}
+
+fn anthropic_document_message(
+    prompt: &str,
+    source_documents: &[SynthesisDocument],
+) -> Result<message::Message, StepError> {
+    let mut content = Vec::with_capacity(source_documents.len() + 1);
+    content.push(UserContent::text(format!(
+        "{prompt}\n\nUse the attached source documents as the authoritative \
+         citation corpus. The documents are in the same order as the numbered \
+         sources above. Cite relevant claims with the source numbers already \
+         assigned above."
+    )));
+
+    for document in source_documents {
+        content.push(UserContent::Document(message::Document {
+            data: message::DocumentSourceKind::String(document.text.clone()),
+            media_type: Some(message::DocumentMediaType::TXT),
+            additional_params: Some(serde_json::json!({
+                "title": format!("Source {}: {}", document.citation.index, document.citation.title),
+                "context": format!("URL: {}", document.citation.url),
+                "citations": { "enabled": true },
+            })),
+        }));
+    }
+
+    OneOrMany::many(content)
+        .map(message::Message::from)
+        .map_err(|e| StepError::permanent(format!("anthropic document prompt: {e}")))
+}
+
+fn extract_anthropic_source_quotes(
+    messages: &[message::Message],
+    source_documents: &[SynthesisDocument],
+) -> Result<Vec<SourceQuote>, StepError> {
+    let mut evidence = Vec::new();
+    let mut seen = HashSet::new();
+
+    for message in messages {
+        let message::Message::Assistant { content, .. } = message else {
+            continue;
+        };
+        for block in content.iter() {
+            let AssistantContent::Text(text) = block else {
+                continue;
+            };
+            let citations = anthropic_completion::anthropic_citations(text)
+                .map_err(|e| StepError::permanent(format!("anthropic citation decode: {e}")))?;
+            for citation in citations {
+                let Some((document_index, cited_text)) =
+                    anthropic_citation_document_span(&citation)
+                else {
+                    continue;
+                };
+                let Some(document) = source_documents.get(document_index) else {
+                    continue;
+                };
+                if !seen.insert((document.citation.index, cited_text.to_string())) {
+                    continue;
+                }
+                evidence.push(SourceQuote {
+                    citation_index: document.citation.index,
+                    excerpt: cited_text.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(evidence)
+}
+
+fn anthropic_citation_document_span(
+    citation: &anthropic_completion::Citation,
+) -> Option<(usize, &str)> {
+    match citation {
+        anthropic_completion::Citation::CharLocation {
+            document_index,
+            cited_text,
+            ..
+        }
+        | anthropic_completion::Citation::PageLocation {
+            document_index,
+            cited_text,
+            ..
+        }
+        | anthropic_completion::Citation::ContentBlockLocation {
+            document_index,
+            cited_text,
+            ..
+        } => Some((*document_index, cited_text.as_str())),
+        anthropic_completion::Citation::SearchResultLocation { .. }
+        | anthropic_completion::Citation::WebSearchResultLocation { .. }
+        | anthropic_completion::Citation::Unknown(_) => None,
+    }
 }
 
 /// Classify a typed-prompt error. Delegates the wrapped `PromptError`
@@ -971,6 +1121,84 @@ mod tests {
             chat_history: Box::new(Vec::new()),
         };
         assert_permanent(&classify_rig_err(err));
+    }
+
+    #[test]
+    fn extract_anthropic_source_quotes_maps_document_indices_to_sources() {
+        let documents = vec![
+            SynthesisDocument {
+                citation: Citation {
+                    index: 1,
+                    url: "https://example.com/one".parse().unwrap(),
+                    title: "One".to_string(),
+                },
+                text: "first source text".to_string(),
+            },
+            SynthesisDocument {
+                citation: Citation {
+                    index: 2,
+                    url: "https://example.com/two".parse().unwrap(),
+                    title: "Two".to_string(),
+                },
+                text: "second source text".to_string(),
+            },
+        ];
+        let citations = serde_json::to_value(vec![anthropic_completion::Citation::CharLocation {
+            cited_text: "second source text".to_string(),
+            document_index: 1,
+            document_title: Some("Source 2: Two".to_string()),
+            start_char_index: 0,
+            end_char_index: 18,
+        }])
+        .unwrap();
+        let messages = vec![message::Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::Text(message::Text {
+                text: "summary".to_string(),
+                additional_params: Some(serde_json::json!({ "citations": citations })),
+            })),
+        }];
+
+        let evidence = extract_anthropic_source_quotes(&messages, &documents).unwrap();
+
+        assert_eq!(
+            evidence,
+            vec![SourceQuote {
+                citation_index: 2,
+                excerpt: "second source text".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_anthropic_source_quotes_deduplicates_repeated_spans() {
+        let documents = vec![SynthesisDocument {
+            citation: Citation {
+                index: 1,
+                url: "https://example.com/one".parse().unwrap(),
+                title: "One".to_string(),
+            },
+            text: "first source text".to_string(),
+        }];
+        let citation = anthropic_completion::Citation::CharLocation {
+            cited_text: "first source text".to_string(),
+            document_index: 0,
+            document_title: Some("Source 1: One".to_string()),
+            start_char_index: 0,
+            end_char_index: 17,
+        };
+        let citations = serde_json::to_value(vec![citation.clone(), citation]).unwrap();
+        let messages = vec![message::Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::Text(message::Text {
+                text: "summary".to_string(),
+                additional_params: Some(serde_json::json!({ "citations": citations })),
+            })),
+        }];
+
+        let evidence = extract_anthropic_source_quotes(&messages, &documents).unwrap();
+
+        assert_eq!(evidence.len(), 1);
     }
 
     #[tokio::test]
