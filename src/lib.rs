@@ -17,21 +17,29 @@
 //!
 //! # Providers
 //!
-//! OpenAI and Anthropic are both supported via Rig.
+//! OpenAI, Anthropic, and Ollama (local models) are supported via Rig.
 //!
-//! - **CLI**: pass `--provider openai` (default) or
-//!   `--provider anthropic`. If unset, the CLI picks based on which
+//! - **CLI**: pass `--provider openai` (default), `--provider anthropic`,
+//!   or `--provider ollama`. If unset, the CLI picks based on which
 //!   `*_API_KEY` env var is set: `ANTHROPIC_API_KEY` alone selects
-//!   Anthropic; otherwise OpenAI.
+//!   Anthropic; otherwise OpenAI. Ollama is never auto-selected; request
+//!   it explicitly; it connects to `http://localhost:11434` by default
+//!   (override `OLLAMA_API_BASE_URL`) and needs no API key.
 //! - **Library**: build the runner via
-//!   [`ResearchStepRunner::new_openai`] or
-//!   [`ResearchStepRunner::new_anthropic`], or use the
-//!   [`ResearchAgent::builder`]'s `.openai(...)` / `.anthropic(...)`.
+//!   [`ResearchStepRunner::new_openai`],
+//!   [`ResearchStepRunner::new_anthropic`], or
+//!   [`ResearchStepRunner::new_ollama`], or use the
+//!   [`ResearchAgent::builder`]'s `.openai(...)` / `.anthropic(...)` /
+//!   `.ollama(...)`.
 //! - **Citations**: Anthropic runs pass fetched pages as
 //!   citation-enabled document blocks during synthesis; when Claude
 //!   returns citation metadata, the final report includes the cited
-//!   source excerpts. OpenAI runs keep the standard numeric
+//!   source excerpts. OpenAI and Ollama runs keep the standard numeric
 //!   source-list citations.
+//! - **Structured phases**: the Planning and Summarizing phases use
+//!   structured (`prompt_typed`) completions, so an Ollama model must
+//!   reliably emit schema-valid JSON; small local models that don't will
+//!   dead-letter those steps.
 //!
 //! # Quick start
 //!

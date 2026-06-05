@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rig_core::providers::{anthropic, openai};
+use rig_core::providers::{anthropic, ollama, openai};
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
 use taquba_workflow::{RunOutcome, RunSpec, TerminalHook, TerminalStatus, WorkflowRuntime};
@@ -196,8 +196,8 @@ async fn persist_outcome(store: &RunStore, outcome: &RunOutcome, query: &str) ->
 
 /// Builder for [`ResearchAgent`]. Required fields:
 ///
-/// - A provider client (call [`Self::openai`] *or* [`Self::anthropic`]).
-///   Last call wins if both are invoked.
+/// - A provider client (call [`Self::openai`], [`Self::anthropic`], or
+///   [`Self::ollama`]). Last call wins if more than one is invoked.
 /// - [`Self::search`]: a [`SearchBackend`] implementation.
 /// - [`Self::config`]: a [`ResearchConfig`] built via
 ///   [`ResearchConfig::new`] with the model identifier you want.
@@ -223,6 +223,12 @@ impl ResearchAgentBuilder {
     /// Set the Rig Anthropic client.
     pub fn anthropic(mut self, client: anthropic::Client) -> Self {
         self.provider = Some(ProviderClient::Anthropic(client));
+        self
+    }
+
+    /// Set the Rig Ollama client, for local models.
+    pub fn ollama(mut self, client: ollama::Client) -> Self {
+        self.provider = Some(ProviderClient::Ollama(client));
         self
     }
 
@@ -254,7 +260,9 @@ impl ResearchAgentBuilder {
     /// Finalize the builder.
     pub fn build(self) -> Result<ResearchAgent> {
         let provider = self.provider.ok_or_else(|| {
-            anyhow!("ResearchAgent requires a provider client (call .openai() or .anthropic())")
+            anyhow!(
+                "ResearchAgent requires a provider client (call .openai(), .anthropic(), or .ollama())"
+            )
         })?;
         let search = self
             .search

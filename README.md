@@ -12,16 +12,24 @@ stopped without re-paying for completed steps.
 cargo install taquba-research
 ```
 
-OpenAI and Anthropic are both supported via Rig. The CLI picks based
-on which `*_API_KEY` env var is set (`ANTHROPIC_API_KEY` alone selects
-Anthropic; otherwise OpenAI); pass `--provider openai|anthropic` to
-force a choice. The library exposes `ResearchStepRunner::new_openai`
-and `ResearchStepRunner::new_anthropic` plus matching
-`.openai(...)` / `.anthropic(...)` builder methods on `ResearchAgent`.
+OpenAI, Anthropic, and Ollama (local models) are supported via Rig. The
+CLI picks based on which `*_API_KEY` env var is set (`ANTHROPIC_API_KEY`
+alone selects Anthropic; otherwise OpenAI); pass
+`--provider openai|anthropic|ollama` to force a choice. Ollama is never
+auto-selected; request it explicitly; it connects to
+`http://localhost:11434` by default (override `OLLAMA_API_BASE_URL`) and
+needs no API key. The library exposes `ResearchStepRunner::new_openai`,
+`ResearchStepRunner::new_anthropic`, and `ResearchStepRunner::new_ollama`
+plus matching `.openai(...)` / `.anthropic(...)` / `.ollama(...)` builder
+methods on `ResearchAgent`.
+
 Anthropic runs pass fetched pages as citation-enabled document blocks
 during synthesis; when Claude returns citation metadata, the final
-report includes the cited source excerpts. OpenAI runs keep the
-standard numeric source-list citations.
+report includes the cited source excerpts. OpenAI and Ollama runs keep
+the standard numeric source-list citations. The Planning and Summarizing
+phases use structured completions, so an Ollama model must reliably emit
+schema-valid JSON; small local models that don't will dead-letter those
+steps.
 
 ## Run
 

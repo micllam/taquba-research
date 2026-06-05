@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Anthropic synthesis requests now pass fetched pages as citation-enabled
   document blocks, and rendered reports include the source excerpts
   Claude cited when citation metadata is returned.
+- Ollama provider support for local models: `ResearchStepRunner::new_ollama`,
+  the `ResearchAgent` builder's `.ollama(...)`, and `--provider ollama` on
+  the CLI (connects to `http://localhost:11434` by default, override with
+  `OLLAMA_API_BASE_URL`, no API key required). Document-citation synthesis
+  remains Anthropic-only; Ollama runs use the plain numeric source list.
 
 ### Changed
 - Bumped `rig-core` to 0.38.

@@ -61,7 +61,7 @@ The mapping helpers in `runner.rs` — `classify_rig_err`, `classify_structured_
 
 ## LLM providers
 
-OpenAI and Anthropic dispatch through the internal `ProviderClient` enum in `runner.rs`; both are compiled in unconditionally (Rig doesn't feature-gate providers, so neither do we). The CLI's `--provider` flag auto-detects from env keys when unset (`ANTHROPIC_API_KEY` alone → Anthropic; otherwise OpenAI). Default model identifiers live on `CliProvider::default_model`; keep them in sync with the constants exported from `rig_core::providers::<p>::completion`.
+OpenAI, Anthropic, and Ollama dispatch through the internal `ProviderClient` enum in `runner.rs`; all are compiled in unconditionally (Rig doesn't feature-gate providers, so neither do we). The CLI's `--provider` flag auto-detects from env keys when unset (`ANTHROPIC_API_KEY` alone → Anthropic; otherwise OpenAI); Ollama is never auto-detected (no API key) and must be requested explicitly. Default model identifiers live on `CliProvider::default_model`; keep them in sync with the constants exported from `rig_core::providers::<p>` (e.g. `ollama::LLAMA3_2`). Document-citation synthesis is Anthropic-only; other providers fall through to the plain-prompt path with no cited excerpts.
 
 ## Don't re-add without discussion
 

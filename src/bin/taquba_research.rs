@@ -21,7 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use rig_core::client::ProviderClient;
-use rig_core::providers::{anthropic, openai};
+use rig_core::providers::{anthropic, ollama, openai};
 use taquba::Queue;
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
@@ -52,6 +52,7 @@ enum CliProvider {
     #[value(name = "openai")]
     OpenAi,
     Anthropic,
+    Ollama,
 }
 
 impl CliProvider {
@@ -60,11 +61,13 @@ impl CliProvider {
         match self {
             CliProvider::OpenAi => "gpt-4o-mini",
             CliProvider::Anthropic => "claude-haiku-4-5",
+            CliProvider::Ollama => ollama::LLAMA3_2,
         }
     }
 
     /// Resolve `--provider` against env vars. If the user passed
-    /// `--provider <p>` explicitly, that wins. Otherwise: if
+    /// `--provider <p>` explicitly, that wins (the only way to select
+    /// `ollama`, since it has no API key to auto-detect). Otherwise: if
     /// `ANTHROPIC_API_KEY` is set and `OPENAI_API_KEY` is not, pick
     /// Anthropic; otherwise default to OpenAI.
     fn resolve(explicit: Option<CliProvider>) -> CliProvider {
@@ -116,16 +119,18 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     max_sources: usize,
 
-    /// LLM provider. If unset, the CLI picks one based on which
-    /// `*_API_KEY` env var is set: `ANTHROPIC_API_KEY` alone selects
-    /// `anthropic`; otherwise `openai` is used. Pass `--provider` to
-    /// force a specific choice.
+    /// LLM provider (`openai`, `anthropic`, or `ollama`). If unset, the
+    /// CLI picks one based on which `*_API_KEY` env var is set:
+    /// `ANTHROPIC_API_KEY` alone selects `anthropic`; otherwise `openai`
+    /// is used. `ollama` (local models) is never auto-selected: pass
+    /// `--provider ollama` explicitly.
     #[arg(long, value_enum)]
     provider: Option<CliProvider>,
 
     /// Specific model identifier passed to the provider. If unset,
     /// the CLI picks a provider-appropriate default
-    /// (`gpt-4o-mini` for OpenAI, `claude-haiku-4-5` for Anthropic).
+    /// (`gpt-4o-mini` for OpenAI, `claude-haiku-4-5` for Anthropic,
+    /// `llama3.2` for Ollama).
     #[arg(long)]
     model: Option<String>,
 
@@ -462,6 +467,11 @@ fn build_runner(cli: &Cli, run_store: &RunStore) -> Result<ResearchStepRunner> {
             let client =
                 anthropic::Client::from_env().context("ANTHROPIC_API_KEY missing or invalid")?;
             ResearchStepRunner::new_anthropic(client, search)
+        }
+        CliProvider::Ollama => {
+            // No API key; defaults to localhost:11434 (OLLAMA_API_BASE_URL).
+            let client = ollama::Client::from_env().context("failed to build Ollama client")?;
+            ResearchStepRunner::new_ollama(client, search)
         }
     };
     Ok(runner.with_run_store(run_store.clone()))

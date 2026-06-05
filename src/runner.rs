@@ -15,7 +15,7 @@ use rig_core::completion::{
 };
 use rig_core::http_client;
 use rig_core::providers::anthropic::completion as anthropic_completion;
-use rig_core::providers::{anthropic, openai};
+use rig_core::providers::{anthropic, ollama, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,7 @@ pub struct ResearchStepRunner {
 pub(crate) enum ProviderClient {
     OpenAi(openai::Client),
     Anthropic(anthropic::Client),
+    Ollama(ollama::Client),
 }
 
 /// What the terminal hook persists for a finished run. Distinct from the
@@ -95,6 +96,12 @@ impl ResearchStepRunner {
     /// Build a runner from a Rig Anthropic client and a search backend.
     pub fn new_anthropic(client: anthropic::Client, search: Arc<dyn SearchBackend>) -> Self {
         Self::from_provider(ProviderClient::Anthropic(client), search)
+    }
+
+    /// Build a runner from a Rig Ollama client and a search backend, for
+    /// local models.
+    pub fn new_ollama(client: ollama::Client, search: Arc<dyn SearchBackend>) -> Self {
+        Self::from_provider(ProviderClient::Ollama(client), search)
     }
 
     pub(crate) fn from_provider(provider: ProviderClient, search: Arc<dyn SearchBackend>) -> Self {
@@ -639,6 +646,18 @@ impl ResearchStepRunner {
                     .await
                     .map_err(classify_rig_err)?
             }
+            ProviderClient::Ollama(client) => {
+                let agent = client
+                    .agent(&state.config.model)
+                    .preamble(AGENT_PREAMBLE)
+                    .max_tokens(state.config.max_tokens_per_call)
+                    .build();
+                agent
+                    .prompt(prompt)
+                    .extended_details()
+                    .await
+                    .map_err(classify_rig_err)?
+            }
         };
         record_usage(&mut state.token_usage, &response.usage);
         Ok(response.output)
@@ -702,6 +721,19 @@ impl ResearchStepRunner {
                 (response.output, response.usage)
             }
             ProviderClient::Anthropic(client) => {
+                let agent = client
+                    .agent(&state.config.model)
+                    .preamble(AGENT_PREAMBLE)
+                    .max_tokens(state.config.max_tokens_per_call)
+                    .build();
+                let response = agent
+                    .prompt_typed::<T>(prompt)
+                    .extended_details()
+                    .await
+                    .map_err(classify_structured_err)?;
+                (response.output, response.usage)
+            }
+            ProviderClient::Ollama(client) => {
                 let agent = client
                     .agent(&state.config.model)
                     .preamble(AGENT_PREAMBLE)
