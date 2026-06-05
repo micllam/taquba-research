@@ -36,7 +36,7 @@ features = ["aws"]
 taquba = "0.7"
 taquba-workflow = "0.5"
 taquba-jobs = "0.3"
-rig-core = "0.37"
+rig-core = "0.38"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
@@ -63,4 +63,3 @@ html2text = "0.17"
 tokio = { version = "1", features = ["test-util"] }
 # `CancellationToken` for constructing `taquba_workflow::Step` in tests.
 tokio-util = { version = "0.7", default-features = false }
-

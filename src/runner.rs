@@ -725,7 +725,8 @@ fn classify_rig_err(err: PromptError) -> StepError {
         PromptError::MaxTurnsError { .. }
         | PromptError::ToolError(_)
         | PromptError::ToolServerError(_)
-        | PromptError::PromptCancelled { .. } => {
+        | PromptError::PromptCancelled { .. }
+        | PromptError::UnknownToolCall { .. } => {
             StepError::permanent(format!("LLM permanent failure: {msg}"))
         }
 
@@ -959,6 +960,17 @@ mod tests {
     fn classify_rig_err_http_429_is_transient() {
         let err = PromptError::CompletionError(CompletionError::HttpError(http_status(429)));
         assert_transient(&classify_rig_err(err));
+    }
+
+    #[test]
+    fn classify_rig_err_unknown_tool_call_is_permanent() {
+        let err = PromptError::UnknownToolCall {
+            tool_name: "lookup".to_string(),
+            available_tools: Vec::new(),
+            allowed_tools: Vec::new(),
+            chat_history: Box::new(Vec::new()),
+        };
+        assert_permanent(&classify_rig_err(err));
     }
 
     #[tokio::test]
