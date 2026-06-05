@@ -59,8 +59,8 @@ impl CliProvider {
     /// Default model identifier when the user doesn't pass `--model`.
     fn default_model(self) -> &'static str {
         match self {
-            CliProvider::OpenAi => "gpt-4o-mini",
-            CliProvider::Anthropic => "claude-haiku-4-5",
+            CliProvider::OpenAi => openai::completion::GPT_4O_MINI,
+            CliProvider::Anthropic => anthropic::completion::CLAUDE_HAIKU_4_5,
             CliProvider::Ollama => ollama::LLAMA3_2,
         }
     }
