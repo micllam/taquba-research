@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to agents when working with code in this repository.
 
 Single-crate repo (`[lib]` + `[[bin]]`) built on the [`taquba`](https://crates.io/crates/taquba) workspace's `taquba`, `taquba-workflow`, and `taquba-jobs` crates. Audience: Rust developers using [Rig](https://crates.io/crates/rig-core).
 
@@ -71,7 +71,7 @@ OpenAI and Anthropic dispatch through the internal `ProviderClient` enum in `run
 
 ## Docstring style
 
-Keep docstrings about the code, not the conversation. State what a type or function is and any non-obvious behaviour or invariant; omit rationale that only makes sense in context of the change that introduced it (specific call sites, design history, debate that landed here). Where the *why* matters and is non-obvious, prefer a short note in this file (CLAUDE.md) over a docstring that will drift as the code evolves.
+Keep docstrings about the code, not the conversation. State what a type or function is and any non-obvious behaviour or invariant; omit rationale that only makes sense in context of the change that introduced it (specific call sites, design history, debate that landed here). Where the *why* matters and is non-obvious, prefer a short note in this file (AGENTS.md) over a docstring that will drift as the code evolves.
 
 ## Content parity
 
