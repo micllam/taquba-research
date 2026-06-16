@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `research-fetch-jobs-results/terminals/` prefixes under your `--store`.
   Markers left behind are inert but never swept, so their blobs are
   retained indefinitely.
+- **Breaking (on-disk):** the durable `ResearchState.synthesis` field
+  changed type, so a run interrupted at or after the synthesizing phase
+  under 0.3.0 cannot be resumed under this release. Drain or discard
+  in-flight runs before upgrading; completed runs, reports, and the
+  `list`/`show`/`status` subcommands are unaffected.
 
 ## [0.3.0] - 2026-05-29
 
