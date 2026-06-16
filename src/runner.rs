@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rig_core::OneOrMany;
+use rig_core::agent::{PromptResponse, TypedPromptResponse};
 use rig_core::client::CompletionClient;
 use rig_core::completion::{
     CompletionError, Prompt, PromptError, StructuredOutputError, TypedPrompt, Usage,
@@ -621,44 +622,19 @@ impl ResearchStepRunner {
         prompt: &str,
         state: &mut ResearchState,
     ) -> Result<String, StepError> {
+        let model = &state.config.model;
+        let max_tokens = state.config.max_tokens_per_call;
         let response = match self.provider.as_ref() {
             ProviderClient::OpenAi(client) => {
-                let agent = client
-                    .agent(&state.config.model)
-                    .preamble(AGENT_PREAMBLE)
-                    .max_tokens(state.config.max_tokens_per_call)
-                    .build();
-                agent
-                    .prompt(prompt)
-                    .extended_details()
-                    .await
-                    .map_err(classify_rig_err)?
+                prompt_extended(client, model, max_tokens, prompt).await
             }
             ProviderClient::Anthropic(client) => {
-                let agent = client
-                    .agent(&state.config.model)
-                    .preamble(AGENT_PREAMBLE)
-                    .max_tokens(state.config.max_tokens_per_call)
-                    .build();
-                agent
-                    .prompt(prompt)
-                    .extended_details()
-                    .await
-                    .map_err(classify_rig_err)?
+                prompt_extended(client, model, max_tokens, prompt).await
             }
             ProviderClient::Ollama(client) => {
-                let agent = client
-                    .agent(&state.config.model)
-                    .preamble(AGENT_PREAMBLE)
-                    .max_tokens(state.config.max_tokens_per_call)
-                    .build();
-                agent
-                    .prompt(prompt)
-                    .extended_details()
-                    .await
-                    .map_err(classify_rig_err)?
+                prompt_extended(client, model, max_tokens, prompt).await
             }
-        };
+        }?;
         record_usage(&mut state.token_usage, &response.usage);
         Ok(response.output)
     }
@@ -671,17 +647,14 @@ impl ResearchStepRunner {
     ) -> Result<(String, Vec<SourceQuote>), StepError> {
         match self.provider.as_ref() {
             ProviderClient::Anthropic(client) if !source_documents.is_empty() => {
-                let agent = client
-                    .agent(&state.config.model)
-                    .preamble(AGENT_PREAMBLE)
-                    .max_tokens(state.config.max_tokens_per_call)
-                    .build();
                 let message = anthropic_document_message(prompt, source_documents)?;
-                let response = agent
-                    .prompt(message)
-                    .extended_details()
-                    .await
-                    .map_err(classify_rig_err)?;
+                let response = prompt_extended(
+                    client,
+                    &state.config.model,
+                    state.config.max_tokens_per_call,
+                    message,
+                )
+                .await?;
                 record_usage(&mut state.token_usage, &response.usage);
                 let evidence = response
                     .messages
@@ -706,50 +679,71 @@ impl ResearchStepRunner {
     where
         T: JsonSchema + DeserializeOwned + Send + 'static,
     {
-        let (output, usage) = match self.provider.as_ref() {
+        let model = &state.config.model;
+        let max_tokens = state.config.max_tokens_per_call;
+        let response = match self.provider.as_ref() {
             ProviderClient::OpenAi(client) => {
-                let agent = client
-                    .agent(&state.config.model)
-                    .preamble(AGENT_PREAMBLE)
-                    .max_tokens(state.config.max_tokens_per_call)
-                    .build();
-                let response = agent
-                    .prompt_typed::<T>(prompt)
-                    .extended_details()
-                    .await
-                    .map_err(classify_structured_err)?;
-                (response.output, response.usage)
+                prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
             }
             ProviderClient::Anthropic(client) => {
-                let agent = client
-                    .agent(&state.config.model)
-                    .preamble(AGENT_PREAMBLE)
-                    .max_tokens(state.config.max_tokens_per_call)
-                    .build();
-                let response = agent
-                    .prompt_typed::<T>(prompt)
-                    .extended_details()
-                    .await
-                    .map_err(classify_structured_err)?;
-                (response.output, response.usage)
+                prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
             }
             ProviderClient::Ollama(client) => {
-                let agent = client
-                    .agent(&state.config.model)
-                    .preamble(AGENT_PREAMBLE)
-                    .max_tokens(state.config.max_tokens_per_call)
-                    .build();
-                let response = agent
-                    .prompt_typed::<T>(prompt)
-                    .extended_details()
-                    .await
-                    .map_err(classify_structured_err)?;
-                (response.output, response.usage)
+                prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
             }
-        };
-        record_usage(&mut state.token_usage, &usage);
-        Ok(output)
+        }?;
+        record_usage(&mut state.token_usage, &response.usage);
+        Ok(response.output)
     }
+}
+
+/// Build a Rig agent for `model` with the shared preamble and per-call
+/// token cap, then run `prompt` with extended details. The concrete agent
+/// type differs per provider, so this is generic over the client; the
+/// returned [`PromptResponse`] is provider-independent.
+async fn prompt_extended<C>(
+    client: &C,
+    model: &str,
+    max_tokens: u64,
+    prompt: impl Into<message::Message> + Send,
+) -> Result<PromptResponse, StepError>
+where
+    C: CompletionClient,
+    C::CompletionModel: 'static,
+{
+    client
+        .agent(model)
+        .preamble(AGENT_PREAMBLE)
+        .max_tokens(max_tokens)
+        .build()
+        .prompt(prompt)
+        .extended_details()
+        .await
+        .map_err(classify_rig_err)
+}
+
+/// Structured counterpart to [`prompt_extended`], running Rig's
+/// `prompt_typed` for the schema `T`.
+async fn prompt_typed_extended<C, T>(
+    client: &C,
+    model: &str,
+    max_tokens: u64,
+    prompt: &str,
+) -> Result<TypedPromptResponse<T>, StepError>
+where
+    C: CompletionClient,
+    C::CompletionModel: 'static,
+    T: JsonSchema + DeserializeOwned + Send + 'static,
+{
+    client
+        .agent(model)
+        .preamble(AGENT_PREAMBLE)
+        .max_tokens(max_tokens)
+        .build()
+        .prompt_typed::<T>(prompt)
+        .extended_details()
+        .await
+        .map_err(classify_structured_err)
 }
 
 /// Accumulate one call's `Usage` into the run-aggregate `TokenUsage`,
