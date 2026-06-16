@@ -1,10 +1,23 @@
 # taquba-research
 
-Durable research agent for Rust. Built on [Rig](https://crates.io/crates/rig-core)
-and [taquba-workflow](https://crates.io/crates/taquba-workflow).
+Durable research agent for Rust, built on
+[Rig](https://crates.io/crates/rig-core) and the
+[taquba](https://crates.io/crates/taquba) stack.
 
-Multi-step agent runs survive process crashes; resume from where you
-stopped without re-paying for completed steps.
+Give it a question and it plans, searches the web, fetches and reads
+pages, then synthesizes a cited report. The whole multi-step run
+**survives process crashes**. Every transition is persisted to object
+storage and every completed LLM call is memoized, so a run that dies
+after twenty paid model calls resumes and re-pays for **none** of them.
+Ctrl+C it, lose the machine, redeploy mid-run: it continues from the last
+completed step.
+
+This is a **reference implementation and CLI tool**: a worked example of
+how Rig (LLM orchestration) and taquba (durable, object-storage-backed
+queues, workflows, and jobs) combine into a crash-safe agent. Install it
+to use it; read it to learn the durable-agent pattern. It is not meant as
+a general-purpose library dependency (see
+[Two public surfaces](#two-public-surfaces)).
 
 ## Install
 
@@ -98,14 +111,20 @@ queue, so an S3-backed deployment keeps everything in one bucket.
 
 ## Two public surfaces
 
-- **High-level**: `ResearchAgent`: a builder that wires Rig, a
-  `SearchBackend`, and a `ResearchConfig` into a `run(queue, query)`
-  helper. This is what the embed example below uses, and what the CLI
-  drives.
-- **Low-level**: `ResearchStepRunner`: a `taquba_workflow::StepRunner`
-  you can drop into your own `taquba_workflow::WorkflowRuntime` if you
-  need to compose research steps with other workflow steps, share a
-  worker pool, or own the terminal hook yourself.
+Both exist so you can run or embed *this research agent*. To add
+durability to *your own* Rig agent, copy the pattern instead:
+per-step memoization of LLM calls over `taquba_workflow::Memo`, plus the
+Rig-error to transient/permanent `StepError` mapping. Those two pieces
+carry over to any agent; the phase state machine here is research-specific.
+
+- **High-level**: `ResearchAgent`, a builder that wires Rig, a
+  `SearchBackend`, and a `ResearchConfig` into a
+  `run(queue, object_store, query)` helper. This is what the embed example
+  below uses, and what the CLI drives.
+- **Low-level**: `ResearchStepRunner`, a `taquba_workflow::StepRunner`
+  you can drop into your own `taquba_workflow::WorkflowRuntime` to compose
+  research steps with other workflow steps, share a worker pool, or own
+  the terminal hook yourself.
 
 ## Embed in your Rig app
 
@@ -138,7 +157,13 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## Durability invariants (inherited from taquba)
+## Durability
+
+- **No re-paying on retry.** Each LLM-backed phase memoizes its output in
+  its per-step `Memo`; an at-least-once redelivery short-circuits to the
+  cached value instead of calling (and billing) the model again.
+
+Inherited from taquba:
 
 - **Single-process, single-writer.** All workers for one queue share
   one process.

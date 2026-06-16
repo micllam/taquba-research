@@ -4,10 +4,20 @@
 //! process crashes. A run is decomposed into a planning step, a fan-out of
 //! search and page-fetch steps, per-page summarization, synthesis, and a
 //! final report-writing step. Every transition is persisted via taquba's
-//! object-storage-backed task queue, so an interrupted process resumes
-//! without re-paying for already-completed steps.
+//! object-storage-backed task queue, and every completed LLM call is
+//! memoized, so an interrupted process resumes from the last completed
+//! step and re-pays for none of the model calls it already made.
 //!
-//! Two surfaces are public:
+//! This crate is a **reference implementation and CLI tool**: a worked
+//! example of combining Rig (LLM orchestration) with the taquba stack
+//! (durable queues, workflows, and jobs) into a crash-safe agent. To make
+//! your *own* Rig agent durable, copy the pattern rather than depending on
+//! this crate: per-step memoization of LLM calls over
+//! [`taquba_workflow::Memo`] plus a Rig-error to transient/permanent
+//! [`StepError`](workflow::StepError) mapping. The phase state machine
+//! here is research-specific.
+//!
+//! Two surfaces are public, both for running or embedding *this* agent:
 //!
 //! - **High-level**: [`ResearchAgent`] - a builder that wires Rig, a
 //!   [`SearchBackend`](search::SearchBackend), and a [`ResearchConfig`]
@@ -109,8 +119,8 @@
 //! queue, the [run index](store::RunIndexEntry), and (by default) the
 //! rendered report all live. It accepts either:
 //!
-//! - a **local path** — default is `~/.taquba-research/`;
-//! - an **object-storage URL** — `s3://bucket/prefix`,
+//! - a **local path**, defaulting to `~/.taquba-research/`;
+//! - an **object-storage URL**, e.g. `s3://bucket/prefix`,
 //!   `gs://bucket/prefix`, `az://container/prefix`, `file:///abs/path`.
 //!
 //! Cloud URLs require the matching cargo feature:
@@ -128,7 +138,12 @@
 //!
 //! # Durability model
 //!
-//! `taquba-research` inherits taquba's invariants:
+//! - **No re-paying on retry.** Each LLM-backed phase memoizes its output
+//!   in its per-step [`Memo`](taquba_workflow::Memo); an at-least-once
+//!   redelivery short-circuits to the cached value instead of calling (and
+//!   billing) the model again.
+//!
+//! Inherited from taquba:
 //!
 //! - **Single-process, single-writer.** All workers for one queue live in
 //!   one binary and share one `Arc<Queue>`.
