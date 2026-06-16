@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Bumped `rig-core` to 0.38.
+- Bumped the taquba stack: `taquba` 0.7 -> 0.8, `taquba-workflow` 0.5 -> 0.6,
+  `taquba-jobs` 0.3 -> 0.4.
+- **Breaking (on-disk):** taquba-workflow 0.6 and taquba-jobs 0.4 changed
+  the terminal-marker filename format used by the memo- and result-retention
+  sweepers. When upgrading a store that previously ran with retention
+  enabled (which it always is here), clear the stale markers out-of-band so the
+  new sweeper recognises them: delete the `workflow-memo/terminals/` and
+  `research-fetch-jobs-results/terminals/` prefixes under your `--store`.
+  Markers left behind are inert but never swept, so their blobs are
+  retained indefinitely.
 
 ## [0.3.0] - 2026-05-29
 
