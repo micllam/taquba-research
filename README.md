@@ -162,6 +162,11 @@ async fn main() -> anyhow::Result<()> {
 - **No re-paying on retry.** Each LLM-backed phase memoizes its output in
   its per-step `Memo`; an at-least-once redelivery short-circuits to the
   cached value instead of calling (and billing) the model again.
+- **Slow calls are covered by the delivery lease.** Every LLM and search
+  call runs under a timeout, and the step extends its lease
+  (`LeaseHandle::ensure_at_least`) to cover that bound before issuing
+  the call; the fetching step re-extends as each page job completes. A
+  hung call times out as a transient step error and is retried.
 
 Inherited from taquba:
 

@@ -22,10 +22,10 @@ use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use rig_core::client::ProviderClient;
 use rig_core::providers::{anthropic, ollama, openai};
-use taquba::Queue;
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, parse_url};
+use taquba::{OpenOptions, Queue, QueueConfig};
 use taquba_research::jobs::RunnerHandle;
 use taquba_research::workflow::{
     RunOutcome, RunSpec, TerminalHook, TerminalStatus, WorkflowRuntime,
@@ -45,6 +45,11 @@ const REPORTS_PREFIX: &str = "reports";
 /// terminal state. Matches the value used by the library's
 /// `ResearchAgent::run`; keep in sync.
 const MEMO_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Lease duration for every queue in the store (workflow steps and
+/// fetch jobs). Set explicitly because it is the bound on detecting a
+/// dead or hung delivery; slow calls extend the lease through
+/// `LeaseHandle` to cover their own timeout, so it stays short.
+const LEASE_DURATION: Duration = Duration::from_secs(30);
 
 /// Provider choice surfaced through `--provider`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -370,7 +375,14 @@ async fn open_queue(ctx: &StoreCtx) -> Result<Arc<Queue>> {
     } else {
         format!("{}/{}", ctx.prefix.as_ref(), QUEUE_DB_NAME)
     };
-    let queue = Queue::open(ctx.object_store.clone(), &queue_path)
+    let opts = OpenOptions {
+        default_queue_config: QueueConfig {
+            lease_duration: LEASE_DURATION,
+            ..QueueConfig::default()
+        },
+        ..OpenOptions::default()
+    };
+    let queue = Queue::open_with_options(ctx.object_store.clone(), &queue_path, opts)
         .await
         .context("opening taquba queue")?;
     Ok(Arc::new(queue))

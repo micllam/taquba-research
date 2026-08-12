@@ -113,6 +113,10 @@ pub(crate) enum FetchError {
     /// than retrying after the owning run is already gone.
     #[error("cancelled")]
     Cancelled,
+    /// Extending the delivery's lease to cover the fetch failed: the
+    /// claim was lost to a re-delivery. Retryable.
+    #[error("lease: {0}")]
+    Lease(String),
 }
 
 impl Job for FetchPage {
@@ -122,6 +126,14 @@ impl Job for FetchPage {
 
     async fn run(&self, ctx: JobContext<'_>) -> Result<FetchedPage, FetchError> {
         let http = ctx.state::<Arc<reqwest::Client>>();
+        // Extend the lease to cover the fetch's timeout before
+        // issuing it, so a slow page cannot outlive the lease.
+        if let Err(e) = ctx.lease().ensure_at_least(FETCH_TIMEOUT) {
+            return Err(match e {
+                taquba::Error::CancelRequested => FetchError::Cancelled,
+                other => FetchError::Lease(other.to_string()),
+            });
+        }
         // Race the HTTP fetch against the job's cooperative
         // cancellation. When the surrounding run is cancelled,
         // run_fetching calls `Queue::cancel(job_id)`, which fires
@@ -139,7 +151,9 @@ impl Job for FetchPage {
 
     fn classify(&self, error: &FetchError) -> ErrorKind {
         match error {
-            FetchError::Transport(_) | FetchError::ReadBody(_) => ErrorKind::Transient,
+            FetchError::Transport(_) | FetchError::ReadBody(_) | FetchError::Lease(_) => {
+                ErrorKind::Transient
+            }
             FetchError::HttpStatus(code) if is_transient_status(*code) => ErrorKind::Transient,
             FetchError::HttpStatus(_)
             | FetchError::NonText(_)
@@ -274,6 +288,10 @@ mod tests {
         );
         assert_eq!(
             job.classify(&FetchError::HttpStatus(429)),
+            ErrorKind::Transient
+        );
+        assert_eq!(
+            job.classify(&FetchError::Lease("claim lost".into())),
             ErrorKind::Transient
         );
     }

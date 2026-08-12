@@ -22,7 +22,7 @@ use rig_core::providers::{anthropic, ollama, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use taquba::Queue;
+use taquba::{LeaseHandle, Queue};
 use taquba_jobs::{JobRunner, JoinError};
 use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
 use url::Url;
@@ -42,6 +42,20 @@ const AGENT_PREAMBLE: &str = "Be precise and concise.";
 /// phase work is in flight. Sets the upper bound on how long an LLM
 /// or HTTP call keeps running after the CLI's `cancel` lands.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Upper bound on a single LLM completion call. The step's lease is
+/// extended by this much before the call is issued, so the delivery
+/// is not re-queued mid-call. Sized for slow local models.
+const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(600);
+/// Upper bound on a single search-backend call, covered by the lease
+/// the same way.
+const SEARCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Lease extension applied before each fetch-handle await: one
+/// FetchPage job's full retry cycle (3 attempts of 20s each plus
+/// backoff) plus the wait for a runner slot behind 16 concurrent
+/// jobs, rounded up. Each completed handle re-extends, so the lease
+/// stays within one job completion of live progress.
+const FETCH_JOIN_LEASE: Duration = Duration::from_secs(150);
 
 /// Memo user-keys for each phase's cached LLM response. Each is
 /// scoped per `(run_id, step_number)` by [`taquba_workflow::Memo`],
@@ -269,7 +283,7 @@ impl ResearchStepRunner {
     ) -> Result<StepOutcome, StepError> {
         match state.phase {
             Phase::Planning => self.run_planning(step, state).await?,
-            Phase::Searching => self.run_searching(state).await?,
+            Phase::Searching => self.run_searching(step, state).await?,
             Phase::Fetching => self.run_fetching(step, state).await?,
             Phase::Summarizing => self.run_summarizing(step, state).await?,
             Phase::Synthesizing => self.run_synthesizing(step, state).await?,
@@ -303,7 +317,7 @@ impl ResearchStepRunner {
         // (lease expiry, worker restart) reuses the prior attempt's
         // response instead of re-paying for the same prompt.
         let plan: Plan = memoized(&step.memo, MEMO_KEY_PLANNING, async {
-            self.llm_prompt_typed(&prompt, state).await
+            self.llm_prompt_typed(&step.lease, &prompt, state).await
         })
         .await?;
 
@@ -327,7 +341,7 @@ impl ResearchStepRunner {
         Ok(())
     }
 
-    async fn run_searching(&self, state: &mut ResearchState) -> Result<(), StepError> {
+    async fn run_searching(&self, step: &Step, state: &mut ResearchState) -> Result<(), StepError> {
         let Some(idx) = state.search_queue.pop_front() else {
             // Defensive: shouldn't happen because the transition below
             // moves us out of Searching as soon as the queue empties.
@@ -341,7 +355,10 @@ impl ResearchStepRunner {
 
         // 5 results per sub-question is a reasonable starting point;
         // the total is capped later by max_sources.
-        let results = self.search.search(&q, 5).await?;
+        let results = under_lease(&step.lease, SEARCH_CALL_TIMEOUT, "search call", async {
+            self.search.search(&q, 5).await.map_err(StepError::from)
+        })
+        .await?;
 
         let known: HashSet<Url> = state.fetched.keys().cloned().collect();
         let mut queued: HashSet<Url> = state.fetch_queue.iter().cloned().collect();
@@ -419,6 +436,15 @@ impl ResearchStepRunner {
         // error (`JoinError::Infra`) fails the step transiently so
         // taquba re-delivers it.
         for (url, handle) in urls.iter().zip(handles) {
+            // Each completed handle is a progress point: re-extend the
+            // lease to cover the next job's worst-case completion.
+            if let Err(e) = step.lease.ensure_at_least(FETCH_JOIN_LEASE) {
+                // Let the still-in-flight jobs finish: a superseding
+                // delivery's idempotent re-submits await these same
+                // job ids.
+                guard.disarm();
+                return Err(lease_step_err(e));
+            }
             match handle.await {
                 Ok(page) => {
                     state.summarize_queue.push_back(url.clone());
@@ -476,7 +502,7 @@ impl ResearchStepRunner {
             text = page.text,
         );
         let parsed: SummaryResp = memoized(&step.memo, MEMO_KEY_SUMMARIZING, async {
-            self.llm_prompt_typed(&prompt, state).await
+            self.llm_prompt_typed(&step.lease, &prompt, state).await
         })
         .await?;
 
@@ -552,7 +578,7 @@ impl ResearchStepRunner {
         );
         let synthesis: SynthesisOutput = memoized(&step.memo, MEMO_KEY_SYNTHESIZING, async {
             let (narrative, evidence) = self
-                .llm_synthesis_prompt(&prompt, &source_documents, state)
+                .llm_synthesis_prompt(&step.lease, &prompt, &source_documents, state)
                 .await?;
             Ok(SynthesisOutput {
                 narrative,
@@ -588,7 +614,7 @@ impl ResearchStepRunner {
         );
 
         let body: String = memoized(&step.memo, MEMO_KEY_WRITING, async {
-            self.llm_prompt(&prompt, state).await
+            self.llm_prompt(&step.lease, &prompt, state).await
         })
         .await?;
 
@@ -615,32 +641,38 @@ impl ResearchStepRunner {
     }
 
     /// Run a single completion via Rig, dispatched to the configured
-    /// provider. Records this call's token usage on `state.token_usage`
-    /// and logs the per-call counts at info level.
+    /// provider, with the delivery lease extended to cover the call's
+    /// [`LLM_CALL_TIMEOUT`] bound. Records this call's token usage on
+    /// `state.token_usage` and logs the per-call counts at info level.
     async fn llm_prompt(
         &self,
+        lease: &LeaseHandle,
         prompt: &str,
         state: &mut ResearchState,
     ) -> Result<String, StepError> {
         let model = &state.config.model;
         let max_tokens = state.config.max_tokens_per_call;
-        let response = match self.provider.as_ref() {
-            ProviderClient::OpenAi(client) => {
-                prompt_extended(client, model, max_tokens, prompt).await
+        let response = under_lease(lease, LLM_CALL_TIMEOUT, "LLM call", async {
+            match self.provider.as_ref() {
+                ProviderClient::OpenAi(client) => {
+                    prompt_extended(client, model, max_tokens, prompt).await
+                }
+                ProviderClient::Anthropic(client) => {
+                    prompt_extended(client, model, max_tokens, prompt).await
+                }
+                ProviderClient::Ollama(client) => {
+                    prompt_extended(client, model, max_tokens, prompt).await
+                }
             }
-            ProviderClient::Anthropic(client) => {
-                prompt_extended(client, model, max_tokens, prompt).await
-            }
-            ProviderClient::Ollama(client) => {
-                prompt_extended(client, model, max_tokens, prompt).await
-            }
-        }?;
+        })
+        .await?;
         record_usage(&mut state.token_usage, &response.usage);
         Ok(response.output)
     }
 
     async fn llm_synthesis_prompt(
         &self,
+        lease: &LeaseHandle,
         prompt: &str,
         source_documents: &[SynthesisDocument],
         state: &mut ResearchState,
@@ -648,12 +680,15 @@ impl ResearchStepRunner {
         match self.provider.as_ref() {
             ProviderClient::Anthropic(client) if !source_documents.is_empty() => {
                 let message = anthropic_document_message(prompt, source_documents)?;
-                let response = prompt_extended(
-                    client,
-                    &state.config.model,
-                    state.config.max_tokens_per_call,
-                    message,
-                )
+                let response = under_lease(lease, LLM_CALL_TIMEOUT, "LLM call", async {
+                    prompt_extended(
+                        client,
+                        &state.config.model,
+                        state.config.max_tokens_per_call,
+                        message,
+                    )
+                    .await
+                })
                 .await?;
                 record_usage(&mut state.token_usage, &response.usage);
                 let evidence = response
@@ -664,15 +699,16 @@ impl ResearchStepRunner {
                     .unwrap_or_default();
                 Ok((response.output, evidence))
             }
-            _ => Ok((self.llm_prompt(prompt, state).await?, Vec::new())),
+            _ => Ok((self.llm_prompt(lease, prompt, state).await?, Vec::new())),
         }
     }
 
     /// Run a structured completion via Rig's `prompt_typed`, dispatched
-    /// to the configured provider. Same usage-tracking behaviour as
-    /// [`Self::llm_prompt`].
+    /// to the configured provider. Same lease and usage-tracking
+    /// behaviour as [`Self::llm_prompt`].
     async fn llm_prompt_typed<T>(
         &self,
+        lease: &LeaseHandle,
         prompt: &str,
         state: &mut ResearchState,
     ) -> Result<T, StepError>
@@ -681,17 +717,20 @@ impl ResearchStepRunner {
     {
         let model = &state.config.model;
         let max_tokens = state.config.max_tokens_per_call;
-        let response = match self.provider.as_ref() {
-            ProviderClient::OpenAi(client) => {
-                prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
+        let response = under_lease(lease, LLM_CALL_TIMEOUT, "LLM call", async {
+            match self.provider.as_ref() {
+                ProviderClient::OpenAi(client) => {
+                    prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
+                }
+                ProviderClient::Anthropic(client) => {
+                    prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
+                }
+                ProviderClient::Ollama(client) => {
+                    prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
+                }
             }
-            ProviderClient::Anthropic(client) => {
-                prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
-            }
-            ProviderClient::Ollama(client) => {
-                prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
-            }
-        }?;
+        })
+        .await?;
         record_usage(&mut state.token_usage, &response.usage);
         Ok(response.output)
     }
@@ -767,6 +806,37 @@ fn record_usage(total: &mut TokenUsage, call: &Usage) {
         .cache_creation_input_tokens
         .saturating_add(call.cache_creation_input_tokens);
     total.reasoning_tokens = total.reasoning_tokens.saturating_add(call.reasoning_tokens);
+}
+
+/// Extend `lease` to cover `bound`, then run `work` under a timeout
+/// of the same bound, so the delivery cannot outlive its lease
+/// mid-call. A timeout is a transient step error; `what` names the
+/// call in the error message.
+async fn under_lease<T, F>(
+    lease: &LeaseHandle,
+    bound: Duration,
+    what: &str,
+    work: F,
+) -> Result<T, StepError>
+where
+    F: Future<Output = Result<T, StepError>>,
+{
+    lease.ensure_at_least(bound).map_err(lease_step_err)?;
+    match tokio::time::timeout(bound, work).await {
+        Ok(result) => result,
+        Err(_) => Err(StepError::transient(format!(
+            "{what} timed out after {}s",
+            bound.as_secs()
+        ))),
+    }
+}
+
+/// Map a failed lease extension to a transient step error. The
+/// extension fails only when the claim was lost or the job's
+/// cancellation was requested; in both cases this delivery's
+/// settlement is rejected or its run terminated, so retrying is safe.
+fn lease_step_err(e: taquba::Error) -> StepError {
+    StepError::transient(format!("lease extension failed: {e}"))
 }
 
 /// Returns the JSON-decoded value previously written to `memo`
@@ -1143,6 +1213,34 @@ mod tests {
             chat_history: Box::new(Vec::new()),
         };
         assert_permanent(&classify_rig_err(err));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn under_lease_times_out_transiently() {
+        let lease = LeaseHandle::detached();
+        let err = under_lease(
+            &lease,
+            Duration::from_secs(5),
+            "test call",
+            std::future::pending::<Result<(), StepError>>(),
+        )
+        .await
+        .expect_err("pending work must time out");
+        assert_transient(&err);
+    }
+
+    #[tokio::test]
+    async fn under_lease_returns_the_inner_result() {
+        let lease = LeaseHandle::detached();
+        let value = under_lease(&lease, Duration::from_secs(5), "test call", async { Ok(7) })
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn lease_step_err_is_transient() {
+        assert_transient(&lease_step_err(taquba::Error::ClaimLost));
     }
 
     #[test]

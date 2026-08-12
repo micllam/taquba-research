@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Steps and fetch jobs extend their delivery lease to cover each slow
+  call (`LeaseHandle::ensure_at_least`, new in taquba 0.11): LLM
+  completions run under a new 10-minute timeout, search-backend calls
+  under a new 60-second timeout, the fetch fan-out join re-extends
+  before each page-job await and the `FetchPage` handler extends to
+  cover its 20-second HTTP timeout. Previously a step slower than the
+  30-second lease was silently re-queued and executed twice; a hung
+  call now times out as a transient step error.
+- The CLI opens its queue with an explicit `lease_duration` of 30
+  seconds, the taquba default, chosen deliberately as the
+  hang-detection bound now that slow calls extend it.
 - **Breaking:** bumped the taquba stack: `taquba` 0.8 -> 0.11,
   `taquba-workflow` 0.6 -> 0.9, `taquba-jobs` 0.4 -> 0.7. The
   re-exported `workflow` types follow taquba-workflow 0.9's breaking
