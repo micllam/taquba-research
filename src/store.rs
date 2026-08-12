@@ -210,7 +210,7 @@ impl RunStore {
                 ),
             }
         }
-        out.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
+        out.sort_by_key(|e| std::cmp::Reverse(e.submitted_at));
         Ok(out)
     }
 

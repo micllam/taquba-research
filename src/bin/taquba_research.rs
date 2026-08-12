@@ -1010,7 +1010,7 @@ async fn cmd_gc(
                 && (statuses.is_empty() || statuses.contains(&r.status))
         })
         .collect();
-    candidates.sort_by(|a, b| a.submitted_at.cmp(&b.submitted_at));
+    candidates.sort_by_key(|r| r.submitted_at);
 
     if candidates.is_empty() {
         println!("No runs match the gc filter.");
