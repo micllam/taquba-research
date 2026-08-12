@@ -65,7 +65,7 @@ impl ResearchAgent {
         // Build the JobRunner the Fetching step submits FetchPage jobs
         // to. It shares the same Queue + ObjectStore as the workflow
         // runtime, distinguished by queue_name.
-        let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store)?;
+        let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store);
         let runner = self
             .runner
             .clone()

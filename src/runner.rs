@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use rig_agent::agent::{PromptResponse, TypedPromptResponse};
+use rig_agent::client::AgentClientExt;
+use rig_agent::completion::{Prompt, PromptError, StructuredOutputError, TypedPrompt};
 use rig_core::OneOrMany;
-use rig_core::agent::{PromptResponse, TypedPromptResponse};
 use rig_core::client::CompletionClient;
 use rig_core::completion::{
-    CompletionError, Prompt, PromptError, StructuredOutputError, TypedPrompt, Usage,
+    CompletionError, Usage,
     message::{self, AssistantContent, UserContent},
 };
 use rig_core::http_client;
@@ -285,9 +287,7 @@ impl ResearchStepRunner {
         }
 
         state.steps_completed += 1;
-        Ok(StepOutcome::Continue {
-            payload: state.to_bytes(),
-        })
+        Ok(StepOutcome::continue_now(state.to_bytes()))
     }
 
     async fn run_planning(&self, step: &Step, state: &mut ResearchState) -> Result<(), StepError> {
@@ -708,7 +708,7 @@ async fn prompt_extended<C>(
     prompt: impl Into<message::Message> + Send,
 ) -> Result<PromptResponse, StepError>
 where
-    C: CompletionClient,
+    C: CompletionClient + AgentClientExt,
     C::CompletionModel: 'static,
 {
     client
@@ -731,7 +731,7 @@ async fn prompt_typed_extended<C, T>(
     prompt: &str,
 ) -> Result<TypedPromptResponse<T>, StepError>
 where
-    C: CompletionClient,
+    C: CompletionClient + AgentClientExt,
     C::CompletionModel: 'static,
     T: JsonSchema + DeserializeOwned + Send + 'static,
 {
@@ -796,8 +796,6 @@ fn classify_rig_err(err: PromptError) -> StepError {
     match err {
         // Configuration / runner-policy issues.
         PromptError::MaxTurnsError { .. }
-        | PromptError::ToolError(_)
-        | PromptError::ToolServerError(_)
         | PromptError::PromptCancelled { .. }
         | PromptError::UnknownToolCall { .. } => {
             StepError::permanent(format!("LLM permanent failure: {msg}"))
@@ -808,11 +806,13 @@ fn classify_rig_err(err: PromptError) -> StepError {
         }
 
         // Anything else from the completion layer (ProviderError,
-        // JsonError, UrlError, RequestError, ResponseError). Auth
-        // failures come through `HttpError(InvalidStatusCode(401|403))`
-        // above, so we default the rest to transient.
-        // Persistent ones get dead-lettered after `max_attempts`.
-        PromptError::CompletionError(_) => StepError::transient(format!("LLM call failed: {msg}")),
+        // JsonError, UrlError, RequestError, ResponseError), plus
+        // `MemoryError` and any future variant (`PromptError` is
+        // non-exhaustive). Auth failures come through
+        // `HttpError(InvalidStatusCode(401|403))` above, so we default
+        // the rest to transient. Persistent ones get dead-lettered
+        // after `max_attempts`.
+        _ => StepError::transient(format!("LLM call failed: {msg}")),
     }
 }
 
@@ -977,6 +977,9 @@ fn classify_structured_err(err: StructuredOutputError) -> StepError {
         StructuredOutputError::EmptyResponse => {
             StepError::transient("typed prompt: model returned an empty response".to_string())
         }
+        // `StructuredOutputError` is non-exhaustive; default future
+        // variants to transient, matching `classify_rig_err`.
+        other => StepError::transient(format!("typed prompt failed: {other}")),
     }
 }
 
@@ -1007,7 +1010,9 @@ mod tests {
             job_id: String::new(),
             attempts: 1,
             cancel_token: CancellationToken::new(),
+            lease: taquba::LeaseHandle::detached(),
             memo,
+            signal: None,
         }
     }
 

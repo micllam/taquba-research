@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** bumped the taquba stack: `taquba` 0.8 -> 0.11,
+  `taquba-workflow` 0.6 -> 0.9, `taquba-jobs` 0.4 -> 0.7. The
+  re-exported `workflow` types follow taquba-workflow 0.9's breaking
+  changes: `Step` gained the `lease` and `signal` fields (tests
+  constructing one add `lease: taquba::LeaseHandle::detached()` and
+  `signal: None`), and `StepOutcome::Continue` gained a `when` field
+  (use `StepOutcome::continue_now`).
+- **Breaking (on-disk):** taquba 0.10 moved the queue's internal keys
+  to a binary encoding, so stores written by earlier releases are
+  unreadable. Start from a fresh `--store`; there is no migration.
+- **Breaking:** `spawn_fetch_runner` returns the runner and handle
+  directly; `JobRunnerBuilder::build` is infallible in taquba-jobs 0.7.
+- **Breaking:** building requires rustc 1.88 (rig 0.41 uses
+  edition-2024 let-chains). The crate declares no `rust-version`, so an
+  older toolchain fails with E0658 errors from inside rig's derive
+  macros.
+- Bumped `rig-core` to 0.41 and added `rig-agent` 0.41, which now
+  contains the classic agent runtime (prompting traits, `PromptError`,
+  `StructuredOutputError`).
+- A run interrupted by a process kill re-delivers its in-flight step
+  immediately on `resume`: taquba 0.11 requeues claimed jobs found at
+  queue open. Previously the interrupted step became claimable only
+  after its lease expired.
+- Step payloads above 256 KiB (the fetched corpus from Fetching onward,
+  at default config) are written once to a payload object under the
+  `queue-payloads` sibling prefix in the same store; previously every
+  transition rewrote them inline.
+- Ollama now honours `max_tokens_per_call`; rig 0.41 sends it as
+  `options.num_predict`. Previously it was silently ignored for Ollama.
+
 ## [0.4.0] - 2026-06-17
 
 ### Added

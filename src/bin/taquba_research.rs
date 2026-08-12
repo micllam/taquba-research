@@ -25,7 +25,7 @@ use rig_core::providers::{anthropic, ollama, openai};
 use taquba::Queue;
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
-use taquba::object_store::{ObjectStore, PutPayload, parse_url};
+use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, parse_url};
 use taquba_research::jobs::RunnerHandle;
 use taquba_research::workflow::{
     RunOutcome, RunSpec, TerminalHook, TerminalStatus, WorkflowRuntime,
@@ -446,7 +446,10 @@ async fn write_report(
 }
 
 fn build_default_report_path(prefix: &ObjectPath, run_id: &str) -> ObjectPath {
-    prefix.child(REPORTS_PREFIX).child(format!("{run_id}.md"))
+    prefix
+        .clone()
+        .join(REPORTS_PREFIX)
+        .join(format!("{run_id}.md"))
 }
 
 fn build_runner(cli: &Cli, run_store: &RunStore) -> Result<ResearchStepRunner> {
@@ -510,7 +513,7 @@ fn spawn_runtime(
     };
     // Stand up the JobRunner the Fetching step submits FetchPage
     // jobs to.
-    let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store)?;
+    let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store);
     let runner = runner.with_job_runner(job_runner).with_queue(queue.clone());
 
     // Sequential workflow: one claimer is enough. See agent.rs for
@@ -964,7 +967,7 @@ async fn cmd_init(store_ctx: &StoreCtx) -> Result<()> {
     // mutating anything, and an empty index returns `None` cleanly.
     let mut stream = store_ctx
         .object_store
-        .list(Some(&store_ctx.prefix.child("runs")));
+        .list(Some(&store_ctx.prefix.clone().join("runs")));
     let has_any = stream
         .try_next()
         .await

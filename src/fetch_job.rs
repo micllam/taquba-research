@@ -18,7 +18,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
@@ -56,7 +55,7 @@ const FETCH_RESULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub fn spawn_fetch_runner(
     queue: &Arc<Queue>,
     object_store: &Arc<dyn ObjectStore>,
-) -> Result<(Arc<JobRunner>, RunnerHandle)> {
+) -> (Arc<JobRunner>, RunnerHandle) {
     let http = Arc::new(
         reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
@@ -64,17 +63,14 @@ pub fn spawn_fetch_runner(
             .build()
             .expect("reqwest client builder cannot fail with default config"),
     );
-    let mut job_runner = JobRunner::builder()
-        .queue(queue.clone())
-        .object_store(object_store.clone())
+    let mut job_runner = JobRunner::builder(queue.clone(), object_store.clone())
         .queue_name(FETCH_QUEUE_NAME)
         .state(http)
         .result_retention(FETCH_RESULT_RETENTION)
-        .build()
-        .context("building fetch JobRunner")?;
+        .build();
     job_runner.register::<FetchPage>();
     let handle = job_runner.spawn(std::future::pending::<()>());
-    Ok((Arc::new(job_runner), handle))
+    (Arc::new(job_runner), handle)
 }
 
 /// One durable HTTP fetch.

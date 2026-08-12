@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
 use taquba::object_store;
 
@@ -124,7 +124,7 @@ impl RunStore {
     /// which both queue state and run index live; pass
     /// [`Path::default()`] to use the store's bucket root.
     pub fn new(object_store: Arc<dyn ObjectStore>, prefix: &Path) -> Self {
-        let runs_prefix = prefix.child("runs");
+        let runs_prefix = prefix.clone().join("runs");
         Self {
             object_store,
             runs_prefix,
@@ -138,12 +138,12 @@ impl RunStore {
 
     /// Object key for `run_id`'s index entry.
     pub fn entry_path(&self, run_id: &str) -> Path {
-        self.runs_prefix.child(format!("{run_id}.json"))
+        self.runs_prefix.clone().join(format!("{run_id}.json"))
     }
 
     /// Object key for `run_id`'s cancellation sentinel.
     pub fn cancel_path(&self, run_id: &str) -> Path {
-        self.runs_prefix.child(format!("{run_id}.cancel"))
+        self.runs_prefix.clone().join(format!("{run_id}.cancel"))
     }
 
     /// Persist `entry`, overwriting any prior version.

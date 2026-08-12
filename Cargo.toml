@@ -2,7 +2,6 @@
 name = "taquba-research"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Durable Rust research agent built on Rig and taquba-workflow."
 repository = "https://github.com/micllam/taquba-research"
@@ -33,10 +32,11 @@ path = "src/bin/taquba_research.rs"
 features = ["aws"]
 
 [dependencies]
-taquba = "0.8"
-taquba-workflow = "0.6"
-taquba-jobs = "0.4"
-rig-core = "0.38"
+taquba = "0.11"
+taquba-workflow = "0.9"
+taquba-jobs = "0.7"
+rig-core = "0.41"
+rig-agent = "0.41"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
