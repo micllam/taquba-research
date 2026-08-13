@@ -27,7 +27,7 @@ pub struct ResearchConfig {
     /// cap are dropped before the fetch phase starts.
     pub max_sources: usize,
     /// Model identifier passed to Rig. Provider-specific: e.g.
-    /// `"gpt-4o-mini"` for OpenAI, `"claude-haiku-4-5"` for Anthropic.
+    /// `"gpt-5-nano"` for OpenAI, `"claude-haiku-4-5"` for Anthropic.
     /// Must be a valid identifier for whichever provider the runner
     /// was built against (see [`crate::ResearchStepRunner::new_openai`]
     /// / [`crate::ResearchStepRunner::new_anthropic`]).

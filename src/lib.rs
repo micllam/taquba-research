@@ -70,7 +70,7 @@
 //! let agent = ResearchAgent::builder()
 //!     .openai(rig)
 //!     .search(Tavily::from_env()?)
-//!     .config(ResearchConfig::new("gpt-4o-mini"))
+//!     .config(ResearchConfig::new("gpt-5-nano"))
 //!     .build()?;
 //!
 //! // `store` also backs the workflow's per-step memo, which short-

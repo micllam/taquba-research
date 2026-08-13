@@ -64,7 +64,7 @@ impl CliProvider {
     /// Default model identifier when the user doesn't pass `--model`.
     fn default_model(self) -> &'static str {
         match self {
-            CliProvider::OpenAi => openai::completion::GPT_4O_MINI,
+            CliProvider::OpenAi => openai::completion::GPT_5_NANO,
             CliProvider::Anthropic => anthropic::completion::CLAUDE_HAIKU_4_5,
             CliProvider::Ollama => ollama::LLAMA3_2,
         }
@@ -134,7 +134,7 @@ struct Cli {
 
     /// Specific model identifier passed to the provider. If unset,
     /// the CLI picks a provider-appropriate default
-    /// (`gpt-4o-mini` for OpenAI, `claude-haiku-4-5` for Anthropic,
+    /// (`gpt-5-nano` for OpenAI, `claude-haiku-4-5` for Anthropic,
     /// `llama3.2` for Ollama).
     #[arg(long)]
     model: Option<String>,

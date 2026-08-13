@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The CLI's default OpenAI model is `gpt-5-nano` (was `gpt-4o-mini`).
+  Pass `--model` to keep the previous default.
 - Step-error classification reads the provider HTTP status via rig
   0.41's `PromptError::provider_response_status`, so a provider error
   that preserves a status without an HTTP-level error (an error
