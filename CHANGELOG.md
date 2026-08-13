@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Step-error classification reads the provider HTTP status via rig
+  0.41's `PromptError::provider_response_status`, so a provider error
+  that preserves a status without an HTTP-level error (an error
+  envelope on a 2xx response, or a `ProviderResponse` with a 4xx
+  status) is classified by that status instead of defaulting to
+  transient.
 - Steps and fetch jobs extend their delivery lease to cover each slow
   call (`LeaseHandle::ensure_at_least`, new in taquba 0.11): LLM
   completions run under a new 10-minute timeout, search-backend calls

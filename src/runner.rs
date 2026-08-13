@@ -13,10 +13,9 @@ use rig_agent::completion::{Prompt, PromptError, StructuredOutputError, TypedPro
 use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
 use rig_core::completion::{
-    CompletionError, Usage,
+    Usage,
     message::{self, AssistantContent, UserContent},
 };
-use rig_core::http_client;
 use rig_core::providers::anthropic::completion as anthropic_completion;
 use rig_core::providers::{anthropic, ollama, openai};
 use schemars::JsonSchema;
@@ -871,30 +870,24 @@ fn classify_rig_err(err: PromptError) -> StepError {
             StepError::permanent(format!("LLM permanent failure: {msg}"))
         }
 
-        PromptError::CompletionError(CompletionError::HttpError(http_err)) => {
-            classify_http(&http_err, &msg)
-        }
-
-        // Anything else from the completion layer (ProviderError,
-        // JsonError, UrlError, RequestError, ResponseError), plus
-        // `MemoryError` and any future variant (`PromptError` is
-        // non-exhaustive). Auth failures come through
-        // `HttpError(InvalidStatusCode(401|403))` above, so we default
-        // the rest to transient. Persistent ones get dead-lettered
-        // after `max_attempts`.
-        _ => StepError::transient(format!("LLM call failed: {msg}")),
+        // Errors that preserve a provider HTTP status classify by that
+        // status; this covers both non-success responses and error
+        // envelopes returned with a 2xx status (2xx classifies as
+        // transient below). Errors without a status (transport, decode,
+        // `MemoryError`, any future variant; `PromptError` is
+        // non-exhaustive) default to transient and are dead-lettered
+        // after `max_attempts` when persistent.
+        err => match err.provider_response_status() {
+            Some(status) => classify_status(status.as_u16(), &msg),
+            None => StepError::transient(format!("LLM call failed: {msg}")),
+        },
     }
 }
 
-fn classify_http(err: &http_client::Error, msg: &str) -> StepError {
-    let status = match err {
-        http_client::Error::InvalidStatusCode(code)
-        | http_client::Error::InvalidStatusCodeWithMessage(code, _) => Some(code.as_u16()),
-        _ => None,
-    };
-    match status {
-        Some(401 | 403) => StepError::permanent(format!("LLM authentication failure: {msg}")),
-        Some(code) if !is_transient_status(code) => {
+fn classify_status(code: u16, msg: &str) -> StepError {
+    match code {
+        401 | 403 => StepError::permanent(format!("LLM authentication failure: {msg}")),
+        code if !is_transient_status(code) => {
             StepError::permanent(format!("LLM client error {code}: {msg}"))
         }
         _ => StepError::transient(format!("LLM HTTP error: {msg}")),
@@ -1057,6 +1050,9 @@ fn classify_structured_err(err: StructuredOutputError) -> StepError {
 mod tests {
     use super::*;
     use reqwest::StatusCode;
+    use rig_core::ProviderResponseError;
+    use rig_core::completion::CompletionError;
+    use rig_core::http_client;
     use std::collections::HashMap;
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
@@ -1158,23 +1154,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_http_routes_401_403_to_permanent() {
-        assert_permanent(&classify_http(&http_status(401), "unauthorized"));
-        assert_permanent(&classify_http(&http_status(403), "forbidden"));
+    fn classify_status_routes_401_403_to_permanent() {
+        assert_permanent(&classify_status(401, "unauthorized"));
+        assert_permanent(&classify_status(403, "forbidden"));
     }
 
     #[test]
-    fn classify_http_routes_other_4xx_to_permanent() {
-        assert_permanent(&classify_http(&http_status(400), "bad request"));
-        assert_permanent(&classify_http(&http_status(404), "not found"));
-        assert_permanent(&classify_http(&http_status(422), "unprocessable"));
+    fn classify_status_routes_other_4xx_to_permanent() {
+        assert_permanent(&classify_status(400, "bad request"));
+        assert_permanent(&classify_status(404, "not found"));
+        assert_permanent(&classify_status(422, "unprocessable"));
     }
 
     #[test]
-    fn classify_http_routes_rate_limit_and_5xx_to_transient() {
-        assert_transient(&classify_http(&http_status(429), "rate limited"));
-        assert_transient(&classify_http(&http_status(500), "server error"));
-        assert_transient(&classify_http(&http_status(503), "unavailable"));
+    fn classify_status_routes_rate_limit_and_5xx_to_transient() {
+        assert_transient(&classify_status(429, "rate limited"));
+        assert_transient(&classify_status(500, "server error"));
+        assert_transient(&classify_status(503, "unavailable"));
     }
 
     #[test]
@@ -1201,6 +1197,28 @@ mod tests {
     #[test]
     fn classify_rig_err_http_429_is_transient() {
         let err = PromptError::CompletionError(CompletionError::HttpError(http_status(429)));
+        assert_transient(&classify_rig_err(err));
+    }
+
+    #[test]
+    fn classify_rig_err_provider_response_4xx_is_permanent() {
+        let err = PromptError::CompletionError(CompletionError::ProviderResponse(
+            ProviderResponseError {
+                status: Some(StatusCode::BAD_REQUEST),
+                body: "invalid request".to_string(),
+            },
+        ));
+        assert_permanent(&classify_rig_err(err));
+    }
+
+    #[test]
+    fn classify_rig_err_provider_response_2xx_envelope_is_transient() {
+        let err = PromptError::CompletionError(CompletionError::ProviderResponse(
+            ProviderResponseError {
+                status: Some(StatusCode::OK),
+                body: "{\"error\":{\"message\":\"overloaded\"}}".to_string(),
+            },
+        ));
         assert_transient(&classify_rig_err(err));
     }
 
