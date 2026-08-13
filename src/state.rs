@@ -72,6 +72,10 @@ pub struct TokenUsage {
     pub cached_input_tokens: u64,
     /// Input tokens written into a provider-managed prompt cache.
     pub cache_creation_input_tokens: u64,
+    /// Input tokens consumed by provider tool-use prompts. Zero for
+    /// this crate's tool-less agents.
+    #[serde(default)]
+    pub tool_use_prompt_tokens: u64,
     /// Tokens consumed by internal reasoning / "thinking" by
     /// reasoning-capable models.
     pub reasoning_tokens: u64,
@@ -246,6 +250,15 @@ mod tests {
                 relevance: 0.5,
             },
         );
+        s.token_usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            cached_input_tokens: 30,
+            cache_creation_input_tokens: 40,
+            tool_use_prompt_tokens: 5,
+            reasoning_tokens: 10,
+        };
         s.synthesis = Some(SynthesisOutput {
             narrative: "synthesized answer".to_string(),
             citations: vec![Citation {
@@ -272,5 +285,16 @@ mod tests {
             Some("summary text")
         );
         assert_eq!(back.synthesis, s.synthesis);
+        assert_eq!(back.token_usage, s.token_usage);
+    }
+
+    #[test]
+    fn token_usage_decodes_without_tool_use_prompt_tokens() {
+        let json = r#"{"input_tokens":1,"output_tokens":2,"total_tokens":3,
+            "cached_input_tokens":0,"cache_creation_input_tokens":0,
+            "reasoning_tokens":0}"#;
+        let usage: TokenUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.tool_use_prompt_tokens, 0);
+        assert_eq!(usage.input_tokens, 1);
     }
 }

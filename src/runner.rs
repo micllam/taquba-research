@@ -804,6 +804,9 @@ fn record_usage(total: &mut TokenUsage, call: &Usage) {
     total.cache_creation_input_tokens = total
         .cache_creation_input_tokens
         .saturating_add(call.cache_creation_input_tokens);
+    total.tool_use_prompt_tokens = total
+        .tool_use_prompt_tokens
+        .saturating_add(call.tool_use_prompt_tokens);
     total.reasoning_tokens = total.reasoning_tokens.saturating_add(call.reasoning_tokens);
 }
 
