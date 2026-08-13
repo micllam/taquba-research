@@ -131,10 +131,10 @@
 //! cargo install taquba-research --features azure  # Azure Blob
 //! ```
 //!
-//! `--output` accepts the same path-or-URL form. When omitted, the
-//! report is persisted as `<store>/reports/<run_id>.md` in the
-//! configured store (so an S3-backed deployment keeps the markdown,
-//! queue, and index in the same bucket).
+//! The report is always persisted as `<store>/reports/<run_id>.md` in
+//! the configured store (so an S3-backed deployment keeps the
+//! markdown, queue, and index in the same bucket). `--output` accepts
+//! the same path-or-URL form and writes an additional copy there.
 //!
 //! # Durability model
 //!

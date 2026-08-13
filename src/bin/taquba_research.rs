@@ -107,12 +107,12 @@ struct Cli {
     /// this and a subcommand are given, the subcommand wins.
     query: Option<String>,
 
-    /// Where to write the final report on completion. Accepts a local
-    /// path or an object-storage URL (`s3://bucket/key.md`, `gs://...`,
-    /// etc.). When omitted, the report is persisted as
-    /// `<store>/reports/<run_id>.md` inside the configured store, so an
-    /// S3-backed deployment keeps the markdown next to the queue and
-    /// index.
+    /// Write an additional copy of the final report on completion.
+    /// Accepts a local path or an object-storage URL
+    /// (`s3://bucket/key.md`, `gs://...`, etc.). The report is always
+    /// persisted as `<store>/reports/<run_id>.md` inside the
+    /// configured store, so an S3-backed deployment keeps the markdown
+    /// next to the queue and index.
     #[arg(long, value_parser = validate_store_arg)]
     output: Option<String>,
 
@@ -759,8 +759,22 @@ async fn handle_terminal(
                 .report
                 .ok_or_else(|| anyhow!("succeeded run has no report"))?;
 
-            let target = resolve_output(cli.output.as_deref())?;
-            let where_ = write_report(&target, store_ctx, run_id, &report.markdown).await?;
+            // The in-store copy under `reports/` is canonical and
+            // always written; `--output` adds a copy elsewhere.
+            let stored = write_report(
+                &OutputTarget::DefaultInStore,
+                store_ctx,
+                run_id,
+                &report.markdown,
+            )
+            .await?;
+            let where_ = match resolve_output(cli.output.as_deref())? {
+                OutputTarget::DefaultInStore => stored,
+                target => {
+                    let copy = write_report(&target, store_ctx, run_id, &report.markdown).await?;
+                    format!("{copy}; also {stored}")
+                }
+            };
 
             println!("✓ Report saved to {where_}");
             println!(

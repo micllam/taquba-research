@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   versions.
 
 ### Changed
+- The CLI always writes the finished report to
+  `<store>/reports/<run_id>.md`; `--output` writes an additional copy
+  instead of replacing the in-store write. Previously a run with
+  `--output` left no report blob in the store.
 - The CLI's default OpenAI model is `gpt-5-nano` (was `gpt-4o-mini`).
   Pass `--model` to keep the previous default.
 - Step-error classification reads the provider HTTP status via rig

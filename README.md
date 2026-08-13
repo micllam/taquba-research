@@ -105,9 +105,10 @@ cargo install taquba-research --features gcp    # Google Cloud Storage
 cargo install taquba-research --features azure  # Azure Blob
 ```
 
-`--output` accepts the same path-or-URL form. When omitted, the report
-is saved to `<store>/reports/<run_id>.md` in the same store as the
-queue, so an S3-backed deployment keeps everything in one bucket.
+The report is always saved to `<store>/reports/<run_id>.md` in the
+same store as the queue, so an S3-backed deployment keeps everything
+in one bucket. `--output` accepts the same path-or-URL form and writes
+an additional copy there.
 
 ## Two public surfaces
 
