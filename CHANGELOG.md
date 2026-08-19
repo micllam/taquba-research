@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those runs' pending steps execute in the starting process under its
   provider settings. The CLI prints a note; the library logs a
   warning. `store::count_waiting_step_jobs` is the underlying count.
+- **Breaking:** `CancelSentinel::is_set` and
+  `CancelSentinel::requested_at` return `object_store::Result`, with
+  only a missing sentinel mapping to absence. Previously every `head`
+  failure read as "not cancelled", so denied credentials or
+  persistent transport failure silently disabled cross-process
+  cancellation. The runner logs failed checks and retries at the poll
+  cadence; the CLI's read commands propagate them.
 - `store::report_path` and `store::REPORTS_PREFIX`, the canonical
   report location shared by the runner and the CLI, and
   `ResearchStepRunner::with_report_store`, attaching the store the

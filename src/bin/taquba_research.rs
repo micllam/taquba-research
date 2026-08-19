@@ -770,7 +770,11 @@ async fn cmd_resume(
             );
         }
     }
-    if sentinel.is_set(&run_id).await {
+    if sentinel
+        .is_set(&run_id)
+        .await
+        .context("checking cancellation sentinel")?
+    {
         eprintln!(
             "Note: run {run_id} has a cancellation requested. Resuming applies it: \
              the next step will mark the run as cancelled."
@@ -965,7 +969,11 @@ async fn gather_rows(store_ctx: &StoreCtx, sentinel: &CancelSentinel) -> Result<
     for entry in entries.into_iter().rev() {
         // The sentinel is checked only for runs without a terminal
         // record.
-        let cancel_requested = entry.terminal.is_none() && sentinel.is_set(&entry.run_id).await;
+        let cancel_requested = entry.terminal.is_none()
+            && sentinel
+                .is_set(&entry.run_id)
+                .await
+                .context("checking cancellation sentinel")?;
         let status =
             store::derive_display_status(&entry, jobs.get(&entry.run_id), cancel_requested);
         rows.push(RunRow { entry, status });
@@ -1023,7 +1031,10 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
     let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
 
     let cancel_requested_at = if entry.terminal.is_none() {
-        sentinel.requested_at(&run_id).await
+        sentinel
+            .requested_at(&run_id)
+            .await
+            .context("checking cancellation sentinel")?
     } else {
         None
     };

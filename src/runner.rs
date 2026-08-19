@@ -229,8 +229,12 @@ impl StepRunner for ResearchStepRunner {
 /// so an already-cancelled run short-circuits before any phase work runs.
 async fn poll_cancelled(sentinel: &CancelSentinel, run_id: &str) {
     loop {
-        if sentinel.is_set(run_id).await {
-            return;
+        match sentinel.is_set(run_id).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            // Logged and retried at the poll cadence; the check must
+            // not fail phase work.
+            Err(e) => tracing::warn!(error = %e, "cancellation sentinel check failed"),
         }
         tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
     }

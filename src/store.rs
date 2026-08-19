@@ -586,19 +586,25 @@ impl CancelSentinel {
             .map(|_| ())
     }
 
-    /// Whether the cancellation sentinel exists.
-    pub async fn is_set(&self, run_id: &str) -> bool {
-        self.object_store.head(&self.path(run_id)).await.is_ok()
+    /// Whether the cancellation sentinel exists. `Ok(false)` only for
+    /// a missing sentinel; any other `head` failure is returned.
+    pub async fn is_set(&self, run_id: &str) -> object_store::Result<bool> {
+        match self.object_store.head(&self.path(run_id)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Instant the sentinel was written (its object's
-    /// `last_modified`), or `None` when no sentinel exists.
-    pub async fn requested_at(&self, run_id: &str) -> Option<DateTime<Utc>> {
-        self.object_store
-            .head(&self.path(run_id))
-            .await
-            .ok()
-            .map(|meta| meta.last_modified)
+    /// `last_modified`). `Ok(None)` only when no sentinel exists; any
+    /// other `head` failure is returned.
+    pub async fn requested_at(&self, run_id: &str) -> object_store::Result<Option<DateTime<Utc>>> {
+        match self.object_store.head(&self.path(run_id)).await {
+            Ok(meta) => Ok(Some(meta.last_modified)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Remove the sentinel. Missing sentinels are not an error.
@@ -958,13 +964,13 @@ mod tests {
     async fn cancel_sentinel_round_trip() {
         use taquba::object_store::memory::InMemory;
         let sentinel = CancelSentinel::new(Arc::new(InMemory::new()), &Path::default());
-        assert!(!sentinel.is_set("run-1").await);
-        assert!(sentinel.requested_at("run-1").await.is_none());
+        assert!(!sentinel.is_set("run-1").await.unwrap());
+        assert!(sentinel.requested_at("run-1").await.unwrap().is_none());
         sentinel.mark("run-1").await.unwrap();
-        assert!(sentinel.is_set("run-1").await);
-        assert!(sentinel.requested_at("run-1").await.is_some());
+        assert!(sentinel.is_set("run-1").await.unwrap());
+        assert!(sentinel.requested_at("run-1").await.unwrap().is_some());
         sentinel.clear("run-1").await.unwrap();
-        assert!(!sentinel.is_set("run-1").await);
+        assert!(!sentinel.is_set("run-1").await.unwrap());
         // Clearing an absent sentinel is not an error.
         sentinel.clear("run-1").await.unwrap();
     }
