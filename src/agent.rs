@@ -115,7 +115,7 @@ impl ResearchAgent {
 
         let worker_runtime = runtime.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let worker = tokio::spawn(async move {
+        let mut worker = tokio::spawn(async move {
             worker_runtime
                 .run(async move {
                     let _ = shutdown_rx.await;
@@ -140,16 +140,35 @@ impl ResearchAgent {
             .await
             .context("submitting research run")?;
 
-        let outcome = rx
-            .await
-            .map_err(|_| anyhow!("terminal hook dropped before signalling"))?;
-        let _ = shutdown_tx.send(());
-        let _ = worker.await;
+        // Await the terminal signal and the worker together: a worker
+        // task that fails or panics before the run terminates would
+        // otherwise leave this call waiting on `rx` indefinitely.
+        let outcome = tokio::select! {
+            out = rx => {
+                let _ = shutdown_tx.send(());
+                // The outcome is already committed, so a worker exit
+                // error is logged only.
+                if let Err(e) = flatten_worker_exit((&mut worker).await) {
+                    tracing::warn!(error = %e, "worker exit error after the terminal outcome");
+                }
+                out.map_err(|_| anyhow!("terminal hook dropped before signalling"))
+            }
+            joined = &mut worker => {
+                // The worker exited before the terminal signal; the
+                // run's step job stays in the queue.
+                drop(shutdown_tx);
+                Err(match flatten_worker_exit(joined) {
+                    Ok(()) => anyhow!("worker exited before the run terminated"),
+                    Err(e) => e.context("workflow worker failed before the run terminated"),
+                })
+            }
+        };
         // Stop the JobRunner only after the workflow worker has
-        // drained: any still-in-flight FetchPage was awaited by the
+        // exited: any still-in-flight FetchPage was awaited by the
         // workflow step that submitted it, so by the time we get here
         // there's nothing left for the job worker to do.
         let _ = job_handle.shutdown().await;
+        let outcome = outcome?;
 
         match outcome.status {
             TerminalStatus::Succeeded => {
@@ -262,6 +281,15 @@ impl ResearchAgentBuilder {
         }
         Ok(ResearchAgent { runner, config })
     }
+}
+
+/// Flatten a worker task's join result: a panic or abort
+/// (`JoinError`) and a [`WorkflowRuntime::run`] error are both
+/// returned as the error.
+fn flatten_worker_exit(
+    joined: std::result::Result<taquba_workflow::Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    Ok(joined??)
 }
 
 /// Terminal hook that forwards the [`RunOutcome`] on a oneshot channel so

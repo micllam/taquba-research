@@ -141,6 +141,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and exited 0, with the resume hint; it now surfaces as an error and
   the CLI exits non-zero. The interrupted-run message is kept for the
   clean Ctrl+C exit.
+- `ResearchAgent::run` waited indefinitely when the worker task
+  failed or panicked before the run terminated; the worker's exit now
+  surfaces as the call's error, and the fetch runner is shut down on
+  that path.
 
 ## [0.4.0] - 2026-06-17
 
