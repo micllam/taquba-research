@@ -131,6 +131,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ollama now honours `max_tokens_per_call`; rig 0.41 sends it as
   `options.num_predict`. Previously it was silently ignored for Ollama.
 
+### Fixed
+- A workflow worker error or panic was reported as an interruption
+  and exited 0, with the resume hint; it now surfaces as an error and
+  the CLI exits non-zero. The interrupted-run message is kept for the
+  clean Ctrl+C exit.
+
 ## [0.4.0] - 2026-06-17
 
 ### Added

@@ -785,6 +785,15 @@ struct WorkerHandles {
     job_handle: RunnerHandle,
 }
 
+/// Flatten a worker task's join result: a panic or abort
+/// (`JoinError`) and a [`WorkflowRuntime::run`] error are both
+/// returned as the error.
+fn flatten_worker_exit(
+    joined: std::result::Result<taquba_workflow::Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    Ok(joined??)
+}
+
 async fn finalize(
     cli: &Cli,
     store_ctx: &StoreCtx,
@@ -792,8 +801,8 @@ async fn finalize(
     run_id: &str,
 ) -> Result<()> {
     // Either the terminal hook fires (run reached a terminal step) or
-    // the worker exited (Ctrl+C). Whichever happens first determines the
-    // exit message.
+    // the worker exited (Ctrl+C or a worker error). Whichever happens
+    // first determines the exit message.
     let WorkerHandles {
         mut rx,
         mut worker,
@@ -804,20 +813,29 @@ async fn finalize(
         out = &mut rx => {
             // Run reached a terminal step. Tell the worker to stop so it
             // doesn't keep polling the queue, then await its clean exit
-            // before writing the report.
+            // before writing the report. The outcome is already
+            // committed, so an exit error is logged only.
             let _ = shutdown_tx.send(());
-            let _ = (&mut worker).await;
+            if let Err(e) = flatten_worker_exit((&mut worker).await) {
+                tracing::warn!(error = %e, "worker exit error after the terminal outcome");
+            }
             handle_terminal(cli, store_ctx, run_id, out.ok()).await
         }
         joined = &mut worker => {
-            // Worker exited without a terminal signal: interrupted.
-            // The pending step job makes the run resumable; no index
-            // write is needed. Drop shutdown_tx; the receiver is
-            // dropped.
+            // Worker exited without a terminal signal. The pending
+            // step job keeps the run resumable; no index write is
+            // needed. Drop shutdown_tx; the receiver is dropped.
             drop(shutdown_tx);
-            let _ = joined;
-            print_interrupted(run_id);
-            Ok(())
+            match flatten_worker_exit(joined) {
+                // Clean exit: the worker's Ctrl+C branch resolved.
+                Ok(()) => {
+                    print_interrupted(run_id);
+                    Ok(())
+                }
+                Err(e) => Err(e.context(format!(
+                    "workflow worker failed; run {run_id} remains resumable"
+                ))),
+            }
         }
     };
     // Workflow worker has stopped (terminal or Ctrl+C). Drain the
