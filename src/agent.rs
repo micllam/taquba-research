@@ -113,6 +113,29 @@ impl ResearchAgent {
             .memo_retention(MEMO_RETENTION)
             .build();
 
+        let entry = RunIndexEntry {
+            run_id: run_id.clone(),
+            query: query.clone(),
+            submitted_at: Utc::now(),
+            terminal: None,
+        };
+        let input = ResearchStepRunner::initial_state(query.clone(), self.config.clone());
+        // Submit before spawning the worker, so a submit failure has
+        // only the fetch runner to shut down.
+        if let Err(e) = runtime
+            .submit(RunSpec {
+                run_id: Some(run_id.clone()),
+                input,
+                kv_writes: [(run_entry_key(&run_id), entry.to_bytes())].into(),
+                ..Default::default()
+            })
+            .await
+            .context("submitting research run")
+        {
+            let _ = job_handle.shutdown().await;
+            return Err(e);
+        }
+
         let worker_runtime = runtime.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let mut worker = tokio::spawn(async move {
@@ -122,23 +145,6 @@ impl ResearchAgent {
                 })
                 .await
         });
-
-        let entry = RunIndexEntry {
-            run_id: run_id.clone(),
-            query: query.clone(),
-            submitted_at: Utc::now(),
-            terminal: None,
-        };
-        let input = ResearchStepRunner::initial_state(query.clone(), self.config.clone());
-        runtime
-            .submit(RunSpec {
-                run_id: Some(run_id.clone()),
-                input,
-                kv_writes: [(run_entry_key(&run_id), entry.to_bytes())].into(),
-                ..Default::default()
-            })
-            .await
-            .context("submitting research run")?;
 
         // Await the terminal signal and the worker together: a worker
         // task that fails or panics before the run terminates would

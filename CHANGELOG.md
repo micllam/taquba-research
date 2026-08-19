@@ -145,6 +145,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed or panicked before the run terminated; the worker's exit now
   surfaces as the call's error, and the fetch runner is shut down on
   that path.
+- A `ResearchAgent::run` submit failure returned without shutting the
+  fetch `JobRunner` down, leaving its polling task running for the
+  process lifetime; the fetch runner is now shut down on every exit
+  path.
 
 ## [0.4.0] - 2026-06-17
 
