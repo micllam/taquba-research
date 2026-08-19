@@ -21,14 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report location shared by the runner and the CLI, and
   `ResearchStepRunner::with_report_store`, attaching the store the
   Writing step writes the report blob to.
+- `TerminalReconciler`, a `TerminalHook` decorator that stages the
+  terminal index record for outcomes that apply no step effects (a
+  dead-lettered step, an external cancellation), so dead-lettered
+  runs receive a durable `failed` record whose summary is decoded
+  from the dead job's payload. Both runtime hosts wrap their capture
+  hooks in it; while the dead job is still present the run derives
+  `failed (dead-lettered)`.
 
 ### Changed
 - **Breaking:** the run index moved from per-run JSON objects under
   `<store>/runs/` into the queue's user KV namespace
   (`research/runs/<run_id>`), and its writes are transactional: the
   submit-time entry joins the submit transaction via `RunSpec`
-  KV writes, and the terminal entry joins the terminal step's
-  settlement via `Step` effects (both new in taquba-workflow 0.10).
+  KV writes, and the terminal entry joins a settlement transaction:
+  the terminal step's via `Step` effects for runner-issued outcomes,
+  the terminal notification's otherwise (both mechanisms new in
+  taquba-workflow 0.10).
   The crash windows in which the index contradicted the queue are
   closed. `RunStore` and `RunIndexStatus` are removed; the reduced
   `RunIndexEntry` stores only submission facts plus an optional
@@ -56,9 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signature: `on_termination` takes a `TerminalEffects` parameter and
   returns `Result<(), StepError>`.
 - **Breaking:** `gc --status` accepts the stored terminal statuses
-  only (`succeeded`, `failed`, `cancelled`); the in-flight values
+  (`succeeded`, `failed`, `cancelled`) plus `unknown`, which opts in
+  to collecting entries with no terminal record and no step job (the
+  state left when the reaper removes a dead-lettered run's job before
+  its `failed` record was reconciled); the in-flight values
   (`running`, `paused`, `cancellation_requested`) are no longer
-  valid, since runs without a terminal record are never gc
+  valid, since runs without a terminal record are otherwise never gc
   candidates.
 - `init` probes the whole store prefix (previously the run index
   prefix) and reports plain reachability.

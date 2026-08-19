@@ -21,7 +21,9 @@ use crate::fetch_job::spawn_fetch_runner;
 use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
-use crate::store::{CancelSentinel, RunIndexEntry, WORKFLOW_QUEUE_NAME, run_entry_key};
+use crate::store::{
+    CancelSentinel, RunIndexEntry, TerminalReconciler, WORKFLOW_QUEUE_NAME, run_entry_key,
+};
 
 /// How long workflow memo blobs are retained after the run reaches a
 /// terminal state. Any in-process at-least-once retry happens well
@@ -66,10 +68,13 @@ impl ResearchAgent {
         // can filter notifications to this run.
         let run_id = ulid::Ulid::new().to_string();
         let (tx, rx) = oneshot::channel::<RunOutcome>();
-        let hook = CaptureOutcome {
-            run_id: run_id.clone(),
-            tx: Mutex::new(Some(tx)),
-        };
+        let hook = TerminalReconciler::new(
+            queue.clone(),
+            CaptureOutcome {
+                run_id: run_id.clone(),
+                tx: Mutex::new(Some(tx)),
+            },
+        );
 
         // Build the JobRunner the Fetching step submits FetchPage jobs
         // to. It shares the same Queue + ObjectStore as the workflow
@@ -265,8 +270,8 @@ impl TerminalHook for CaptureOutcome {
         // by a terminated process is delivered to the next worker on
         // the queue. Consuming a foreign notification here would
         // misattribute the outcome, so it is acked and logged; its
-        // run's terminal index entry was committed by the step
-        // settlement.
+        // run's terminal index entry is staged by the step settlement
+        // or by the wrapping `TerminalReconciler`.
         if outcome.run_id != self.run_id {
             tracing::warn!(
                 run_id = %outcome.run_id,

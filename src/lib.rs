@@ -210,7 +210,7 @@ pub use fetch_job::{FETCH_QUEUE_NAME, spawn_fetch_runner};
 pub use report::{Citation, Report, RunStats};
 pub use runner::{ResearchStepRunner, RunRecord};
 pub use state::{Phase, ResearchConfig, StateSummary, TokenUsage, summarize_state};
-pub use store::CancelSentinel;
+pub use store::{CancelSentinel, TerminalReconciler};
 
 /// Re-exports of the workflow runtime types most users will need to wire a
 /// custom [`WorkflowRuntime`](taquba_workflow::WorkflowRuntime) around

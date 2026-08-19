@@ -34,7 +34,8 @@ use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, parse_url};
 use taquba::{JobStatus, OpenOptions, Queue, QueueConfig, QueueReader, ReaderMode, ReaderOptions};
 use taquba_research::jobs::RunnerHandle;
 use taquba_research::store::{
-    self, RunDisplayStatus, RunIndexEntry, StepJobState, StoredStatus, WORKFLOW_QUEUE_NAME,
+    self, RunDisplayStatus, RunIndexEntry, StepJobState, StoredStatus, TerminalReconciler,
+    WORKFLOW_QUEUE_NAME,
 };
 use taquba_research::workflow::{
     RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
@@ -205,12 +206,14 @@ enum Command {
         /// days in the past.
         #[arg(long)]
         older_than_days: Option<i64>,
-        /// Restrict deletion to specific terminal statuses
-        /// (repeatable). Allowed: `succeeded`, `failed`, `cancelled`.
-        /// Runs without a terminal record are never deleted: their
-        /// state is held in the queue.
+        /// Restrict deletion to specific statuses (repeatable).
+        /// Allowed: `succeeded`, `failed`, `cancelled`, `unknown`.
+        /// `unknown` (never matched by default) selects entries with
+        /// no terminal record and no step job; other runs without a
+        /// terminal record are never deleted: their state is held in
+        /// the queue.
         #[arg(long = "status", value_parser = parse_gc_status)]
-        statuses: Vec<StoredStatus>,
+        statuses: Vec<GcStatus>,
         /// Proceed even when claimed jobs are visible in the store.
         /// Opening the writer fences a live worker and requeues its
         /// claimed jobs; pass this only when no worker is running.
@@ -222,13 +225,23 @@ enum Command {
     },
 }
 
-fn parse_gc_status(s: &str) -> std::result::Result<StoredStatus, String> {
+/// Status filter accepted by `gc --status`: the stored terminal
+/// statuses plus `unknown`, entries with no terminal record and no
+/// step job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GcStatus {
+    Stored(StoredStatus),
+    Unknown,
+}
+
+fn parse_gc_status(s: &str) -> std::result::Result<GcStatus, String> {
     match s.to_ascii_lowercase().as_str() {
-        "succeeded" => Ok(StoredStatus::Succeeded),
-        "failed" => Ok(StoredStatus::Failed),
-        "cancelled" | "canceled" => Ok(StoredStatus::Cancelled),
+        "succeeded" => Ok(GcStatus::Stored(StoredStatus::Succeeded)),
+        "failed" => Ok(GcStatus::Stored(StoredStatus::Failed)),
+        "cancelled" | "canceled" => Ok(GcStatus::Stored(StoredStatus::Cancelled)),
+        "unknown" => Ok(GcStatus::Unknown),
         other => Err(format!(
-            "unknown status `{other}`; expected one of: succeeded, failed, cancelled"
+            "unknown status `{other}`; expected one of: succeeded, failed, cancelled, unknown"
         )),
     }
 }
@@ -558,7 +571,8 @@ fn build_config(cli: &Cli) -> ResearchConfig {
 }
 
 /// Build a [`WorkflowRuntime`] with our standard config (one claimer,
-/// `CaptureHook` for the terminal channel) and spawn its worker task.
+/// a `TerminalReconciler`-wrapped `CaptureHook` for the terminal
+/// channel) and spawn its worker task.
 /// The worker exits on either Ctrl+C or a terminal-hook signal sent via
 /// [`WorkerHandles::shutdown_tx`]; the Ctrl+C branch prints an
 /// immediate "Interrupting..." acknowledgement so the user doesn't
@@ -569,14 +583,17 @@ fn spawn_runtime(
     runner: ResearchStepRunner,
     run_id: &str,
 ) -> Result<(
-    WorkflowRuntime<ResearchStepRunner, CaptureHook>,
+    WorkflowRuntime<ResearchStepRunner, TerminalReconciler<CaptureHook>>,
     WorkerHandles,
 )> {
     let (tx, rx) = oneshot::channel::<RunOutcome>();
-    let hook = CaptureHook {
-        run_id: run_id.to_string(),
-        tx: Mutex::new(Some(tx)),
-    };
+    let hook = TerminalReconciler::new(
+        queue.clone(),
+        CaptureHook {
+            run_id: run_id.to_string(),
+            tx: Mutex::new(Some(tx)),
+        },
+    );
     // Build the JobRunner the Fetching step submits FetchPage jobs to.
     let (job_runner, job_handle) = spawn_fetch_runner(&queue, &store_ctx.object_store);
     let runner = runner
@@ -1088,7 +1105,7 @@ async fn cmd_gc(
     store_ctx: &StoreCtx,
     sentinel: &CancelSentinel,
     older_than_days: Option<i64>,
-    statuses: Vec<StoredStatus>,
+    statuses: Vec<GcStatus>,
     force: bool,
     dry_run: bool,
 ) -> Result<()> {
@@ -1098,7 +1115,7 @@ async fn cmd_gc(
     }
     // The claimed-job count is used by the guard before the writer
     // open below; a dry run never opens the writer.
-    let (claimed, entries) = with_reader(store_ctx, async |reader| {
+    let (claimed, entries, jobs) = with_reader(store_ctx, async |reader| {
         let mut claimed = 0usize;
         for queue in [WORKFLOW_QUEUE_NAME, FETCH_QUEUE_NAME] {
             claimed += reader
@@ -1108,22 +1125,26 @@ async fn cmd_gc(
                 .len();
         }
         let entries = store::list_runs(reader).await?;
-        Ok((claimed, entries))
+        let jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
+        Ok((claimed, entries, jobs))
     })
     .await?;
 
     let cutoff = older_than_days.map(|d| Utc::now() - chrono::Duration::days(d));
+    let wants_unknown = statuses.contains(&GcStatus::Unknown);
     let mut candidates: Vec<_> = entries
         .into_iter()
-        .filter(|e| match &e.terminal {
-            // Runs without a terminal record are still represented in
-            // the queue (in flight, interrupted or dead-lettered);
-            // deleting their entries would orphan that state.
-            None => false,
-            Some(t) => {
-                (statuses.is_empty() || statuses.contains(&t.status))
-                    && cutoff.is_none_or(|c| e.submitted_at < c)
-            }
+        .filter(|e| {
+            let matches_status = match &e.terminal {
+                // Entries with no terminal record and no step job are
+                // collected only via an explicit `--status unknown`;
+                // other runs without a terminal record are still
+                // represented in the queue, and deleting their entries
+                // would orphan that state.
+                None => wants_unknown && !jobs.contains_key(&e.run_id),
+                Some(t) => statuses.is_empty() || statuses.contains(&GcStatus::Stored(t.status)),
+            };
+            matches_status && cutoff.is_none_or(|c| e.submitted_at < c)
         })
         .collect();
     candidates.sort_by_key(|e| e.submitted_at);
@@ -1223,8 +1244,8 @@ impl TerminalHook for CaptureHook {
         // by a terminated process is delivered to the next worker on
         // the queue. Consuming a foreign notification here would
         // misattribute the outcome, so it is acked and logged; its
-        // run's terminal index entry was committed by the step
-        // settlement.
+        // run's terminal index entry is staged by the step settlement
+        // or by the wrapping `TerminalReconciler`.
         if outcome.run_id != self.run_id {
             tracing::warn!(
                 run_id = %outcome.run_id,
