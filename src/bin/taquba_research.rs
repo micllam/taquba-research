@@ -16,8 +16,8 @@
 //!
 //! `list`, `status`, `show` and `cancel` read through a
 //! [`QueueReader`] and work from a second process against a live
-//! store. `gc` needs the exclusive writer; it refuses while claimed
-//! jobs are visible unless `--force` is passed.
+//! store. `resume` and `gc` need the exclusive writer; they refuse
+//! while claimed jobs are visible unless `--force` is passed.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -173,6 +173,11 @@ enum Command {
     Resume {
         /// Run identifier to resume.
         run_id: String,
+        /// Proceed even when claimed jobs are visible in the store.
+        /// Opening the writer fences a live worker and requeues its
+        /// claimed jobs; pass this only when no worker is running.
+        #[arg(long)]
+        force: bool,
     },
     /// List past runs.
     List,
@@ -270,8 +275,8 @@ async fn main() -> Result<()> {
     let sentinel = CancelSentinel::new(store_ctx.object_store.clone(), &store_ctx.prefix);
 
     match &cli.command {
-        Some(Command::Resume { run_id }) => {
-            cmd_resume(&cli, &store_ctx, &sentinel, run_id.clone()).await
+        Some(Command::Resume { run_id, force }) => {
+            cmd_resume(&cli, &store_ctx, &sentinel, run_id.clone(), *force).await
         }
         Some(Command::List) => cmd_list(&store_ctx, &sentinel).await,
         Some(Command::Status { run_id }) => cmd_status(&store_ctx, &sentinel, run_id.clone()).await,
@@ -458,6 +463,23 @@ async fn with_reader<T>(ctx: &StoreCtx, op: impl AsyncFn(&QueueReader) -> Result
             second
         }
     }
+}
+
+/// Number of claimed jobs visible through `reader`, across both
+/// queues. Guards an exclusive writer open: opening the writer fences
+/// a live worker and requeues its claimed jobs. Best-effort in both
+/// directions: a reader cannot distinguish a live claim from an
+/// abandoned one, and reader lag can hide a recent claim.
+async fn count_claimed_jobs(reader: &QueueReader) -> Result<usize> {
+    let mut claimed = 0usize;
+    for queue in [WORKFLOW_QUEUE_NAME, FETCH_QUEUE_NAME] {
+        claimed += reader
+            .list_jobs(queue, JobStatus::Claimed, None, 1)
+            .await?
+            .jobs
+            .len();
+    }
+    Ok(claimed)
 }
 
 /// Resolve where the final report should land. Returns `None` for the
@@ -685,6 +707,7 @@ async fn cmd_resume(
     store_ctx: &StoreCtx,
     sentinel: &CancelSentinel,
     run_id: String,
+    force: bool,
 ) -> Result<()> {
     // Guard against resuming a finished, dead-lettered or unknown run
     // before the (exclusive) writer open. A reader-side check
@@ -693,10 +716,11 @@ async fn cmd_resume(
         if !queue_exists(store_ctx).await? {
             bail!("no run index entry for {run_id} (store contains no runs)");
         }
-        let (entry, job) = with_reader(store_ctx, async |reader| {
+        let (claimed, entry, job) = with_reader(store_ctx, async |reader| {
+            let claimed = count_claimed_jobs(reader).await?;
             let entry = store::get_run(reader, &run_id).await?;
             let mut jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
-            Ok((entry, jobs.remove(&run_id)))
+            Ok((claimed, entry, jobs.remove(&run_id)))
         })
         .await?;
         let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
@@ -713,6 +737,14 @@ async fn cmd_resume(
                 job.attempts
             ),
             Some(_) => {}
+        }
+        // Guard before taking the exclusive writer, as in `cmd_gc`;
+        // the caveats are on `count_claimed_jobs`.
+        if claimed > 0 && !force {
+            bail!(
+                "claimed jobs are visible in this store; a worker may be live. \
+                 Re-run with --force only when no `run`/`resume` process is active."
+            );
         }
     }
     if sentinel.is_set(&run_id).await {
@@ -1116,14 +1148,7 @@ async fn cmd_gc(
     // The claimed-job count is used by the guard before the writer
     // open below; a dry run never opens the writer.
     let (claimed, entries, jobs) = with_reader(store_ctx, async |reader| {
-        let mut claimed = 0usize;
-        for queue in [WORKFLOW_QUEUE_NAME, FETCH_QUEUE_NAME] {
-            claimed += reader
-                .list_jobs(queue, JobStatus::Claimed, None, 1)
-                .await?
-                .jobs
-                .len();
-        }
+        let claimed = count_claimed_jobs(reader).await?;
         let entries = store::list_runs(reader).await?;
         let jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
         Ok((claimed, entries, jobs))
@@ -1180,12 +1205,8 @@ async fn cmd_gc(
         return Ok(());
     }
 
-    // Reader-side guard before taking the exclusive writer: opening
-    // the writer fences a live worker and requeues its claimed jobs.
-    // A claimed job visible through the reader is treated as a live
-    // worker. The check is best-effort in both directions: a reader
-    // cannot distinguish a live claim from an abandoned one, and
-    // reader lag can hide a recent claim.
+    // Reader-side guard before taking the exclusive writer; the
+    // caveats are on `count_claimed_jobs`.
     if claimed > 0 && !force {
         bail!(
             "claimed jobs are visible in this store; a worker may be live. \

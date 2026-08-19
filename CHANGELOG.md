@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Phase`, `StateSummary` and `summarize_state`, decoding the
   progress-relevant fields of a step-job payload for inspection
   tooling.
-- The CLI's `gc` gains `--force`. Without it, `gc` refuses while
-  claimed jobs are visible in the store, since opening the exclusive
-  writer would fence a live worker and requeue its claimed jobs.
+- The CLI's `gc` and `resume` gain `--force`. Without it, both refuse
+  while claimed jobs are visible in the store, since opening the
+  exclusive writer would fence a live worker and requeue its claimed
+  jobs.
 - `store::report_path` and `store::REPORTS_PREFIX`, the canonical
   report location shared by the runner and the CLI, and
   `ResearchStepRunner::with_report_store`, attaching the store the
