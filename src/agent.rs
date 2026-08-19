@@ -6,10 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
 use rig_core::providers::{anthropic, ollama, openai};
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
-use taquba_workflow::{RunOutcome, RunSpec, TerminalHook, TerminalStatus, WorkflowRuntime};
+use taquba_workflow::{
+    RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
@@ -18,7 +21,7 @@ use crate::fetch_job::spawn_fetch_runner;
 use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
-use crate::store::RunStore;
+use crate::store::{CancelSentinel, RunIndexEntry, WORKFLOW_QUEUE_NAME, run_entry_key};
 
 /// How long workflow memo blobs are retained after the run reaches a
 /// terminal state. Any in-process at-least-once retry happens well
@@ -33,7 +36,6 @@ const MEMO_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub struct ResearchAgent {
     runner: ResearchStepRunner,
     config: ResearchConfig,
-    run_store: Option<RunStore>,
 }
 
 impl ResearchAgent {
@@ -57,8 +59,13 @@ impl ResearchAgent {
         query: impl Into<String>,
     ) -> Result<Report> {
         let query = query.into();
+        // The run id is generated before submit so the index entry's
+        // KV key can join the submit transaction and the terminal hook
+        // can filter notifications to this run.
+        let run_id = ulid::Ulid::new().to_string();
         let (tx, rx) = oneshot::channel::<RunOutcome>();
         let hook = CaptureOutcome {
+            run_id: run_id.clone(),
             tx: Mutex::new(Some(tx)),
         };
 
@@ -77,6 +84,7 @@ impl ResearchAgent {
         // current one acks. One worker is enough and avoids unnecessary
         // claim transaction conflicts.
         let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
+            .queue_name(WORKFLOW_QUEUE_NAME)
             .max_concurrent_steps(1)
             .memo_retention(MEMO_RETENTION)
             .build();
@@ -91,10 +99,18 @@ impl ResearchAgent {
                 .await
         });
 
+        let entry = RunIndexEntry {
+            run_id: run_id.clone(),
+            query: query.clone(),
+            submitted_at: Utc::now(),
+            terminal: None,
+        };
         let input = ResearchStepRunner::initial_state(query.clone(), self.config.clone());
         runtime
             .submit(RunSpec {
+                run_id: Some(run_id.clone()),
                 input,
+                kv_writes: [(run_entry_key(&run_id), entry.to_bytes())].into(),
                 ..Default::default()
             })
             .await
@@ -110,10 +126,6 @@ impl ResearchAgent {
         // workflow step that submitted it, so by the time we get here
         // there's nothing left for the job worker to do.
         let _ = job_handle.shutdown().await;
-
-        if let Some(store) = &self.run_store {
-            persist_outcome(store, &outcome, &query).await?;
-        }
 
         match outcome.status {
             TerminalStatus::Succeeded => {
@@ -143,57 +155,6 @@ impl ResearchAgent {
     }
 }
 
-async fn persist_outcome(store: &RunStore, outcome: &RunOutcome, query: &str) -> Result<()> {
-    use crate::store::{RunIndexEntry, RunIndexStatus};
-    use chrono::Utc;
-
-    let (status, report, error) = match outcome.status {
-        TerminalStatus::Succeeded => {
-            let bytes = outcome.result.clone().unwrap_or_default();
-            let record: Result<RunRecord, _> = serde_json::from_slice(&bytes);
-            match record {
-                Ok(r) => (RunIndexStatus::Succeeded, r.report, None),
-                Err(e) => (
-                    RunIndexStatus::Succeeded,
-                    None,
-                    Some(format!("(report decode failed: {e})")),
-                ),
-            }
-        }
-        TerminalStatus::Failed => (RunIndexStatus::Failed, None, outcome.error.clone()),
-        TerminalStatus::Cancelled => (RunIndexStatus::Cancelled, None, outcome.error.clone()),
-        _ => (
-            RunIndexStatus::Failed,
-            None,
-            Some(format!("unknown terminal status: {}", outcome.status)),
-        ),
-    };
-
-    let now = Utc::now();
-    let submitted_at = store
-        .get(&outcome.run_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|e| e.submitted_at)
-        .unwrap_or(now);
-
-    let entry = RunIndexEntry {
-        run_id: outcome.run_id.clone(),
-        query: query.to_string(),
-        submitted_at,
-        status,
-        report,
-        error,
-        updated_at: now,
-    };
-    store
-        .put(&entry)
-        .await
-        .context("persisting run index entry")?;
-    Ok(())
-}
-
 /// Builder for [`ResearchAgent`]. Required fields:
 ///
 /// - A provider client (call [`Self::openai`], [`Self::anthropic`], or
@@ -204,13 +165,14 @@ async fn persist_outcome(store: &RunStore, outcome: &RunOutcome, query: &str) ->
 ///
 /// Optional:
 ///
-/// - [`Self::run_store`]: filesystem index for CLI-style `list`/`status`.
+/// - [`Self::cancellation`]: sentinel handle for cross-process
+///   cancellation.
 #[derive(Default)]
 pub struct ResearchAgentBuilder {
     provider: Option<ProviderClient>,
     search: Option<Arc<dyn SearchBackend>>,
     config: Option<ResearchConfig>,
-    run_store: Option<RunStore>,
+    cancel: Option<CancelSentinel>,
 }
 
 impl ResearchAgentBuilder {
@@ -250,10 +212,10 @@ impl ResearchAgentBuilder {
         self
     }
 
-    /// Attach a [`RunStore`] for cross-process cancellation and CLI
-    /// `list`/`status`/`show` visibility.
-    pub fn run_store(mut self, store: RunStore) -> Self {
-        self.run_store = Some(store);
+    /// Attach a [`CancelSentinel`] so a `cancel` issued from another
+    /// process terminates the run.
+    pub fn cancellation(mut self, sentinel: CancelSentinel) -> Self {
+        self.cancel = Some(sentinel);
         self
     }
 
@@ -271,30 +233,49 @@ impl ResearchAgentBuilder {
             .config
             .ok_or_else(|| anyhow!("ResearchAgent requires a ResearchConfig"))?;
         let mut runner = ResearchStepRunner::from_provider(provider, search);
-        if let Some(store) = &self.run_store {
-            runner = runner.with_run_store(store.clone());
+        if let Some(sentinel) = self.cancel {
+            runner = runner.with_cancellation(sentinel);
         }
-        Ok(ResearchAgent {
-            runner,
-            config,
-            run_store: self.run_store,
-        })
+        Ok(ResearchAgent { runner, config })
     }
 }
 
 /// Terminal hook that forwards the [`RunOutcome`] on a oneshot channel so
 /// the caller can `await` the whole run.
 struct CaptureOutcome {
+    /// Run this invocation submitted. Notifications for any other run
+    /// are stale; see `on_termination`.
+    run_id: String,
     tx: Mutex<Option<oneshot::Sender<RunOutcome>>>,
 }
 
 impl TerminalHook for CaptureOutcome {
-    async fn on_termination(&self, outcome: &RunOutcome) {
+    async fn on_termination(
+        &self,
+        outcome: &RunOutcome,
+        _effects: &TerminalEffects,
+    ) -> std::result::Result<(), StepError> {
+        // Terminal notifications are durable jobs: one left unclaimed
+        // by a terminated process is delivered to the next worker on
+        // the queue. Consuming a foreign notification here would
+        // misattribute the outcome, so it is acked and logged; its
+        // run's terminal index entry was committed by the step
+        // settlement.
+        if outcome.run_id != self.run_id {
+            tracing::warn!(
+                run_id = %outcome.run_id,
+                status = %outcome.status,
+                "acknowledged stale terminal notification from another run"
+            );
+            return Ok(());
+        }
         // Take the sender out of the mutex before sending so the lock
-        // guard isn't held across `tx.send`.
+        // guard is not held across `tx.send`. A redelivered
+        // notification finds no sender and is a no-op.
         let tx = self.tx.lock().await.take();
         if let Some(tx) = tx {
             let _ = tx.send(outcome.clone());
         }
+        Ok(())
     }
 }

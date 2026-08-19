@@ -109,6 +109,46 @@ pub enum Phase {
     Writing,
 }
 
+impl Phase {
+    /// Stable lowercase identifier used in CLI output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Searching => "searching",
+            Self::Fetching => "fetching",
+            Self::Summarizing => "summarizing",
+            Self::Synthesizing => "synthesizing",
+            Self::Writing => "writing",
+        }
+    }
+}
+
+impl std::fmt::Display for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Progress snapshot of an in-flight run, decoded from a step job's
+/// payload by inspection commands.
+#[derive(Debug, Clone)]
+pub struct StateSummary {
+    /// Phase the next (or current) step will run.
+    pub phase: Phase,
+    /// Steps the runner has completed so far.
+    pub steps_completed: u32,
+}
+
+/// Decode the progress-relevant fields of a step-job payload. Returns
+/// `None` when the payload is not a serialized research state.
+pub fn summarize_state(payload: &[u8]) -> Option<StateSummary> {
+    let state = ResearchState::from_bytes(payload).ok()?;
+    Some(StateSummary {
+        phase: state.phase,
+        steps_completed: state.steps_completed,
+    })
+}
+
 /// Per-page fetched text, plus the title we'll use in citations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchedPage {

@@ -33,7 +33,7 @@ features = ["aws"]
 
 [dependencies]
 taquba = "0.11"
-taquba-workflow = "0.9"
+taquba-workflow = "0.10"
 taquba-jobs = "0.7"
 rig-core = "0.41"
 rig-agent = "0.41"

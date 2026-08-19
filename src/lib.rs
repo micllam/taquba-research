@@ -199,25 +199,26 @@ mod runner;
 /// other backend.
 pub mod search;
 mod state;
-/// Run-level index of submitted runs, kept in the same `ObjectStore`
-/// as the SlateDB queue. Backs the CLI's `list`/`status`/`show`/
-/// `cancel`/`init`/`gc` subcommands. See [`store::RunIndexEntry`].
+/// Run-level index of submitted runs, stored in the queue's user KV
+/// namespace, plus the cancellation sentinel. Backs the CLI's
+/// `list`/`status`/`show`/`cancel`/`gc` subcommands. See
+/// [`store::RunIndexEntry`].
 pub mod store;
 
 pub use agent::{ResearchAgent, ResearchAgentBuilder};
-pub use fetch_job::spawn_fetch_runner;
+pub use fetch_job::{FETCH_QUEUE_NAME, spawn_fetch_runner};
 pub use report::{Citation, Report, RunStats};
 pub use runner::{ResearchStepRunner, RunRecord};
-pub use state::{ResearchConfig, TokenUsage};
-pub use store::RunStore;
+pub use state::{Phase, ResearchConfig, StateSummary, TokenUsage, summarize_state};
+pub use store::CancelSentinel;
 
 /// Re-exports of the workflow runtime types most users will need to wire a
 /// custom [`WorkflowRuntime`](taquba_workflow::WorkflowRuntime) around
 /// [`ResearchStepRunner`].
 pub mod workflow {
     pub use taquba_workflow::{
-        NoopTerminalHook, RunOutcome, RunSpec, Step, StepError, StepOutcome, StepRunner,
-        SubmitOutcome, TerminalHook, TerminalStatus, WorkflowRuntime,
+        EffectsHandle, NoopTerminalHook, RunOutcome, RunSpec, Step, StepError, StepOutcome,
+        StepRunner, SubmitOutcome, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
     };
 }
 

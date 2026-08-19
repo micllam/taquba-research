@@ -32,7 +32,7 @@ use crate::search::{SearchBackend, SearchError};
 use crate::state::{
     Phase, ResearchConfig, ResearchState, SourceQuote, Summary, SynthesisOutput, TokenUsage,
 };
-use crate::store::RunStore;
+use crate::store::{CancelSentinel, RunIndexEntry, RunSummary, StoredStatus, TerminalRecord};
 
 /// Preamble applied to every Rig agent built by the runner. Kept
 /// terse: the per-phase prompts carry the task-specific instructions.
@@ -75,7 +75,7 @@ const MEMO_KEY_WRITING: &str = "writing";
 pub struct ResearchStepRunner {
     provider: Arc<ProviderClient>,
     search: Arc<dyn SearchBackend>,
-    run_store: Option<RunStore>,
+    cancel: Option<CancelSentinel>,
     job_runner: Option<Arc<JobRunner>>,
     queue: Option<Arc<Queue>>,
 }
@@ -124,19 +124,19 @@ impl ResearchStepRunner {
         Self {
             provider: Arc::new(provider),
             search,
-            run_store: None,
+            cancel: None,
             job_runner: None,
             queue: None,
         }
     }
 
-    /// Attach a [`RunStore`] used to check cancellation sentinels
-    /// throughout each step. The runner polls the sentinel concurrently
-    /// with the phase work, so a long-running LLM or HTTP call is
-    /// dropped within ~1 second of the sentinel appearing. When unset,
-    /// the runner ignores cancellation.
-    pub fn with_run_store(mut self, store: RunStore) -> Self {
-        self.run_store = Some(store);
+    /// Attach a [`CancelSentinel`] used to check for cross-process
+    /// cancellation throughout each step. The runner polls the sentinel
+    /// concurrently with the phase work, so a long-running LLM or HTTP
+    /// call is dropped within ~1 second of the sentinel appearing. When
+    /// unset, the runner ignores cancellation.
+    pub fn with_cancellation(mut self, sentinel: CancelSentinel) -> Self {
+        self.cancel = Some(sentinel);
         self
     }
 
@@ -186,30 +186,90 @@ impl StepRunner for ResearchStepRunner {
         // call is dropped within `CANCEL_POLL_INTERVAL` of the sentinel
         // appearing instead of blocking until the call completes.
         let work = self.dispatch_phase(step, &mut state);
-        match &self.run_store {
-            Some(store) => {
+        let outcome = match &self.cancel {
+            Some(sentinel) => {
                 tokio::select! {
-                    res = work => res,
-                    () = poll_cancelled(store, &step.run_id) => Ok(StepOutcome::Cancel {
+                    res = work => res?,
+                    () = poll_cancelled(sentinel, &step.run_id) => StepOutcome::Cancel {
                         reason: "Cancelled by user".to_string(),
-                    }),
+                    },
                 }
             }
-            None => work.await,
+            None => work.await?,
+        };
+        // The terminal index entry for a cancellation joins the
+        // settlement transaction of the Cancel outcome. The Succeed
+        // entry is staged in `dispatch_phase`, where the report is
+        // available.
+        if let StepOutcome::Cancel { reason } = &outcome {
+            stage_entry(step, &cancelled_entry(step, &state, reason))?;
         }
+        Ok(outcome)
     }
 }
 
 /// Resolves when the run's cancellation sentinel appears. Polls at
 /// [`CANCEL_POLL_INTERVAL`] cadence; the initial check fires immediately
 /// so an already-cancelled run short-circuits before any phase work runs.
-async fn poll_cancelled(store: &RunStore, run_id: &str) {
+async fn poll_cancelled(sentinel: &CancelSentinel, run_id: &str) {
     loop {
-        if store.is_cancelled(run_id).await {
+        if sentinel.is_set(run_id).await {
             return;
         }
         tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
     }
+}
+
+/// Terminal index entry for a successful run, summarizing the report's
+/// stats.
+fn succeeded_entry(step: &Step, state: &ResearchState, report: &Report) -> RunIndexEntry {
+    RunIndexEntry {
+        run_id: step.run_id.clone(),
+        query: state.query.clone(),
+        submitted_at: state.started_at,
+        terminal: Some(TerminalRecord {
+            status: StoredStatus::Succeeded,
+            error: None,
+            finished_at: report.stats.finished_at,
+            summary: RunSummary {
+                steps_completed: report.stats.steps_completed,
+                wall_time_secs: report.stats.wall_time.as_secs(),
+                token_usage: report.stats.token_usage,
+            },
+        }),
+    }
+}
+
+/// Terminal index entry for a cancelled run. The summary reflects
+/// progress up to the cancellation.
+fn cancelled_entry(step: &Step, state: &ResearchState, reason: &str) -> RunIndexEntry {
+    let finished_at = Utc::now();
+    let wall_time = (finished_at - state.started_at)
+        .to_std()
+        .unwrap_or_default();
+    RunIndexEntry {
+        run_id: step.run_id.clone(),
+        query: state.query.clone(),
+        submitted_at: state.started_at,
+        terminal: Some(TerminalRecord {
+            status: StoredStatus::Cancelled,
+            error: Some(reason.to_string()),
+            finished_at,
+            summary: RunSummary {
+                steps_completed: state.steps_completed,
+                wall_time_secs: wall_time.as_secs(),
+                token_usage: state.token_usage,
+            },
+        }),
+    }
+}
+
+/// Stage `entry` on the step's effects handle, so it commits in the
+/// same transaction as the terminal outcome's settlement.
+fn stage_entry(step: &Step, entry: &RunIndexEntry) -> Result<(), StepError> {
+    step.effects
+        .put(crate::store::run_entry_key(&entry.run_id), entry.to_bytes())
+        .map_err(|e| StepError::permanent(format!("staging run index entry: {e}")))
 }
 
 /// Drop-guard that fires `Queue::cancel` on a non-empty set of
@@ -288,6 +348,7 @@ impl ResearchStepRunner {
             Phase::Synthesizing => self.run_synthesizing(step, state).await?,
             Phase::Writing => {
                 let report = self.run_writing(step, state).await?;
+                stage_entry(step, &succeeded_entry(step, state, &report))?;
                 let record = RunRecord {
                     report: Some(report),
                     run_id: step.run_id.clone(),
@@ -1059,11 +1120,11 @@ mod tests {
     use std::collections::HashMap;
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
-    use taquba_workflow::{MemoStore, StepErrorKind};
+    use taquba_workflow::{EffectsHandle, MemoStore, StepErrorKind};
     use tokio_util::sync::CancellationToken;
 
-    fn test_store() -> RunStore {
-        RunStore::new(Arc::new(InMemory::new()), &Path::default())
+    fn test_sentinel() -> CancelSentinel {
+        CancelSentinel::new(Arc::new(InMemory::new()), &Path::default())
     }
 
     /// Build a `Step` with a fresh in-memory `Memo` and otherwise
@@ -1082,6 +1143,7 @@ mod tests {
             lease: taquba::LeaseHandle::detached(),
             memo,
             signal: None,
+            effects: EffectsHandle::detached(),
         }
     }
 
@@ -1109,26 +1171,77 @@ mod tests {
 
     #[tokio::test]
     async fn poll_cancelled_returns_immediately_if_already_cancelled() {
-        let store = test_store();
-        store.mark_cancelled("run-1").await.unwrap();
+        let sentinel = test_sentinel();
+        sentinel.mark("run-1").await.unwrap();
 
         // Initial check fires before any sleep, so this returns
         // without yielding to the timer.
-        poll_cancelled(&store, "run-1").await;
+        poll_cancelled(&sentinel, "run-1").await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn poll_cancelled_resolves_after_sentinel_appears() {
-        let store = test_store();
-        let writer = store.clone();
+        let sentinel = test_sentinel();
+        let writer = sentinel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            writer.mark_cancelled("run-2").await.unwrap();
+            writer.mark("run-2").await.unwrap();
         });
 
         // With virtual time the polling loop's sleep auto-advances
         // when the runtime is idle.
-        poll_cancelled(&store, "run-2").await;
+        poll_cancelled(&sentinel, "run-2").await;
+    }
+
+    #[test]
+    fn cancelled_entry_records_reason_and_progress() {
+        let step = test_step("run-3", 4);
+        let mut state = ResearchState::new("q", ResearchConfig::new("m"));
+        state.steps_completed = 4;
+        state.token_usage.input_tokens = 10;
+
+        let entry = cancelled_entry(&step, &state, "Cancelled by user");
+
+        assert_eq!(entry.run_id, "run-3");
+        assert_eq!(entry.query, "q");
+        assert_eq!(entry.submitted_at, state.started_at);
+        let t = entry.terminal.expect("terminal record");
+        assert_eq!(t.status, StoredStatus::Cancelled);
+        assert_eq!(t.error.as_deref(), Some("Cancelled by user"));
+        assert_eq!(t.summary.steps_completed, 4);
+        assert_eq!(t.summary.token_usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn succeeded_entry_summarizes_report_stats() {
+        let step = test_step("run-4", 9);
+        let state = ResearchState::new("q", ResearchConfig::new("m"));
+        let stats = crate::report::RunStats {
+            steps_completed: 9,
+            wall_time: Duration::from_secs(120),
+            started_at: state.started_at,
+            finished_at: Utc::now(),
+            token_usage: TokenUsage {
+                input_tokens: 5,
+                ..TokenUsage::default()
+            },
+        };
+        let report = Report {
+            run_id: "run-4".to_string(),
+            query: "q".to_string(),
+            markdown: String::new(),
+            citations: Vec::new(),
+            stats,
+        };
+
+        let entry = succeeded_entry(&step, &state, &report);
+
+        let t = entry.terminal.expect("terminal record");
+        assert_eq!(t.status, StoredStatus::Succeeded);
+        assert!(t.error.is_none());
+        assert_eq!(t.summary.steps_completed, 9);
+        assert_eq!(t.summary.wall_time_secs, 120);
+        assert_eq!(t.summary.token_usage.input_tokens, 5);
     }
 
     #[test]
@@ -1340,6 +1453,123 @@ mod tests {
         let evidence = extract_anthropic_source_quotes(&messages, &documents).unwrap();
 
         assert_eq!(evidence.len(), 1);
+    }
+
+    struct NoSearch;
+
+    #[async_trait::async_trait]
+    impl SearchBackend for NoSearch {
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<crate::search::SearchResult>, SearchError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct SignalOutcome {
+        tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<taquba_workflow::RunOutcome>>>,
+    }
+
+    impl taquba_workflow::TerminalHook for SignalOutcome {
+        async fn on_termination(
+            &self,
+            outcome: &taquba_workflow::RunOutcome,
+            _effects: &taquba_workflow::TerminalEffects,
+        ) -> Result<(), StepError> {
+            if let Some(tx) = self.tx.lock().unwrap().take() {
+                let _ = tx.send(outcome.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_index_entry_joins_submit_and_succeed_settlements() {
+        use crate::store::run_entry_key;
+        use rig_core::client::ProviderClient as _;
+        use taquba_workflow::{RunSpec, TerminalStatus, WorkflowRuntime};
+
+        let object_store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let queue = Arc::new(Queue::open(object_store.clone(), "q").await.unwrap());
+        let run_id = "01RUNIDX";
+
+        // Pre-populate the writing memo so the terminal step completes
+        // without an LLM call.
+        MemoStore::new(object_store.clone(), "test-memo")
+            .new_memo(run_id, 0)
+            .put(
+                MEMO_KEY_WRITING,
+                &serde_json::to_vec("report body").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut state = ResearchState::new("a query", ResearchConfig::new("m"));
+        state.phase = Phase::Writing;
+
+        let runner = ResearchStepRunner::from_provider(
+            ProviderClient::Ollama(rig_core::providers::ollama::Client::from_env().unwrap()),
+            Arc::new(NoSearch),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let hook = SignalOutcome {
+            tx: std::sync::Mutex::new(Some(tx)),
+        };
+        let runtime = WorkflowRuntime::builder(queue.clone(), object_store, runner, hook)
+            .queue_name("test-workflow")
+            .memo_prefix("test-memo")
+            .max_concurrent_steps(1)
+            .build();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let worker_runtime = runtime.clone();
+        let worker = tokio::spawn(async move {
+            worker_runtime
+                .run(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let entry = RunIndexEntry {
+            run_id: run_id.to_string(),
+            query: "a query".to_string(),
+            submitted_at: state.started_at,
+            terminal: None,
+        };
+        runtime
+            .submit(RunSpec {
+                run_id: Some(run_id.to_string()),
+                input: state.to_bytes(),
+                kv_writes: [(run_entry_key(run_id), entry.to_bytes())].into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The submit-time entry is readable as soon as submit returns.
+        let bytes = queue.kv_get(&run_entry_key(run_id)).await.unwrap().unwrap();
+        assert!(
+            RunIndexEntry::from_bytes(&bytes)
+                .unwrap()
+                .terminal
+                .is_none()
+        );
+
+        let outcome = rx.await.unwrap();
+        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let _ = shutdown_tx.send(());
+        let _ = worker.await;
+
+        // The terminal entry was applied by the Succeed settlement.
+        let bytes = queue.kv_get(&run_entry_key(run_id)).await.unwrap().unwrap();
+        let stored = RunIndexEntry::from_bytes(&bytes).unwrap();
+        assert_eq!(stored.query, "a query");
+        let terminal = stored.terminal.expect("terminal record");
+        assert_eq!(terminal.status, StoredStatus::Succeeded);
+        assert!(terminal.error.is_none());
+        assert_eq!(terminal.summary.steps_completed, 1);
     }
 
     #[tokio::test]

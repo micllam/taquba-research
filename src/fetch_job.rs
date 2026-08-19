@@ -34,7 +34,7 @@ const FETCH_RESPONSE_BYTE_CAP: usize = 2 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Logical queue name for fetch jobs. Distinct from the workflow
 /// runtime's queue so retention policies can diverge if needed.
-const FETCH_QUEUE_NAME: &str = "research-fetch-jobs";
+pub const FETCH_QUEUE_NAME: &str = "research-fetch-jobs";
 /// How long a `FetchPage` result blob is retained after the job
 /// reaches a terminal state. Any in-process idempotent re-submission
 /// (workflow-step retry) of the same `(run_id, url)` short-circuits

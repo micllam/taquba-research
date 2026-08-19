@@ -11,8 +11,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TokenUsage::tool_use_prompt_tokens`, mirroring the field rig 0.40
   added to `Usage`. Decodes as zero from state persisted by earlier
   versions.
+- `Phase`, `StateSummary` and `summarize_state`, decoding the
+  progress-relevant fields of a step-job payload for inspection
+  tooling.
+- The CLI's `gc` gains `--force`. Without it, `gc` refuses while
+  claimed jobs are visible in the store, since opening the exclusive
+  writer would fence a live worker and requeue its claimed jobs.
 
 ### Changed
+- **Breaking:** the run index moved from per-run JSON objects under
+  `<store>/runs/` into the queue's user KV namespace
+  (`research/runs/<run_id>`), and its writes are transactional: the
+  submit-time entry joins the submit transaction via `RunSpec`
+  KV writes, and the terminal entry joins the terminal step's
+  settlement via `Step` effects (both new in taquba-workflow 0.10).
+  The crash windows in which the index contradicted the queue are
+  closed. `RunStore` and `RunIndexStatus` are removed; the reduced
+  `RunIndexEntry` stores only submission facts plus an optional
+  `TerminalRecord` (`StoredStatus`, error, `RunSummary`), and every
+  in-flight status is derived at read time (`RunDisplayStatus`,
+  `derive_display_status`). Cross-process cancellation moved to the
+  new `CancelSentinel`; `ResearchAgentBuilder::run_store` is replaced
+  by `ResearchAgentBuilder::cancellation` and
+  `ResearchStepRunner::with_run_store` by
+  `ResearchStepRunner::with_cancellation`. Stores written by earlier
+  versions are not readable; start from a fresh store.
+- **Breaking:** the workflow queue name is `research-workflow` (was
+  taquba-workflow's default `workflow-steps`), set explicitly so
+  reader-side queries and the runtime agree on it
+  (`WORKFLOW_QUEUE_NAME`); `FETCH_QUEUE_NAME` is now public.
+- The CLI's `list`, `status`, `show` and `cancel` read through a
+  `QueueReader` (`FollowLatest`) and work from a second process
+  against a live store. `status` reports live progress (phase, steps
+  completed, attempts, dead-letter attempt history) decoded from the
+  run's step job; the stored `paused` status is removed and
+  interrupted runs derive as `queued`. `show` reads the canonical
+  `<store>/reports/<run_id>.md` blob; the embedded report copy in the
+  index entry is removed.
+- `TerminalHook` implementations follow taquba-workflow 0.10's
+  signature: `on_termination` takes a `TerminalEffects` parameter and
+  returns `Result<(), StepError>`.
+- **Breaking:** `gc --status` accepts the stored terminal statuses
+  only (`succeeded`, `failed`, `cancelled`); the in-flight values
+  (`running`, `paused`, `cancellation_requested`) are no longer
+  valid, since runs without a terminal record are never gc
+  candidates.
+- `init` probes the whole store prefix (previously the run index
+  prefix) and reports plain reachability.
 - The CLI always writes the finished report to
   `<store>/reports/<run_id>.md`; `--output` writes an additional copy
   instead of replacing the in-store write. Previously a run with
