@@ -672,6 +672,17 @@ async fn cmd_run(
     let config = build_config(cli);
     let queue = open_queue(store_ctx).await?;
 
+    let waiting = store::count_waiting_step_jobs(&queue)
+        .await
+        .context("counting queued runs")?;
+    if waiting > 0 {
+        eprintln!(
+            "Note: {waiting} queued run(s) already exist in this store; this worker will \
+             execute their pending steps too, under this invocation's provider settings. \
+             Inspect them with `list`."
+        );
+    }
+
     // The run id is generated before submit so the index entry's KV
     // key can join the submit transaction: the run and its entry
     // commit together.
@@ -716,11 +727,16 @@ async fn cmd_resume(
         if !queue_exists(store_ctx).await? {
             bail!("no run index entry for {run_id} (store contains no runs)");
         }
-        let (claimed, entry, job) = with_reader(store_ctx, async |reader| {
+        let (claimed, waiting_others, entry, job) = with_reader(store_ctx, async |reader| {
             let claimed = count_claimed_jobs(reader).await?;
             let entry = store::get_run(reader, &run_id).await?;
             let mut jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
-            Ok((claimed, entry, jobs.remove(&run_id)))
+            let job = jobs.remove(&run_id);
+            let waiting_others = jobs
+                .values()
+                .filter(|s| matches!(s, StepJobState::Waiting(_)))
+                .count();
+            Ok((claimed, waiting_others, entry, job))
         })
         .await?;
         let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
@@ -744,6 +760,13 @@ async fn cmd_resume(
             bail!(
                 "claimed jobs are visible in this store; a worker may be live. \
                  Re-run with --force only when no `run`/`resume` process is active."
+            );
+        }
+        if waiting_others > 0 {
+            eprintln!(
+                "Note: {waiting_others} other queued run(s) exist in this store; this worker \
+                 will execute their pending steps too, under this invocation's provider \
+                 settings."
             );
         }
     }

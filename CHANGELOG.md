@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while claimed jobs are visible in the store, since opening the
   exclusive writer would fence a live worker and requeue its claimed
   jobs.
+- `run`, `resume` and `ResearchAgent::run` report other queued runs
+  at worker start: the worker drains the shared workflow queue, so
+  those runs' pending steps execute in the starting process under its
+  provider settings. The CLI prints a note; the library logs a
+  warning. `store::count_waiting_step_jobs` is the underlying count.
 - `store::report_path` and `store::REPORTS_PREFIX`, the canonical
   report location shared by the runner and the CLI, and
   `ResearchStepRunner::with_report_store`, attaching the store the

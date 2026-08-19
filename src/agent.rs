@@ -22,7 +22,8 @@ use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
 use crate::store::{
-    CancelSentinel, RunIndexEntry, TerminalReconciler, WORKFLOW_QUEUE_NAME, run_entry_key,
+    CancelSentinel, RunIndexEntry, TerminalReconciler, WORKFLOW_QUEUE_NAME,
+    count_waiting_step_jobs, run_entry_key,
 };
 
 /// How long workflow memo blobs are retained after the run reaches a
@@ -75,6 +76,18 @@ impl ResearchAgent {
                 tx: Mutex::new(Some(tx)),
             },
         );
+
+        // The worker drains the shared workflow queue, so other queued
+        // runs' pending steps execute in this call too.
+        let waiting = count_waiting_step_jobs(&queue)
+            .await
+            .context("counting queued runs")?;
+        if waiting > 0 {
+            tracing::warn!(
+                waiting,
+                "queued runs exist in this store; this worker will execute their pending steps"
+            );
+        }
 
         // Build the JobRunner the Fetching step submits FetchPage jobs
         // to. It shares the same Queue + ObjectStore as the workflow

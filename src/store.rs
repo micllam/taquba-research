@@ -347,6 +347,32 @@ pub async fn snapshot_step_jobs(
     Ok(map)
 }
 
+/// Number of step jobs waiting in the workflow queue (pending or
+/// scheduled; terminal notifications excluded). The workflow is
+/// sequential, so each waiting run holds exactly one step job and the
+/// count equals the number of interrupted or queued runs.
+pub async fn count_waiting_step_jobs(queue: &Queue) -> taquba::Result<usize> {
+    let mut count = 0usize;
+    for status in [JobStatus::Pending, JobStatus::Scheduled] {
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = queue
+                .list_jobs(WORKFLOW_QUEUE_NAME, status, cursor.as_deref(), SCAN_PAGE)
+                .await?;
+            count += page
+                .jobs
+                .iter()
+                .filter(|j| !j.headers.contains_key(HEADER_TERMINAL))
+                .count();
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Terminal-hook decorator reconciling the run index with outcomes
 /// that applied no step effects. A dead-lettered step (and an external
 /// [`WorkflowRuntime::cancel`](taquba_workflow::WorkflowRuntime::cancel))
@@ -782,6 +808,45 @@ mod tests {
         );
 
         reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn count_waiting_excludes_terminal_notifications() {
+        use taquba::object_store::memory::InMemory;
+        use taquba::{EnqueueOptions, Queue};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let queue = Queue::open(object_store, "q").await.unwrap();
+        for run in ["01A", "01B"] {
+            queue
+                .enqueue_with(
+                    WORKFLOW_QUEUE_NAME,
+                    Vec::new(),
+                    EnqueueOptions {
+                        headers: [(HEADER_RUN_ID.to_string(), run.to_string())].into(),
+                        ..EnqueueOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        queue
+            .enqueue_with(
+                WORKFLOW_QUEUE_NAME,
+                Vec::new(),
+                EnqueueOptions {
+                    headers: [
+                        (HEADER_RUN_ID.to_string(), "01A".to_string()),
+                        (HEADER_TERMINAL.to_string(), "true".to_string()),
+                    ]
+                    .into(),
+                    ..EnqueueOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(count_waiting_step_jobs(&queue).await.unwrap(), 2);
     }
 
     struct AlwaysFail;
