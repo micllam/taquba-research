@@ -172,7 +172,10 @@ pub enum RunDisplayStatus {
     /// The cancellation sentinel exists but no terminal record does;
     /// the cancellation takes effect on the runner's next step.
     CancellationRequested,
-    /// A step job for the run is claimed by a worker.
+    /// A step job for the run is claimed by a worker. A claim
+    /// abandoned by a killed worker process also derives this state:
+    /// lease expiry is writer-process state, so the job stays claimed
+    /// until the next writer open requeues it.
     Running,
     /// A step job is pending or scheduled: either an interrupted run
     /// awaiting `resume`, or the interval between an acknowledgement

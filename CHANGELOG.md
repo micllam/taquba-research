@@ -71,7 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a live store. `status` reports live progress (phase, steps
   completed, attempts, dead-letter attempt history) decoded from the
   run's step job; the stored `paused` status is removed and
-  interrupted runs derive as `queued`. `show` reads the canonical
+  interrupted runs derive as `queued`. A run interrupted by a hard
+  process kill derives as `running` until the next writer open
+  requeues its abandoned claim, since lease expiry is writer-process
+  state. `show` reads the canonical
   `<store>/reports/<run_id>.md` blob; the embedded report copy in the
   index entry is removed.
 - `TerminalHook` implementations follow taquba-workflow 0.10's
