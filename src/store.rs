@@ -41,6 +41,17 @@ pub const WORKFLOW_QUEUE_NAME: &str = "research-workflow";
 /// Prefix of run index entries in the queue's user KV namespace.
 pub const RUNS_KV_PREFIX: &str = "research/runs/";
 
+/// Prefix, under the store's key prefix, of canonical report blobs.
+pub const REPORTS_PREFIX: &str = "reports";
+
+/// Object key of `run_id`'s canonical report blob.
+pub fn report_path(prefix: &Path, run_id: &str) -> Path {
+    prefix
+        .clone()
+        .join(REPORTS_PREFIX)
+        .join(format!("{run_id}.md"))
+}
+
 /// KV key of `run_id`'s index entry. Run ids are ULIDs assigned at
 /// submission, so a scan over [`RUNS_KV_PREFIX`] returns entries in
 /// submission order.

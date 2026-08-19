@@ -49,7 +49,6 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 
 const QUEUE_DB_NAME: &str = "queue";
-const REPORTS_PREFIX: &str = "reports";
 /// How long workflow memo blobs are retained after the run reaches a
 /// terminal state. Matches the value used by the library's
 /// `ResearchAgent::run`; keep in sync.
@@ -488,7 +487,7 @@ async fn write_report(
 ) -> Result<String> {
     match target {
         OutputTarget::DefaultInStore => {
-            let key = build_default_report_path(&fallback.prefix, run_id);
+            let key = store::report_path(&fallback.prefix, run_id);
             fallback
                 .object_store
                 .put(&key, PutPayload::from(markdown.as_bytes().to_vec()))
@@ -515,13 +514,6 @@ async fn write_report(
             Ok(path.to_string())
         }
     }
-}
-
-fn build_default_report_path(prefix: &ObjectPath, run_id: &str) -> ObjectPath {
-    prefix
-        .clone()
-        .join(REPORTS_PREFIX)
-        .join(format!("{run_id}.md"))
 }
 
 fn build_runner(cli: &Cli, sentinel: &CancelSentinel) -> Result<ResearchStepRunner> {
@@ -572,8 +564,8 @@ fn build_config(cli: &Cli) -> ResearchConfig {
 /// immediate "Interrupting..." acknowledgement so the user doesn't
 /// experience a silent ~10-30s drain.
 fn spawn_runtime(
+    store_ctx: &StoreCtx,
     queue: Arc<Queue>,
-    object_store: Arc<dyn ObjectStore>,
     runner: ResearchStepRunner,
     run_id: &str,
 ) -> Result<(
@@ -585,14 +577,16 @@ fn spawn_runtime(
         run_id: run_id.to_string(),
         tx: Mutex::new(Some(tx)),
     };
-    // Stand up the JobRunner the Fetching step submits FetchPage
-    // jobs to.
-    let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store);
-    let runner = runner.with_job_runner(job_runner).with_queue(queue.clone());
+    // Build the JobRunner the Fetching step submits FetchPage jobs to.
+    let (job_runner, job_handle) = spawn_fetch_runner(&queue, &store_ctx.object_store);
+    let runner = runner
+        .with_job_runner(job_runner)
+        .with_queue(queue.clone())
+        .with_report_store(store_ctx.object_store.clone(), &store_ctx.prefix);
 
     // Sequential workflow: one claimer is enough. See agent.rs for
     // context.
-    let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
+    let runtime = WorkflowRuntime::builder(queue, store_ctx.object_store.clone(), runner, hook)
         .queue_name(WORKFLOW_QUEUE_NAME)
         .max_concurrent_steps(1)
         .memo_retention(MEMO_RETENTION)
@@ -643,7 +637,7 @@ async fn cmd_run(
     // key can join the submit transaction: the run and its entry
     // commit together.
     let run_id = ulid::Ulid::new().to_string();
-    let (runtime, handles) = spawn_runtime(queue, store_ctx.object_store.clone(), runner, &run_id)?;
+    let (runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id)?;
 
     let entry = RunIndexEntry {
         run_id: run_id.clone(),
@@ -716,8 +710,7 @@ async fn cmd_resume(
 
     // The runtime is discarded: cmd_resume submits no new work; it
     // starts a worker to process the existing pending step.
-    let (_runtime, handles) =
-        spawn_runtime(queue, store_ctx.object_store.clone(), runner, &run_id)?;
+    let (_runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id)?;
 
     println!("Resuming {run_id}...");
 
@@ -801,15 +794,12 @@ async fn handle_terminal(
                 .report
                 .ok_or_else(|| anyhow!("succeeded run has no report"))?;
 
-            // The in-store copy under `reports/` is canonical and
-            // always written; `--output` adds a copy elsewhere.
-            let stored = write_report(
-                &OutputTarget::DefaultInStore,
-                store_ctx,
-                run_id,
-                &report.markdown,
-            )
-            .await?;
+            // The Writing step already wrote the canonical copy under
+            // `reports/`; `--output` adds a copy elsewhere.
+            let stored = format!(
+                "{} (in configured store)",
+                store::report_path(&store_ctx.prefix, run_id)
+            );
             let where_ = match resolve_output(cli.output.as_deref())? {
                 OutputTarget::DefaultInStore => stored,
                 target => {
@@ -994,7 +984,7 @@ async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) ->
     // every case; its absence means the run is unknown, unfinished or
     // did not succeed. The index entry is consulted only for a more
     // specific error message.
-    let key = build_default_report_path(&store_ctx.prefix, &run_id);
+    let key = store::report_path(&store_ctx.prefix, &run_id);
     // The body read shares the get's error handling: either call can
     // return NotFound depending on the backend.
     let read = match store_ctx.object_store.get(&key).await {
@@ -1198,7 +1188,7 @@ async fn cmd_gc(
         }
         // Default-location report. Custom `--output` destinations are
         // not tracked and are not deleted.
-        let report = build_default_report_path(&store_ctx.prefix, &e.run_id);
+        let report = store::report_path(&store_ctx.prefix, &e.run_id);
         match store_ctx.object_store.delete(&report).await {
             Ok(_) | Err(taquba::object_store::Error::NotFound { .. }) => {}
             Err(err) => {

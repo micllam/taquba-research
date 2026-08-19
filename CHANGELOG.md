@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The CLI's `gc` gains `--force`. Without it, `gc` refuses while
   claimed jobs are visible in the store, since opening the exclusive
   writer would fence a live worker and requeue its claimed jobs.
+- `store::report_path` and `store::REPORTS_PREFIX`, the canonical
+  report location shared by the runner and the CLI, and
+  `ResearchStepRunner::with_report_store`, attaching the store the
+  Writing step writes the report blob to.
 
 ### Changed
 - **Breaking:** the run index moved from per-run JSON objects under
@@ -58,10 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   candidates.
 - `init` probes the whole store prefix (previously the run index
   prefix) and reports plain reachability.
-- The CLI always writes the finished report to
-  `<store>/reports/<run_id>.md`; `--output` writes an additional copy
-  instead of replacing the in-store write. Previously a run with
-  `--output` left no report blob in the store.
+- The canonical `<store>/reports/<run_id>.md` blob is written by the
+  Writing step before its settlement, for the CLI and
+  `ResearchAgent::run` alike, so a terminal record saying succeeded
+  implies the report exists. Previously the CLI wrote it only after
+  the run terminated and only when `--output` was not passed, and
+  library runs wrote no blob at all. `--output` writes an additional
+  copy.
 - The CLI's default OpenAI model is `gpt-5-nano` (was `gpt-4o-mini`).
   Pass `--model` to keep the previous default.
 - Step-error classification reads the provider HTTP status via rig

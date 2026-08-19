@@ -21,6 +21,8 @@ use rig_core::providers::{anthropic, ollama, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use taquba::object_store::path::Path;
+use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use taquba::{LeaseHandle, Queue};
 use taquba_jobs::{JobRunner, JoinError};
 use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
@@ -49,6 +51,9 @@ const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Upper bound on a single search-backend call, covered by the lease
 /// the same way.
 const SEARCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound on the canonical report blob write, covered by the
+/// lease the same way.
+const REPORT_PUT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Lease extension applied before each fetch-handle await: one
 /// FetchPage job's full retry cycle (3 attempts of 20s each plus
 /// backoff) plus the wait for a runner slot behind 16 concurrent
@@ -78,6 +83,7 @@ pub struct ResearchStepRunner {
     cancel: Option<CancelSentinel>,
     job_runner: Option<Arc<JobRunner>>,
     queue: Option<Arc<Queue>>,
+    report_store: Option<(Arc<dyn ObjectStore>, Path)>,
 }
 
 /// Per-provider LLM client.
@@ -127,6 +133,7 @@ impl ResearchStepRunner {
             cancel: None,
             job_runner: None,
             queue: None,
+            report_store: None,
         }
     }
 
@@ -159,6 +166,15 @@ impl ResearchStepRunner {
     /// already terminated.
     pub fn with_queue(mut self, queue: Arc<Queue>) -> Self {
         self.queue = Some(queue);
+        self
+    }
+
+    /// Attach the object store and key prefix under which the Writing
+    /// step writes the canonical report blob
+    /// (`<prefix>/reports/<run_id>.md`), before the step settles. When
+    /// unset, no canonical report blob is written.
+    pub fn with_report_store(mut self, object_store: Arc<dyn ObjectStore>, prefix: &Path) -> Self {
+        self.report_store = Some((object_store, prefix.clone()));
         self
     }
 
@@ -348,6 +364,11 @@ impl ResearchStepRunner {
             Phase::Synthesizing => self.run_synthesizing(step, state).await?,
             Phase::Writing => {
                 let report = self.run_writing(step, state).await?;
+                // The blob is written before the step settles, so a
+                // terminal record saying succeeded implies the report
+                // exists. A redelivered step rewrites the same
+                // memoized bytes.
+                self.put_report(step, &report).await?;
                 stage_entry(step, &succeeded_entry(step, state, &report))?;
                 let record = RunRecord {
                     report: Some(report),
@@ -362,6 +383,25 @@ impl ResearchStepRunner {
 
         state.steps_completed += 1;
         Ok(StepOutcome::continue_now(state.to_bytes()))
+    }
+
+    /// Write the canonical report blob at
+    /// `<prefix>/reports/<run_id>.md`. A no-op without a report store;
+    /// a failed write is a transient step error, so the Writing step
+    /// never settles without the blob.
+    async fn put_report(&self, step: &Step, report: &Report) -> Result<(), StepError> {
+        let Some((object_store, prefix)) = &self.report_store else {
+            return Ok(());
+        };
+        let path = crate::store::report_path(prefix, &step.run_id);
+        under_lease(&step.lease, REPORT_PUT_TIMEOUT, "report write", async {
+            object_store
+                .put(&path, PutPayload::from(report.markdown.as_bytes().to_vec()))
+                .await
+                .map(|_| ())
+                .map_err(|e| StepError::transient(format!("writing report blob: {e}")))
+        })
+        .await
     }
 
     async fn run_planning(&self, step: &Step, state: &mut ResearchState) -> Result<(), StepError> {
@@ -1512,12 +1552,13 @@ mod tests {
         let runner = ResearchStepRunner::from_provider(
             ProviderClient::Ollama(rig_core::providers::ollama::Client::from_env().unwrap()),
             Arc::new(NoSearch),
-        );
+        )
+        .with_report_store(object_store.clone(), &Path::default());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let hook = SignalOutcome {
             tx: std::sync::Mutex::new(Some(tx)),
         };
-        let runtime = WorkflowRuntime::builder(queue.clone(), object_store, runner, hook)
+        let runtime = WorkflowRuntime::builder(queue.clone(), object_store.clone(), runner, hook)
             .queue_name("test-workflow")
             .memo_prefix("test-memo")
             .max_concurrent_steps(1)
@@ -1570,6 +1611,17 @@ mod tests {
         assert_eq!(terminal.status, StoredStatus::Succeeded);
         assert!(terminal.error.is_none());
         assert_eq!(terminal.summary.steps_completed, 1);
+
+        // The Writing step wrote the canonical report blob before it
+        // settled.
+        let blob = object_store
+            .get(&crate::store::report_path(&Path::default(), run_id))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert!(!blob.is_empty());
     }
 
     #[tokio::test]

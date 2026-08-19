@@ -49,7 +49,9 @@ impl ResearchAgent {
     ///
     /// `object_store` backs the workflow runtime's [memo store] used to
     /// short-circuit at-least-once retries of paid LLM calls. The common
-    /// case is to pass the same store the [`Queue`] was opened with.
+    /// case is to pass the same store the [`Queue`] was opened with. The
+    /// finished report is also written to `reports/<run_id>.md` in
+    /// `object_store` before the final step settles.
     ///
     /// [memo store]: taquba_workflow::Memo
     pub async fn run(
@@ -77,7 +79,11 @@ impl ResearchAgent {
             .runner
             .clone()
             .with_job_runner(job_runner)
-            .with_queue(queue.clone());
+            .with_queue(queue.clone())
+            .with_report_store(
+                object_store.clone(),
+                &taquba::object_store::path::Path::default(),
+            );
 
         // The research workflow is strictly sequential: each
         // `StepOutcome::Continue` enqueues the next step only after the
