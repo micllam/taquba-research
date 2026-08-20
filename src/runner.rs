@@ -857,17 +857,18 @@ impl ResearchStepRunner {
 async fn prompt_extended<C>(
     client: &C,
     model: &str,
-    max_tokens: u64,
+    max_tokens: Option<u64>,
     prompt: impl Into<message::Message> + Send,
 ) -> Result<PromptResponse, StepError>
 where
     C: CompletionClient + AgentClientExt,
     C::CompletionModel: 'static,
 {
-    client
-        .agent(model)
-        .preamble(AGENT_PREAMBLE)
-        .max_tokens(max_tokens)
+    let mut builder = client.agent(model).preamble(AGENT_PREAMBLE);
+    if let Some(max_tokens) = max_tokens {
+        builder = builder.max_tokens(max_tokens);
+    }
+    builder
         .build()
         .prompt(prompt)
         .extended_details()
@@ -880,7 +881,7 @@ where
 async fn prompt_typed_extended<C, T>(
     client: &C,
     model: &str,
-    max_tokens: u64,
+    max_tokens: Option<u64>,
     prompt: &str,
 ) -> Result<TypedPromptResponse<T>, StepError>
 where
@@ -888,10 +889,11 @@ where
     C::CompletionModel: 'static,
     T: JsonSchema + DeserializeOwned + Send + 'static,
 {
-    client
-        .agent(model)
-        .preamble(AGENT_PREAMBLE)
-        .max_tokens(max_tokens)
+    let mut builder = client.agent(model).preamble(AGENT_PREAMBLE);
+    if let Some(max_tokens) = max_tokens {
+        builder = builder.max_tokens(max_tokens);
+    }
+    builder
         .build()
         .prompt_typed::<T>(prompt)
         .extended_details()

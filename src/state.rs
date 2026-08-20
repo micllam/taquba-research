@@ -32,8 +32,9 @@ pub struct ResearchConfig {
     /// was built against (see [`crate::ResearchStepRunner::new_openai`]
     /// / [`crate::ResearchStepRunner::new_anthropic`]).
     pub model: String,
-    /// Maximum tokens per single LLM call.
-    pub max_tokens_per_call: u64,
+    /// Maximum tokens per single LLM call. When `None`, no explicit
+    /// limit is sent and the provider's or model's default applies.
+    pub max_tokens_per_call: Option<u64>,
     /// Per-page text limit fed to the summarization step (UTF-8 chars).
     /// Larger pages are truncated.
     pub max_page_chars: usize,
@@ -48,7 +49,7 @@ impl ResearchConfig {
             depth: 6,
             max_sources: 30,
             model: model.into(),
-            max_tokens_per_call: 4096,
+            max_tokens_per_call: None,
             max_page_chars: 16_000,
         }
     }
@@ -274,6 +275,7 @@ mod tests {
     #[test]
     fn round_trip_serde() {
         let mut s = ResearchState::new("a query", ResearchConfig::new("gpt-4o-mini"));
+        s.config.max_tokens_per_call = Some(2048);
         let url: Url = "https://example.com/page".parse().unwrap();
         s.fetched.insert(
             url.clone(),
@@ -326,6 +328,7 @@ mod tests {
         );
         assert_eq!(back.synthesis, s.synthesis);
         assert_eq!(back.token_usage, s.token_usage);
+        assert_eq!(back.config.max_tokens_per_call, Some(2048));
     }
 
     #[test]
