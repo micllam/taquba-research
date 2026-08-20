@@ -802,12 +802,8 @@ impl ResearchStepRunner {
                 })
                 .await?;
                 record_usage(&mut state.token_usage, &response.usage);
-                let evidence = response
-                    .messages
-                    .as_deref()
-                    .map(|messages| extract_anthropic_source_quotes(messages, source_documents))
-                    .transpose()?
-                    .unwrap_or_default();
+                let evidence =
+                    extract_anthropic_source_quotes(&response.content, source_documents)?;
                 Ok((response.output, evidence))
             }
             _ => Ok((
@@ -1105,39 +1101,33 @@ fn anthropic_document_message(
 }
 
 fn extract_anthropic_source_quotes(
-    messages: &[message::Message],
+    content: &[AssistantContent],
     source_documents: &[SynthesisDocument],
 ) -> Result<Vec<SourceQuote>, StepError> {
     let mut evidence = Vec::new();
     let mut seen = HashSet::new();
 
-    for message in messages {
-        let message::Message::Assistant { content, .. } = message else {
+    for block in content {
+        let AssistantContent::Text(text) = block else {
             continue;
         };
-        for block in content.iter() {
-            let AssistantContent::Text(text) = block else {
+        let citations = anthropic_completion::anthropic_citations(text)
+            .map_err(|e| StepError::permanent(format!("anthropic citation decode: {e}")))?;
+        for citation in citations {
+            let Some((document_index, cited_text)) = anthropic_citation_document_span(&citation)
+            else {
                 continue;
             };
-            let citations = anthropic_completion::anthropic_citations(text)
-                .map_err(|e| StepError::permanent(format!("anthropic citation decode: {e}")))?;
-            for citation in citations {
-                let Some((document_index, cited_text)) =
-                    anthropic_citation_document_span(&citation)
-                else {
-                    continue;
-                };
-                let Some(document) = source_documents.get(document_index) else {
-                    continue;
-                };
-                if !seen.insert((document.citation.index, cited_text.to_string())) {
-                    continue;
-                }
-                evidence.push(SourceQuote {
-                    citation_index: document.citation.index,
-                    excerpt: cited_text.to_string(),
-                });
+            let Some(document) = source_documents.get(document_index) else {
+                continue;
+            };
+            if !seen.insert((document.citation.index, cited_text.to_string())) {
+                continue;
             }
+            evidence.push(SourceQuote {
+                citation_index: document.citation.index,
+                excerpt: cited_text.to_string(),
+            });
         }
     }
 
@@ -1484,18 +1474,12 @@ mod tests {
             },
         )])
         .unwrap();
-        let messages = vec![message::Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::Text(message::Text {
-                text: "summary".to_string(),
-                additional_params: message::AdditionalParams::from_entries([(
-                    "citations",
-                    citations,
-                )]),
-            })],
-        }];
+        let content = vec![AssistantContent::Text(message::Text {
+            text: "summary".to_string(),
+            additional_params: message::AdditionalParams::from_entries([("citations", citations)]),
+        })];
 
-        let evidence = extract_anthropic_source_quotes(&messages, &documents).unwrap();
+        let evidence = extract_anthropic_source_quotes(&content, &documents).unwrap();
 
         assert_eq!(
             evidence,
@@ -1526,18 +1510,12 @@ mod tests {
             },
         );
         let citations = serde_json::to_value(vec![citation.clone(), citation]).unwrap();
-        let messages = vec![message::Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::Text(message::Text {
-                text: "summary".to_string(),
-                additional_params: message::AdditionalParams::from_entries([(
-                    "citations",
-                    citations,
-                )]),
-            })],
-        }];
+        let content = vec![AssistantContent::Text(message::Text {
+            text: "summary".to_string(),
+            additional_params: message::AdditionalParams::from_entries([("citations", citations)]),
+        })];
 
-        let evidence = extract_anthropic_source_quotes(&messages, &documents).unwrap();
+        let evidence = extract_anthropic_source_quotes(&content, &documents).unwrap();
 
         assert_eq!(evidence.len(), 1);
     }
