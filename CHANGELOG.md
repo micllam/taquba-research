@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the dead job's payload. Both runtime hosts wrap their capture
   hooks in it; while the dead job is still present the run derives
   `failed (dead-lettered)`.
+- `RunStats::output_truncated`, set when the Writing step's final
+  completion stopped at the output-token limit (reported per call by
+  rig 0.42). The rendered report notes the truncation and the runner
+  logs a warning.
 
 ### Changed
 - **Breaking:** the run index moved from per-run JSON objects under

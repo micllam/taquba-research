@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use rig_agent::agent::{PromptResponse, TypedPromptResponse};
+use rig_agent::agent::{CompletionCall, PromptResponse, TypedPromptResponse};
 use rig_agent::client::AgentClientExt;
 use rig_agent::completion::{Prompt, PromptError, StructuredOutputError, TypedPrompt};
 use rig_core::client::CompletionClient;
 use rig_core::completion::{
-    Usage,
+    FinishReason, Usage,
     message::{self, AssistantContent, UserContent},
 };
 use rig_core::providers::anthropic::completion as anthropic_completion;
@@ -716,10 +716,13 @@ impl ResearchStepRunner {
             syn = synthesis.narrative,
         );
 
-        let body: String = memoized(&step.memo, MEMO_KEY_WRITING, async {
+        let output: PromptOutput = memoized(&step.memo, MEMO_KEY_WRITING, async {
             self.llm_prompt(&step.lease, &prompt, state).await
         })
         .await?;
+        if output.truncated {
+            tracing::warn!("report body truncated at the output-token limit");
+        }
 
         let finished_at = Utc::now();
         let wall_time = (finished_at - state.started_at)
@@ -731,9 +734,11 @@ impl ResearchStepRunner {
             started_at: state.started_at,
             finished_at,
             token_usage: state.token_usage,
+            output_truncated: output.truncated,
         };
 
-        let markdown = render_markdown(&state.query, &step.run_id, &body, &synthesis, &stats);
+        let markdown =
+            render_markdown(&state.query, &step.run_id, &output.text, &synthesis, &stats);
         Ok(Report {
             run_id: step.run_id.clone(),
             query: state.query.clone(),
@@ -752,7 +757,7 @@ impl ResearchStepRunner {
         lease: &LeaseHandle,
         prompt: &str,
         state: &mut ResearchState,
-    ) -> Result<String, StepError> {
+    ) -> Result<PromptOutput, StepError> {
         let model = &state.config.model;
         let max_tokens = state.config.max_tokens_per_call;
         let response = under_lease(lease, LLM_CALL_TIMEOUT, "LLM call", async {
@@ -770,7 +775,10 @@ impl ResearchStepRunner {
         })
         .await?;
         record_usage(&mut state.token_usage, &response.usage);
-        Ok(response.output)
+        Ok(PromptOutput {
+            truncated: length_truncated(&response.completion_calls),
+            text: response.output,
+        })
     }
 
     async fn llm_synthesis_prompt(
@@ -802,7 +810,10 @@ impl ResearchStepRunner {
                     .unwrap_or_default();
                 Ok((response.output, evidence))
             }
-            _ => Ok((self.llm_prompt(lease, prompt, state).await?, Vec::new())),
+            _ => Ok((
+                self.llm_prompt(lease, prompt, state).await?.text,
+                Vec::new(),
+            )),
         }
     }
 
@@ -1039,6 +1050,24 @@ struct SummaryResp {
     relevance: f32,
 }
 
+/// A plain completion's text plus whether its final completion call
+/// stopped at the output-token limit. The Writing step memoizes the
+/// whole value, so the truncation flag is preserved across a step
+/// retry.
+#[derive(Serialize, Deserialize)]
+struct PromptOutput {
+    text: String,
+    truncated: bool,
+}
+
+/// Whether the final completion call of an agent run stopped
+/// generating at the output-token limit.
+fn length_truncated(calls: &[CompletionCall]) -> bool {
+    calls
+        .last()
+        .is_some_and(|call| matches!(call.finish_reason, Some(FinishReason::Length)))
+}
+
 fn anthropic_document_message(
     prompt: &str,
     source_documents: &[SynthesisDocument],
@@ -1264,6 +1293,7 @@ mod tests {
                 input_tokens: 5,
                 ..TokenUsage::default()
             },
+            output_truncated: false,
         };
         let report = Report {
             run_id: "run-4".to_string(),
@@ -1411,6 +1441,18 @@ mod tests {
     }
 
     #[test]
+    fn length_truncated_reads_the_final_completion_call() {
+        assert!(!length_truncated(&[]));
+
+        let mut cut = CompletionCall::new(0, Usage::default());
+        cut.finish_reason = Some(FinishReason::Length);
+        assert!(length_truncated(&[cut.clone()]));
+
+        let complete = CompletionCall::new(1, Usage::default());
+        assert!(!length_truncated(&[cut, complete]));
+    }
+
+    #[test]
     fn extract_anthropic_source_quotes_maps_document_indices_to_sources() {
         let documents = vec![
             SynthesisDocument {
@@ -1544,7 +1586,11 @@ mod tests {
             .new_memo(run_id, 0)
             .put(
                 MEMO_KEY_WRITING,
-                &serde_json::to_vec("report body").unwrap(),
+                &serde_json::to_vec(&PromptOutput {
+                    text: "report body".to_string(),
+                    truncated: false,
+                })
+                .unwrap(),
             )
             .await
             .unwrap();

@@ -53,6 +53,9 @@ pub struct RunStats {
     pub finished_at: DateTime<Utc>,
     /// Aggregate token usage across every LLM call in the run.
     pub token_usage: TokenUsage,
+    /// Whether the Writing step's final completion stopped at the
+    /// output-token limit, leaving the report body truncated.
+    pub output_truncated: bool,
 }
 
 mod duration_secs {
@@ -92,6 +95,9 @@ pub(crate) fn render_markdown(
         format_duration(stats.wall_time),
         format_tokens(&stats.token_usage),
     ));
+    if stats.output_truncated {
+        out.push_str("**Note:** the report body was truncated at the output-token limit.\n\n");
+    }
     out.push_str("---\n\n");
     out.push_str(body.trim());
     out.push_str("\n\n## Citations\n\n");
@@ -146,6 +152,27 @@ fn compact_excerpt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stats(output_truncated: bool) -> RunStats {
+        RunStats {
+            steps_completed: 6,
+            wall_time: Duration::from_secs(90),
+            started_at: DateTime::UNIX_EPOCH,
+            finished_at: DateTime::UNIX_EPOCH,
+            token_usage: TokenUsage::default(),
+            output_truncated,
+        }
+    }
+
+    #[test]
+    fn render_markdown_notes_truncated_output() {
+        let synthesis = SynthesisOutput::default();
+        let truncated = render_markdown("q", "run-1", "body", &synthesis, &stats(true));
+        let complete = render_markdown("q", "run-1", "body", &synthesis, &stats(false));
+
+        assert!(truncated.contains("truncated at the output-token limit"));
+        assert!(!complete.contains("truncated"));
+    }
 
     #[test]
     fn compact_excerpt_collapses_whitespace_without_truncating() {
