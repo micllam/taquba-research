@@ -145,6 +145,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transition rewrote them inline.
 - Ollama now honours `max_tokens_per_call`; rig 0.41 sends it as
   `options.num_predict`. Previously it was silently ignored for Ollama.
+- Bumped `rig-core` and `rig-agent` to 0.42. Inherited behaviour
+  changes: a turn truncated before producing any answer surfaces as an
+  error, classified transient, where it previously succeeded with an
+  empty completion; Anthropic `TokenUsage::reasoning_tokens` is
+  populated for thinking models (previously always zero); Anthropic
+  and OpenAI non-success HTTP responses classify through the
+  provider-response status path, with the transient/permanent mapping
+  unchanged.
 
 ### Fixed
 - A workflow worker error or panic was reported as an interruption

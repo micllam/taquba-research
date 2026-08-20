@@ -10,7 +10,6 @@ use chrono::Utc;
 use rig_agent::agent::{PromptResponse, TypedPromptResponse};
 use rig_agent::client::AgentClientExt;
 use rig_agent::completion::{Prompt, PromptError, StructuredOutputError, TypedPrompt};
-use rig_core::OneOrMany;
 use rig_core::client::CompletionClient;
 use rig_core::completion::{
     Usage,
@@ -783,7 +782,7 @@ impl ResearchStepRunner {
     ) -> Result<(String, Vec<SourceQuote>), StepError> {
         match self.provider.as_ref() {
             ProviderClient::Anthropic(client) if !source_documents.is_empty() => {
-                let message = anthropic_document_message(prompt, source_documents)?;
+                let message = anthropic_document_message(prompt, source_documents);
                 let response = under_lease(lease, LLM_CALL_TIMEOUT, "LLM call", async {
                     prompt_extended(
                         client,
@@ -1043,7 +1042,7 @@ struct SummaryResp {
 fn anthropic_document_message(
     prompt: &str,
     source_documents: &[SynthesisDocument],
-) -> Result<message::Message, StepError> {
+) -> message::Message {
     let mut content = Vec::with_capacity(source_documents.len() + 1);
     content.push(UserContent::text(format!(
         "{prompt}\n\nUse the attached source documents as the authoritative \
@@ -1056,17 +1055,22 @@ fn anthropic_document_message(
         content.push(UserContent::Document(message::Document {
             data: message::DocumentSourceKind::String(document.text.clone()),
             media_type: Some(message::DocumentMediaType::TXT),
-            additional_params: Some(serde_json::json!({
-                "title": format!("Source {}: {}", document.citation.index, document.citation.title),
-                "context": format!("URL: {}", document.citation.url),
-                "citations": { "enabled": true },
-            })),
+            additional_params: message::AdditionalParams::from_entries([
+                (
+                    "title",
+                    format!(
+                        "Source {}: {}",
+                        document.citation.index, document.citation.title
+                    )
+                    .into(),
+                ),
+                ("context", format!("URL: {}", document.citation.url).into()),
+                ("citations", serde_json::json!({ "enabled": true })),
+            ]),
         }));
     }
 
-    OneOrMany::many(content)
-        .map(message::Message::from)
-        .map_err(|e| StepError::permanent(format!("anthropic document prompt: {e}")))
+    message::Message::from(content)
 }
 
 fn extract_anthropic_source_quotes(
@@ -1113,23 +1117,17 @@ fn anthropic_citation_document_span(
     citation: &anthropic_completion::Citation,
 ) -> Option<(usize, &str)> {
     match citation {
-        anthropic_completion::Citation::CharLocation {
-            document_index,
-            cited_text,
-            ..
+        anthropic_completion::Citation::CharLocation(c) => {
+            Some((c.document_index, c.cited_text.as_str()))
         }
-        | anthropic_completion::Citation::PageLocation {
-            document_index,
-            cited_text,
-            ..
+        anthropic_completion::Citation::PageLocation(c) => {
+            Some((c.document_index, c.cited_text.as_str()))
         }
-        | anthropic_completion::Citation::ContentBlockLocation {
-            document_index,
-            cited_text,
-            ..
-        } => Some((*document_index, cited_text.as_str())),
-        anthropic_completion::Citation::SearchResultLocation { .. }
-        | anthropic_completion::Citation::WebSearchResultLocation { .. }
+        anthropic_completion::Citation::ContentBlockLocation(c) => {
+            Some((c.document_index, c.cited_text.as_str()))
+        }
+        anthropic_completion::Citation::SearchResultLocation(_)
+        | anthropic_completion::Citation::WebSearchResultLocation(_)
         | anthropic_completion::Citation::Unknown(_) => None,
     }
 }
@@ -1148,9 +1146,6 @@ fn classify_structured_err(err: StructuredOutputError) -> StepError {
         StructuredOutputError::EmptyResponse => {
             StepError::transient("typed prompt: model returned an empty response".to_string())
         }
-        // `StructuredOutputError` is non-exhaustive; default future
-        // variants to transient, matching `classify_rig_err`.
-        other => StepError::transient(format!("typed prompt failed: {other}")),
     }
 }
 
@@ -1363,10 +1358,7 @@ mod tests {
     #[test]
     fn classify_rig_err_provider_response_4xx_is_permanent() {
         let err = PromptError::CompletionError(CompletionError::ProviderResponse(
-            ProviderResponseError {
-                status: Some(StatusCode::BAD_REQUEST),
-                body: "invalid request".to_string(),
-            },
+            ProviderResponseError::new(StatusCode::BAD_REQUEST, "invalid request"),
         ));
         assert_permanent(&classify_rig_err(err));
     }
@@ -1374,10 +1366,7 @@ mod tests {
     #[test]
     fn classify_rig_err_provider_response_2xx_envelope_is_transient() {
         let err = PromptError::CompletionError(CompletionError::ProviderResponse(
-            ProviderResponseError {
-                status: Some(StatusCode::OK),
-                body: "{\"error\":{\"message\":\"overloaded\"}}".to_string(),
-            },
+            ProviderResponseError::new(StatusCode::OK, "{\"error\":{\"message\":\"overloaded\"}}"),
         ));
         assert_transient(&classify_rig_err(err));
     }
@@ -1441,20 +1430,25 @@ mod tests {
                 text: "second source text".to_string(),
             },
         ];
-        let citations = serde_json::to_value(vec![anthropic_completion::Citation::CharLocation {
-            cited_text: "second source text".to_string(),
-            document_index: 1,
-            document_title: Some("Source 2: Two".to_string()),
-            start_char_index: 0,
-            end_char_index: 18,
-        }])
+        let citations = serde_json::to_value(vec![anthropic_completion::Citation::CharLocation(
+            anthropic_completion::CharLocationCitation {
+                cited_text: "second source text".to_string(),
+                document_index: 1,
+                document_title: Some("Source 2: Two".to_string()),
+                start_char_index: 0,
+                end_char_index: 18,
+            },
+        )])
         .unwrap();
         let messages = vec![message::Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::Text(message::Text {
+            content: vec![AssistantContent::Text(message::Text {
                 text: "summary".to_string(),
-                additional_params: Some(serde_json::json!({ "citations": citations })),
-            })),
+                additional_params: message::AdditionalParams::from_entries([(
+                    "citations",
+                    citations,
+                )]),
+            })],
         }];
 
         let evidence = extract_anthropic_source_quotes(&messages, &documents).unwrap();
@@ -1478,20 +1472,25 @@ mod tests {
             },
             text: "first source text".to_string(),
         }];
-        let citation = anthropic_completion::Citation::CharLocation {
-            cited_text: "first source text".to_string(),
-            document_index: 0,
-            document_title: Some("Source 1: One".to_string()),
-            start_char_index: 0,
-            end_char_index: 17,
-        };
+        let citation = anthropic_completion::Citation::CharLocation(
+            anthropic_completion::CharLocationCitation {
+                cited_text: "first source text".to_string(),
+                document_index: 0,
+                document_title: Some("Source 1: One".to_string()),
+                start_char_index: 0,
+                end_char_index: 17,
+            },
+        );
         let citations = serde_json::to_value(vec![citation.clone(), citation]).unwrap();
         let messages = vec![message::Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::Text(message::Text {
+            content: vec![AssistantContent::Text(message::Text {
                 text: "summary".to_string(),
-                additional_params: Some(serde_json::json!({ "citations": citations })),
-            })),
+                additional_params: message::AdditionalParams::from_entries([(
+                    "citations",
+                    citations,
+                )]),
+            })],
         }];
 
         let evidence = extract_anthropic_source_quotes(&messages, &documents).unwrap();
