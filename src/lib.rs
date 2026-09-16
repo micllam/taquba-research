@@ -162,12 +162,12 @@
 //! ## Fetching is the one fan-out phase
 //!
 //! Most phases are one workflow step per unit of work. Fetching is the
-//! exception: a single workflow step submits one `FetchPage` taquba-job
-//! per URL to a [`JobRunner`](taquba_jobs::JobRunner) sharing the
-//! queue (under a distinct queue-name), then `try_join_all`s the
+//! exception: a single workflow step submits one `FetchPage` job per
+//! URL to a [`JobRunner`](taquba_workflow::jobs::JobRunner) sharing
+//! the queue (under a distinct queue-name), then `try_join_all`s the
 //! handles. The per-URL `idempotency_key` derives from
-//! `(run_id, url)`, so taquba-jobs's result-aware idempotent submit
-//! short-circuits to cached result blobs on step retry; no URL is
+//! `(run_id, url)`, so the job runner's result-aware idempotent
+//! submit short-circuits to recorded results on step retry; no URL is
 //! fetched twice across attempts.
 //!
 //! [`spawn_fetch_runner`] is the helper that builds and spawns this
@@ -217,14 +217,15 @@ pub use store::{CancelSentinel, TerminalReconciler};
 /// [`ResearchStepRunner`].
 pub mod workflow {
     pub use taquba_workflow::{
-        EffectsHandle, NoopTerminalHook, RunOutcome, RunSpec, Step, StepError, StepOutcome,
-        StepRunner, SubmitOutcome, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+        Delivery, EffectsHandle, NoopTerminalHook, RunId, RunOptions, RunOutcome, RunSpec, Step,
+        StepError, StepOutcome, StepRunner, SubmitOutcome, TerminalEffects, TerminalHook,
+        TerminalStatus, WorkflowRuntime,
     };
 }
 
-/// Re-exports of the [`taquba_jobs`] types callers need to manage the
-/// fetch [`JobRunner`](taquba_jobs::JobRunner) returned by
-/// [`spawn_fetch_runner`].
+/// Re-exports of the [`taquba_workflow::jobs`] types callers need to
+/// manage the fetch [`JobRunner`](taquba_workflow::jobs::JobRunner)
+/// returned by [`spawn_fetch_runner`].
 pub mod jobs {
-    pub use taquba_jobs::{JobRunner, RunnerHandle};
+    pub use taquba_workflow::jobs::{JobRunner, RunnerHandle};
 }

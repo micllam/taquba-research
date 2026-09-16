@@ -11,7 +11,8 @@ use rig_core::providers::{anthropic, ollama, openai};
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
 use taquba_workflow::{
-    RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus,
+    WorkflowRuntime,
 };
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
@@ -67,7 +68,7 @@ impl ResearchAgent {
         // The run id is generated before submit so the index entry's
         // KV key can join the submit transaction and the terminal hook
         // can filter notifications to this run.
-        let run_id = ulid::Ulid::new().to_string();
+        let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
         let (tx, rx) = oneshot::channel::<RunOutcome>();
         let hook = TerminalReconciler::new(
             queue.clone(),
@@ -114,7 +115,7 @@ impl ResearchAgent {
             .build();
 
         let entry = RunIndexEntry {
-            run_id: run_id.clone(),
+            run_id: run_id.to_string(),
             query: query.clone(),
             submitted_at: Utc::now(),
             terminal: None,
@@ -199,7 +200,6 @@ impl ResearchAgent {
                     outcome.error.unwrap_or_else(|| "(no reason)".to_string())
                 );
             }
-            other => bail!("unknown terminal status: {other}"),
         }
     }
 }
@@ -303,7 +303,7 @@ fn flatten_worker_exit(
 struct CaptureOutcome {
     /// Run this invocation submitted. Notifications for any other run
     /// are stale; see `on_termination`.
-    run_id: String,
+    run_id: RunId,
     tx: Mutex<Option<oneshot::Sender<RunOutcome>>>,
 }
 

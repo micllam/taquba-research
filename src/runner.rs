@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use taquba::object_store::path::Path;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use taquba::{LeaseHandle, Queue};
-use taquba_jobs::{JobRunner, JoinError};
+use taquba_workflow::jobs::{JobRunner, JoinError};
 use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
 use url::Url;
 
@@ -80,7 +80,7 @@ pub struct ResearchStepRunner {
     provider: Arc<ProviderClient>,
     search: Arc<dyn SearchBackend>,
     cancel: Option<CancelSentinel>,
-    job_runner: Option<Arc<JobRunner>>,
+    job_runner: Option<JobRunner>,
     queue: Option<Arc<Queue>>,
     report_store: Option<(Arc<dyn ObjectStore>, Path)>,
 }
@@ -153,7 +153,7 @@ impl ResearchStepRunner {
     /// `FetchPage` registered and an `Arc<reqwest::Client>` on its
     /// state; use [`crate::spawn_fetch_runner`] to build one with
     /// both already attached.
-    pub fn with_job_runner(mut self, job_runner: Arc<JobRunner>) -> Self {
+    pub fn with_job_runner(mut self, job_runner: JobRunner) -> Self {
         self.job_runner = Some(job_runner);
         self
     }
@@ -243,7 +243,7 @@ async fn poll_cancelled(sentinel: &CancelSentinel, run_id: &str) {
 /// stats.
 fn succeeded_entry(step: &Step, state: &ResearchState, report: &Report) -> RunIndexEntry {
     RunIndexEntry {
-        run_id: step.run_id.clone(),
+        run_id: step.run_id.to_string(),
         query: state.query.clone(),
         submitted_at: state.started_at,
         terminal: Some(TerminalRecord {
@@ -267,7 +267,7 @@ fn cancelled_entry(step: &Step, state: &ResearchState, reason: &str) -> RunIndex
         .to_std()
         .unwrap_or_default();
     RunIndexEntry {
-        run_id: step.run_id.clone(),
+        run_id: step.run_id.to_string(),
         query: state.query.clone(),
         submitted_at: state.started_at,
         terminal: Some(TerminalRecord {
@@ -375,7 +375,7 @@ impl ResearchStepRunner {
                 stage_entry(step, &succeeded_entry(step, state, &report))?;
                 let record = RunRecord {
                     report: Some(report),
-                    run_id: step.run_id.clone(),
+                    run_id: step.run_id.to_string(),
                     query: state.query.clone(),
                 };
                 let bytes = serde_json::to_vec(&record)
@@ -514,7 +514,7 @@ impl ResearchStepRunner {
         let mut handles = Vec::with_capacity(urls.len());
         for url in &urls {
             let job = FetchPage {
-                run_id: step.run_id.clone(),
+                run_id: step.run_id.to_string(),
                 url: url.clone(),
                 max_chars: state.config.max_page_chars,
             };
@@ -740,7 +740,7 @@ impl ResearchStepRunner {
         let markdown =
             render_markdown(&state.query, &step.run_id, &output.text, &synthesis, &stats);
         Ok(Report {
-            run_id: step.run_id.clone(),
+            run_id: step.run_id.to_string(),
             query: state.query.clone(),
             markdown,
             citations: synthesis.citations,
@@ -1177,11 +1177,9 @@ mod tests {
     use rig_core::ProviderResponseError;
     use rig_core::completion::CompletionError;
     use rig_core::http_client;
-    use std::collections::HashMap;
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
-    use taquba_workflow::{EffectsHandle, MemoStore, StepErrorKind};
-    use tokio_util::sync::CancellationToken;
+    use taquba_workflow::{MemoStore, RunId, StepErrorKind};
 
     fn test_sentinel() -> CancelSentinel {
         CancelSentinel::new(Arc::new(InMemory::new()), &Path::default())
@@ -1190,21 +1188,13 @@ mod tests {
     /// Build a `Step` with a fresh in-memory `Memo` and otherwise
     /// inert fields, suitable for exercising memo-using helpers.
     fn test_step(run_id: &str, step_number: u32) -> Step {
-        let memo =
-            MemoStore::new(Arc::new(InMemory::new()), "test-memo").new_memo(run_id, step_number);
-        Step {
-            run_id: run_id.to_string(),
-            step_number,
-            payload: Vec::new(),
-            headers: HashMap::new(),
-            job_id: String::new(),
-            attempts: 1,
-            cancel_token: CancellationToken::new(),
-            lease: taquba::LeaseHandle::detached(),
-            memo,
-            signal: None,
-            effects: EffectsHandle::detached(),
-        }
+        let run_id = RunId::new(run_id).unwrap();
+        let mut step = Step::detached(Vec::new());
+        step.memo =
+            MemoStore::new(Arc::new(InMemory::new()), "test-memo").new_memo(&run_id, step_number);
+        step.run_id = run_id;
+        step.step_number = step_number;
+        step
     }
 
     fn assert_transient(err: &StepError) {
@@ -1558,12 +1548,12 @@ mod tests {
 
         let object_store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(Queue::open(object_store.clone(), "q").await.unwrap());
-        let run_id = "01RUNIDX";
+        let run_id = RunId::new("01RUNIDX").unwrap();
 
         // Pre-populate the writing memo so the terminal step completes
         // without an LLM call.
         MemoStore::new(object_store.clone(), "test-memo")
-            .new_memo(run_id, 0)
+            .new_memo(&run_id, 0)
             .put(
                 MEMO_KEY_WRITING,
                 &serde_json::to_vec(&PromptOutput {
@@ -1610,16 +1600,20 @@ mod tests {
         };
         runtime
             .submit(RunSpec {
-                run_id: Some(run_id.to_string()),
+                run_id: Some(run_id.clone()),
                 input: state.to_bytes(),
-                kv_writes: [(run_entry_key(run_id), entry.to_bytes())].into(),
+                kv_writes: [(run_entry_key(&run_id), entry.to_bytes())].into(),
                 ..Default::default()
             })
             .await
             .unwrap();
 
         // The submit-time entry is readable as soon as submit returns.
-        let bytes = queue.kv_get(&run_entry_key(run_id)).await.unwrap().unwrap();
+        let bytes = queue
+            .kv_get(&run_entry_key(&run_id))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             RunIndexEntry::from_bytes(&bytes)
                 .unwrap()
@@ -1633,7 +1627,11 @@ mod tests {
         let _ = worker.await;
 
         // The terminal entry was applied by the Succeed settlement.
-        let bytes = queue.kv_get(&run_entry_key(run_id)).await.unwrap().unwrap();
+        let bytes = queue
+            .kv_get(&run_entry_key(&run_id))
+            .await
+            .unwrap()
+            .unwrap();
         let stored = RunIndexEntry::from_bytes(&bytes).unwrap();
         assert_eq!(stored.query, "a query");
         let terminal = stored.terminal.expect("terminal record");
@@ -1644,7 +1642,7 @@ mod tests {
         // The Writing step wrote the canonical report blob before it
         // settled.
         let blob = object_store
-            .get(&crate::store::report_path(&Path::default(), run_id))
+            .get(&crate::store::report_path(&Path::default(), &run_id))
             .await
             .unwrap()
             .bytes()

@@ -1,13 +1,13 @@
-//! `FetchPage`: the durable [`taquba_jobs::Job`] that fetches a single
-//! URL and returns its title + extracted plain text.
+//! `FetchPage`: the durable [`Job`] that fetches a single URL and
+//! returns its title + extracted plain text.
 //!
 //! Submitting one `FetchPage` per URL with a deterministic
 //! `idempotency_key` and `try_join_all`-ing the handles is how the
 //! [`Phase::Fetching`](crate::state::Phase::Fetching) step parallelises
 //! its work while staying correct under at-least-once retries. A
-//! retried step re-submits the same payloads, taquba-jobs's
-//! result-aware idempotent submit short-circuits to the cached
-//! result blobs, and the awaits resolve without re-running any HTTP.
+//! retried step re-submits the same payloads, the job runner's
+//! result-aware idempotent submit short-circuits to the recorded
+//! results, and the awaits resolve without re-running any HTTP.
 //!
 //! Per-URL work has no LLM cost, so saving the bytes is incidental
 //! here; what matters is that the surrounding step becomes a single
@@ -21,7 +21,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
-use taquba_jobs::{ErrorKind, Job, JobContext, JobRunner, RunnerHandle};
+use taquba_workflow::StepErrorKind;
+use taquba_workflow::jobs::{Job, JobContext, JobRunner, RunnerHandle};
 use thiserror::Error;
 use url::Url;
 
@@ -35,27 +36,28 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Logical queue name for fetch jobs. Distinct from the workflow
 /// runtime's queue so retention policies can diverge if needed.
 pub const FETCH_QUEUE_NAME: &str = "research-fetch-jobs";
-/// How long a `FetchPage` result blob is retained after the job
-/// reaches a terminal state. Any in-process idempotent re-submission
-/// (workflow-step retry) of the same `(run_id, url)` short-circuits
-/// to the cached blob until this window elapses; after that the
-/// blob is swept and a re-submission falls through to a fresh fetch.
-/// One week covers every realistic run wall-time + inspection gap.
+/// How long a `FetchPage` run result record is retained after the
+/// job reaches a terminal state. Any in-process idempotent
+/// re-submission (workflow-step retry) of the same `(run_id, url)`
+/// short-circuits to the recorded result until this window elapses;
+/// after that the record is swept and a re-submission falls through
+/// to a fresh fetch. One week covers every realistic run wall-time +
+/// inspection gap.
 const FETCH_RESULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Build a [`JobRunner`] with the internal `FetchPage` job
 /// registered and an `Arc<reqwest::Client>` on its state, then spawn
-/// its worker. Returns an `Arc<JobRunner>` for submission and a
+/// its worker. Returns the `JobRunner` for submission and a
 /// [`RunnerHandle`] for graceful shutdown.
 ///
 /// The runner shares the supplied `queue` and `object_store` with
 /// the surrounding workflow runtime; jobs are enqueued under the
-/// `research-fetch-jobs` queue-name and their result blobs live
-/// under a sibling prefix in the object store.
+/// `research-fetch-jobs` queue-name and their memo and run result
+/// records live under a sibling prefix in the object store.
 pub fn spawn_fetch_runner(
     queue: &Arc<Queue>,
     object_store: &Arc<dyn ObjectStore>,
-) -> (Arc<JobRunner>, RunnerHandle) {
+) -> (JobRunner, RunnerHandle) {
     let http = Arc::new(
         reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
@@ -63,14 +65,14 @@ pub fn spawn_fetch_runner(
             .build()
             .expect("reqwest client builder cannot fail with default config"),
     );
-    let mut job_runner = JobRunner::builder(queue.clone(), object_store.clone())
+    let job_runner = JobRunner::builder(queue.clone(), object_store.clone())
         .queue_name(FETCH_QUEUE_NAME)
         .state(http)
-        .result_retention(FETCH_RESULT_RETENTION)
+        .retention(FETCH_RESULT_RETENTION)
+        .register::<FetchPage>()
         .build();
-    job_runner.register::<FetchPage>();
     let handle = job_runner.spawn(std::future::pending::<()>());
-    (Arc::new(job_runner), handle)
+    (job_runner, handle)
 }
 
 /// One durable HTTP fetch.
@@ -128,7 +130,7 @@ impl Job for FetchPage {
         let http = ctx.state::<Arc<reqwest::Client>>();
         // Extend the lease to cover the fetch's timeout before
         // issuing it, so a slow page cannot outlive the lease.
-        if let Err(e) = ctx.lease().ensure_at_least(FETCH_TIMEOUT) {
+        if let Err(e) = ctx.lease.ensure_at_least(FETCH_TIMEOUT) {
             return Err(match e {
                 taquba::Error::CancelRequested => FetchError::Cancelled,
                 other => FetchError::Lease(other.to_string()),
@@ -141,7 +143,7 @@ impl Job for FetchPage {
         // of running it out to the reqwest timeout.
         tokio::select! {
             result = fetch_and_extract(http, &self.url, self.max_chars) => result,
-            _ = ctx.cancel_token().cancelled() => Err(FetchError::Cancelled),
+            _ = ctx.cancel_token.cancelled() => Err(FetchError::Cancelled),
         }
     }
 
@@ -149,16 +151,16 @@ impl Job for FetchPage {
         Some(format!("fetch:{}:{}", self.run_id, self.url))
     }
 
-    fn classify(&self, error: &FetchError) -> ErrorKind {
+    fn classify(&self, error: &FetchError) -> StepErrorKind {
         match error {
             FetchError::Transport(_) | FetchError::ReadBody(_) | FetchError::Lease(_) => {
-                ErrorKind::Transient
+                StepErrorKind::Transient
             }
-            FetchError::HttpStatus(code) if is_transient_status(*code) => ErrorKind::Transient,
+            FetchError::HttpStatus(code) if is_transient_status(*code) => StepErrorKind::Transient,
             FetchError::HttpStatus(_)
             | FetchError::NonText(_)
             | FetchError::Empty
-            | FetchError::Cancelled => ErrorKind::Permanent,
+            | FetchError::Cancelled => StepErrorKind::Permanent,
         }
     }
 }
@@ -280,19 +282,19 @@ mod tests {
         };
         assert_eq!(
             job.classify(&FetchError::Transport("dns".into())),
-            ErrorKind::Transient
+            StepErrorKind::Transient
         );
         assert_eq!(
             job.classify(&FetchError::HttpStatus(503)),
-            ErrorKind::Transient
+            StepErrorKind::Transient
         );
         assert_eq!(
             job.classify(&FetchError::HttpStatus(429)),
-            ErrorKind::Transient
+            StepErrorKind::Transient
         );
         assert_eq!(
             job.classify(&FetchError::Lease("claim lost".into())),
-            ErrorKind::Transient
+            StepErrorKind::Transient
         );
     }
 
@@ -305,13 +307,16 @@ mod tests {
         };
         assert_eq!(
             job.classify(&FetchError::HttpStatus(404)),
-            ErrorKind::Permanent
+            StepErrorKind::Permanent
         );
         assert_eq!(
             job.classify(&FetchError::NonText("application/pdf".into())),
-            ErrorKind::Permanent
+            StepErrorKind::Permanent
         );
-        assert_eq!(job.classify(&FetchError::Empty), ErrorKind::Permanent);
-        assert_eq!(job.classify(&FetchError::Cancelled), ErrorKind::Permanent);
+        assert_eq!(job.classify(&FetchError::Empty), StepErrorKind::Permanent);
+        assert_eq!(
+            job.classify(&FetchError::Cancelled),
+            StepErrorKind::Permanent
+        );
     }
 }

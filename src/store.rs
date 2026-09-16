@@ -11,7 +11,7 @@
 //! - **At termination**: for runner-issued outcomes (`Succeed` /
 //!   `Cancel`) the terminal record joins the terminal step's
 //!   settlement transaction via
-//!   [`Step::effects`](taquba_workflow::Step::effects); for
+//!   [`Step::effects`](taquba_workflow::Delivery::effects); for
 //!   terminations that apply no step effects (a dead-lettered step, an
 //!   external cancellation) it joins the terminal notification's
 //!   settlement, staged by [`TerminalReconciler`].
@@ -182,9 +182,9 @@ pub enum RunDisplayStatus {
     /// and the next claim.
     Queued,
     /// No step job and no terminal record: a dead-lettered run whose
-    /// dead job the reaper removed before [`TerminalReconciler`]
-    /// processed its notification, store corruption or a version
-    /// mismatch. Collectable via the CLI's `gc --status unknown`.
+    /// dead job the retention sweep removed before a worker processed
+    /// its notification, store corruption or a version mismatch.
+    /// Collectable via the CLI's `gc --status unknown`.
     Unknown,
 }
 
@@ -434,14 +434,6 @@ impl<H> TerminalReconciler<H> {
             TerminalStatus::Succeeded => StoredStatus::Succeeded,
             TerminalStatus::Failed => StoredStatus::Failed,
             TerminalStatus::Cancelled => StoredStatus::Cancelled,
-            other => {
-                tracing::warn!(
-                    run_id = %outcome.run_id,
-                    status = %other,
-                    "skipping reconciliation of unknown terminal status"
-                );
-                return Ok(());
-            }
         };
         let finished_at = Utc::now();
         let summary = self
@@ -779,10 +771,7 @@ mod tests {
             .enqueue_with(
                 WORKFLOW_QUEUE_NAME,
                 Vec::new(),
-                EnqueueOptions {
-                    headers: [(HEADER_RUN_ID.to_string(), e.run_id.clone())].into(),
-                    ..EnqueueOptions::default()
-                },
+                EnqueueOptions::default().header(HEADER_RUN_ID, e.run_id.clone()),
             )
             .await
             .unwrap();
@@ -792,10 +781,7 @@ mod tests {
         let reader = QueueReader::open_with_options(
             object_store,
             "q",
-            ReaderOptions {
-                mode: ReaderMode::FollowLatest,
-                ..ReaderOptions::default()
-            },
+            ReaderOptions::default().mode(ReaderMode::FollowLatest),
         )
         .await
         .unwrap();
@@ -831,10 +817,7 @@ mod tests {
                 .enqueue_with(
                     WORKFLOW_QUEUE_NAME,
                     Vec::new(),
-                    EnqueueOptions {
-                        headers: [(HEADER_RUN_ID.to_string(), run.to_string())].into(),
-                        ..EnqueueOptions::default()
-                    },
+                    EnqueueOptions::default().header(HEADER_RUN_ID, run),
                 )
                 .await
                 .unwrap();
@@ -843,14 +826,9 @@ mod tests {
             .enqueue_with(
                 WORKFLOW_QUEUE_NAME,
                 Vec::new(),
-                EnqueueOptions {
-                    headers: [
-                        (HEADER_RUN_ID.to_string(), "01A".to_string()),
-                        (HEADER_TERMINAL.to_string(), "true".to_string()),
-                    ]
-                    .into(),
-                    ..EnqueueOptions::default()
-                },
+                EnqueueOptions::default()
+                    .header(HEADER_RUN_ID, "01A")
+                    .header(HEADER_TERMINAL, "true"),
             )
             .await
             .unwrap();
@@ -890,11 +868,11 @@ mod tests {
     async fn reconciler_records_failed_for_dead_lettered_run() {
         use crate::state::ResearchConfig;
         use taquba::object_store::memory::InMemory;
-        use taquba_workflow::{RunSpec, WorkflowRuntime};
+        use taquba_workflow::{RunId, RunSpec, WorkflowRuntime};
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(Queue::open(object_store.clone(), "q").await.unwrap());
-        let run_id = "01RECONCILE";
+        let run_id = RunId::new("01RECONCILE").unwrap();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let hook = TerminalReconciler::new(
@@ -931,9 +909,9 @@ mod tests {
         };
         runtime
             .submit(RunSpec {
-                run_id: Some(run_id.to_string()),
+                run_id: Some(run_id.clone()),
                 input: state.to_bytes(),
-                kv_writes: [(run_entry_key(run_id), e.to_bytes())].into(),
+                kv_writes: [(run_entry_key(&run_id), e.to_bytes())].into(),
                 ..Default::default()
             })
             .await
@@ -949,7 +927,11 @@ mod tests {
         // The reconciled record committed with the notification's
         // acknowledgement; the summary comes from the dead job's
         // payload.
-        let bytes = queue.kv_get(&run_entry_key(run_id)).await.unwrap().unwrap();
+        let bytes = queue
+            .kv_get(&run_entry_key(&run_id))
+            .await
+            .unwrap()
+            .unwrap();
         let stored = RunIndexEntry::from_bytes(&bytes).unwrap();
         let terminal = stored.terminal.expect("reconciled terminal record");
         assert_eq!(terminal.status, StoredStatus::Failed);

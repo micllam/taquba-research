@@ -47,6 +47,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logs a warning.
 
 ### Changed
+- **Breaking:** bumped `taquba` to 0.13 and `taquba-workflow` to 0.12;
+  `taquba-jobs` is no longer a dependency, its implementation having
+  moved into `taquba_workflow::jobs`, which the `jobs` re-export module
+  now points to. The re-exported types follow the upstream breaks: run
+  ids are `RunId` (`RunSpec::run_id`, `RunOutcome::run_id`), the
+  delivery fields of `Step` moved to `Step::delivery` (a test builds
+  one with `Step::detached`) and `RunSpec::{headers, priority,
+  max_attempts_per_step, run_at}` moved to `RunSpec::options`. The
+  `workflow` module also re-exports `Delivery`, `RunId` and
+  `RunOptions`. `spawn_fetch_runner` returns the `JobRunner` by value
+  and `ResearchStepRunner::with_job_runner` takes one; the runner is
+  `Clone`.
+- **Breaking (on-disk):** taquba 0.13 and taquba-workflow 0.12 store
+  payloads as MessagePack binary strings and derive job status from
+  the key space; the memo prefixes follow the upstream default of
+  `{queue_name}-memo` (`research-workflow-memo`,
+  `research-fetch-jobs-memo`). Stores written by earlier versions are
+  not readable; start from a fresh store.
+- A run whose step the queue dead-lettered outside the worker (a lease
+  expired past the attempt limit, crash recovery at queue open) is
+  terminated as failed by the next worker, with its terminal
+  notification enqueued in the same transaction, so `TerminalReconciler`
+  records it and `gc --status unknown` is needed only for an entry
+  whose dead job the retention sweep removed first.
 - **Breaking:** the run index moved from per-run JSON objects under
   `<store>/runs/` into the queue's user KV namespace
   (`research/runs/<run_id>`), and its writes are transactional: the

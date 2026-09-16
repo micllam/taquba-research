@@ -38,7 +38,8 @@ use taquba_research::store::{
     WORKFLOW_QUEUE_NAME,
 };
 use taquba_research::workflow::{
-    RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus,
+    WorkflowRuntime,
 };
 use taquba_research::{
     CancelSentinel, FETCH_QUEUE_NAME, ResearchConfig, ResearchStepRunner, RunRecord,
@@ -403,13 +404,8 @@ fn queue_path(ctx: &StoreCtx) -> String {
 }
 
 async fn open_queue(ctx: &StoreCtx) -> Result<Arc<Queue>> {
-    let opts = OpenOptions {
-        default_queue_config: QueueConfig {
-            lease_duration: LEASE_DURATION,
-            ..QueueConfig::default()
-        },
-        ..OpenOptions::default()
-    };
+    let opts = OpenOptions::default()
+        .default_queue_config(QueueConfig::default().lease_duration(LEASE_DURATION));
     let queue = Queue::open_with_options(ctx.object_store.clone(), &queue_path(ctx), opts)
         .await
         .context("opening taquba queue")?;
@@ -436,10 +432,7 @@ async fn open_reader(ctx: &StoreCtx) -> Result<QueueReader> {
     QueueReader::open_with_options(
         ctx.object_store.clone(),
         &queue_path(ctx),
-        ReaderOptions {
-            mode: ReaderMode::FollowLatest,
-            ..ReaderOptions::default()
-        },
+        ReaderOptions::default().mode(ReaderMode::FollowLatest),
     )
     .await
     .context("opening queue reader")
@@ -603,7 +596,7 @@ fn spawn_runtime(
     store_ctx: &StoreCtx,
     queue: Arc<Queue>,
     runner: ResearchStepRunner,
-    run_id: &str,
+    run_id: &RunId,
 ) -> Result<(
     WorkflowRuntime<ResearchStepRunner, TerminalReconciler<CaptureHook>>,
     WorkerHandles,
@@ -612,7 +605,7 @@ fn spawn_runtime(
     let hook = TerminalReconciler::new(
         queue.clone(),
         CaptureHook {
-            run_id: run_id.to_string(),
+            run_id: run_id.clone(),
             tx: Mutex::new(Some(tx)),
         },
     );
@@ -686,11 +679,11 @@ async fn cmd_run(
     // The run id is generated before submit so the index entry's KV
     // key can join the submit transaction: the run and its entry
     // commit together.
-    let run_id = ulid::Ulid::new().to_string();
+    let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
     let (runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id)?;
 
     let entry = RunIndexEntry {
-        run_id: run_id.clone(),
+        run_id: run_id.to_string(),
         query: query.clone(),
         submitted_at: Utc::now(),
         terminal: None,
@@ -720,6 +713,9 @@ async fn cmd_resume(
     run_id: String,
     force: bool,
 ) -> Result<()> {
+    let run_id: RunId = run_id
+        .parse()
+        .with_context(|| format!("invalid run id `{run_id}`"))?;
     // Guard against resuming a finished, dead-lettered or unknown run
     // before the (exclusive) writer open. A reader-side check
     // suffices: the worker acts on the same entry and step job.
@@ -731,7 +727,7 @@ async fn cmd_resume(
             let claimed = count_claimed_jobs(reader).await?;
             let entry = store::get_run(reader, &run_id).await?;
             let mut jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
-            let job = jobs.remove(&run_id);
+            let job = jobs.remove(run_id.as_str());
             let waiting_others = jobs
                 .values()
                 .filter(|s| matches!(s, StepJobState::Waiting(_)))
@@ -920,10 +916,6 @@ async fn handle_terminal(
             // User-initiated stop. Not an error; exit 0.
             let reason = outcome.error.as_deref().unwrap_or("(no reason supplied)");
             eprintln!("⊘ Run {run_id} cancelled: {reason}");
-        }
-        other => {
-            eprintln!("✗ Run {run_id} reached unknown terminal status: {other}");
-            std::process::exit(1);
         }
     }
     Ok(())
@@ -1303,7 +1295,7 @@ async fn cmd_gc(
 struct CaptureHook {
     /// Run this invocation submitted or resumed. Notifications for any
     /// other run are stale; see `on_termination`.
-    run_id: String,
+    run_id: RunId,
     tx: Mutex<Option<oneshot::Sender<RunOutcome>>>,
 }
 
