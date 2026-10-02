@@ -76,10 +76,11 @@ Other subcommands:
 - `init`: verify the configured store is reachable (creds, bucket
   exists). Recommended before submitting an expensive run against a
   fresh cloud bucket.
-- `gc --older-than-days N [--status S]... [--dry-run]`: clean up
-  recorded runs and their default-location reports. Active runs
-  (`running`, `paused`, `cancellation_requested`) are protected
-  unless explicitly opted in via `--status <state>`.
+- `gc --older-than-days N [--status S]... [--dry-run]`: clean up recorded runs
+  and their default-location reports. `--status` accepts `succeeded`, `failed`,
+  `cancelled` and `unknown`. A run without a terminal record is deleted only
+  with `unknown`, which selects entries that lack a terminal record and a step
+  job.
 
 See `taquba-research --help` for the full flag list.
 
