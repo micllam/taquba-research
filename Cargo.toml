@@ -8,6 +8,7 @@ repository = "https://github.com/micllam/taquba-research"
 homepage = "https://github.com/micllam/taquba-research"
 readme = "README.md"
 keywords = ["agent", "research", "rig", "taquba", "durable"]
+include = ["src/**", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE-APACHE", "LICENSE-MIT"]
 
 [features]
 # No cloud backend by default; the in-memory and local-disk stores work
