@@ -8,8 +8,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rig_core::providers::{anthropic, ollama, openai};
-use taquba::Queue;
 use taquba::object_store::ObjectStore;
+use taquba::{Queue, SettlementEffects};
 use taquba_workflow::{
     RunId, RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus,
     WorkflowRuntime,
@@ -127,7 +127,8 @@ impl ResearchAgent {
             .submit(RunSpec {
                 run_id: Some(run_id.clone()),
                 input,
-                kv_writes: [(run_entry_key(&run_id), entry.to_bytes())].into(),
+                effects: SettlementEffects::default()
+                    .kv_put(run_entry_key(&run_id), entry.to_bytes()),
                 ..Default::default()
             })
             .await

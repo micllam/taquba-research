@@ -3194,9 +3194,9 @@ dependencies = [
 
 [[package]]
 name = "taquba"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c277a7735e0cb57ac12f2c76abf9584ddba5945c07fb56a2fad8b0765f1b7460"
+checksum = "5e1224c60c6f1ef66ab11cf9e00bc49c7654ccb9d6ef1145764e0372a4632211"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3241,9 +3241,9 @@ dependencies = [
 
 [[package]]
 name = "taquba-workflow"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9cad5f88768dbe4c6765f0fc98e5c9547e652c873c77a4fcbfb154ed5228106"
+checksum = "ba6aa31e8932bd0710584d5b7731fe3ba6f7ebb2643656610f8dbbb4e0b773d2"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4006,7 +4006,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

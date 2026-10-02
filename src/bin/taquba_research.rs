@@ -31,7 +31,10 @@ use rig_core::providers::{anthropic, ollama, openai};
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, parse_url};
-use taquba::{JobStatus, OpenOptions, Queue, QueueConfig, QueueReader, ReaderMode, ReaderOptions};
+use taquba::{
+    JobStatus, OpenOptions, Queue, QueueConfig, QueueReader, ReaderMode, ReaderOptions,
+    SettlementEffects,
+};
 use taquba_research::jobs::RunnerHandle;
 use taquba_research::store::{
     self, RunDisplayStatus, RunIndexEntry, StepJobState, StoredStatus, TerminalReconciler,
@@ -467,6 +470,7 @@ async fn count_claimed_jobs(reader: &QueueReader) -> Result<usize> {
     let mut claimed = 0usize;
     for queue in [WORKFLOW_QUEUE_NAME, FETCH_QUEUE_NAME] {
         claimed += reader
+            .view()
             .list_jobs(queue, JobStatus::Claimed, None, 1)
             .await?
             .jobs
@@ -693,7 +697,8 @@ async fn cmd_run(
         .submit(RunSpec {
             run_id: Some(run_id.clone()),
             input,
-            kv_writes: [(store::run_entry_key(&run_id), entry.to_bytes())].into(),
+            effects: SettlementEffects::default()
+                .kv_put(store::run_entry_key(&run_id), entry.to_bytes()),
             ..Default::default()
         })
         .await
@@ -1008,16 +1013,20 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
     if !queue_exists(store_ctx).await? {
         bail!("no run index entry for {run_id} (store contains no runs)");
     }
-    let (entry, job, history) = with_reader(store_ctx, async |reader| {
+    let (entry, job, payload, history) = with_reader(store_ctx, async |reader| {
         let entry = store::get_run(reader, &run_id).await?;
         let mut jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
         let job = jobs.remove(&run_id);
+        let payload = match &job {
+            Some(state) => store::job_payload(reader.view(), state.job()).await?,
+            None => None,
+        };
         // The attempt history is printed for dead-lettered runs only.
         let history = match &job {
-            Some(StepJobState::Dead(dead)) => reader.attempt_history(&dead.id).await?,
+            Some(StepJobState::Dead(dead)) => reader.view().attempt_history(&dead.id).await?,
             _ => Vec::new(),
         };
-        Ok((entry, job, history))
+        Ok((entry, job, payload, history))
     })
     .await?;
     let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
@@ -1051,7 +1060,7 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
     }
     if let Some(state) = &job {
         let job = state.job();
-        if let Some(progress) = summarize_state(&job.payload) {
+        if let Some(progress) = payload.as_deref().and_then(summarize_state) {
             println!(
                 "progress:     phase {} · {} steps completed",
                 progress.phase, progress.steps_completed

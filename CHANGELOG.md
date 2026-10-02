@@ -45,9 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completion stopped at the output-token limit (reported per call by
   rig 0.42). The rendered report notes the truncation and the runner
   logs a warning.
+- `store::job_payload`, the payload of a job listing record, which reads an
+  offloaded payload through the queue. A listing record from taquba 0.14 omits
+  an offloaded payload, so read the payload of a `StepJobState` record with
+  `job_payload`.
 
 ### Changed
-- **Breaking:** bumped `taquba` to 0.13 and `taquba-workflow` to 0.12;
+- **Breaking:** bumped `taquba` to 0.14 and `taquba-workflow` to 0.13;
   `taquba-jobs` is no longer a dependency, its implementation having
   moved into `taquba_workflow::jobs`, which the `jobs` re-export module
   now points to. The re-exported types follow the upstream breaks: run
@@ -59,7 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RunOptions`. `spawn_fetch_runner` returns the `JobRunner` by value
   and `ResearchStepRunner::with_job_runner` takes one; the runner is
   `Clone`.
-- **Breaking (on-disk):** taquba 0.13 and taquba-workflow 0.12 store
+- **Breaking (on-disk):** taquba 0.14 and taquba-workflow 0.13 store
   payloads as MessagePack binary strings and derive job status from
   the key space; the memo prefixes follow the upstream default of
   `{queue_name}-memo` (`research-workflow-memo`,
@@ -75,10 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<store>/runs/` into the queue's user KV namespace
   (`research/runs/<run_id>`), and its writes are transactional: the
   submit-time entry joins the submit transaction via `RunSpec`
-  KV writes, and the terminal entry joins a settlement transaction:
+  effects, and the terminal entry joins a settlement transaction:
   the terminal step's via `Step` effects for runner-issued outcomes,
-  the terminal notification's otherwise (both mechanisms new in
-  taquba-workflow 0.10).
+  the terminal notification's otherwise.
   The crash windows in which the index contradicted the queue are
   closed. `RunStore` and `RunIndexStatus` are removed; the reduced
   `RunIndexEntry` stores only submission facts plus an optional

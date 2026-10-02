@@ -6,8 +6,8 @@
 //!
 //! - **At submission** (query, submit time), joining the submit
 //!   transaction via
-//!   [`RunSpec::kv_writes`](taquba_workflow::RunSpec::kv_writes), so a
-//!   run cannot exist without an entry or an entry without a run.
+//!   [`RunSpec::effects`](taquba_workflow::RunSpec::effects), so a run
+//!   cannot exist without an entry or an entry without a run.
 //! - **At termination**: for runner-issued outcomes (`Succeed` /
 //!   `Cancel`) the terminal record joins the terminal step's
 //!   settlement transaction via
@@ -27,11 +27,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use futures_util::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
 use taquba::object_store;
-use taquba::{JobRecord, JobStatus, Queue, QueueReader};
+use taquba::{JobRecord, JobStatus, Queue, QueueReader, QueueView};
 use taquba_workflow::{
     HEADER_RUN_ID, HEADER_TERMINAL, RunOutcome, StepError, TerminalEffects, TerminalHook,
     TerminalStatus,
@@ -223,12 +224,22 @@ pub enum StepJobState {
 }
 
 impl StepJobState {
-    /// The observed job record, regardless of state.
+    /// The observed job record, regardless of state. The record does not
+    /// contain an offloaded payload, which [`job_payload`] reads.
     pub fn job(&self) -> &JobRecord {
         match self {
             Self::Dead(j) | Self::Claimed(j) | Self::Waiting(j) => j,
         }
     }
+}
+
+/// The payload of `job`, a record of a job listing. An offloaded payload is
+/// read through `view`, and `Ok(None)` means the job no longer exists.
+pub async fn job_payload(view: &QueueView, job: &JobRecord) -> taquba::Result<Option<Vec<u8>>> {
+    if job.payload_ref.is_none() {
+        return Ok(Some(job.payload.clone()));
+    }
+    Ok(view.get_job(&job.id).await?.map(|job| job.payload))
 }
 
 /// Compute a run's display status. Precedence: stored terminal record,
@@ -269,24 +280,18 @@ const SCAN_PAGE: usize = 256;
 /// skipped.
 pub async fn list_runs(reader: &QueueReader) -> taquba::Result<Vec<RunIndexEntry>> {
     let mut out = Vec::new();
-    let mut cursor: Option<Vec<u8>> = None;
-    loop {
-        let page = reader
-            .kv_scan(RUNS_KV_PREFIX.as_bytes(), cursor.as_deref(), SCAN_PAGE)
-            .await?;
-        for (key, value) in page.entries {
-            match RunIndexEntry::from_bytes(&value) {
-                Ok(entry) => out.push(entry),
-                Err(e) => tracing::warn!(
-                    key = %String::from_utf8_lossy(&key),
-                    error = %e,
-                    "skipping malformed run index entry"
-                ),
-            }
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
+    let entries = reader
+        .view()
+        .kv_entries(RUNS_KV_PREFIX.as_bytes(), .., SCAN_PAGE);
+    let mut entries = std::pin::pin!(entries);
+    while let Some((key, value)) = entries.try_next().await? {
+        match RunIndexEntry::from_bytes(&value) {
+            Ok(entry) => out.push(entry),
+            Err(e) => tracing::warn!(
+                key = %String::from_utf8_lossy(&key),
+                error = %e,
+                "skipping malformed run index entry"
+            ),
         }
     }
     Ok(out)
@@ -295,7 +300,7 @@ pub async fn list_runs(reader: &QueueReader) -> taquba::Result<Vec<RunIndexEntry
 /// Load one run's index entry. `Ok(None)` when the run is unknown; a
 /// malformed entry is an error.
 pub async fn get_run(reader: &QueueReader, run_id: &str) -> anyhow::Result<Option<RunIndexEntry>> {
-    let Some(bytes) = reader.kv_get(&run_entry_key(run_id)).await? else {
+    let Some(bytes) = reader.view().kv_get(&run_entry_key(run_id)).await? else {
         return Ok(None);
     };
     let entry = RunIndexEntry::from_bytes(&bytes)
@@ -323,10 +328,6 @@ pub async fn snapshot_step_jobs(
         }
     };
 
-    // Every scan is driven by the page cursor: a page can be shorter
-    // than the limit without being the last one (records whose
-    // offloaded payload was removed mid-scan are dropped after the
-    // cursor is computed), so a short page must not end the loop.
     for (status, make) in [
         (JobStatus::Dead, StepJobState::Dead as fn(_) -> _),
         (JobStatus::Claimed, StepJobState::Claimed),
@@ -336,6 +337,7 @@ pub async fn snapshot_step_jobs(
         let mut cursor: Option<Vec<u8>> = None;
         loop {
             let page = reader
+                .view()
                 .list_jobs(queue, status, cursor.as_deref(), SCAN_PAGE)
                 .await?;
             for job in page.jobs {
@@ -360,6 +362,7 @@ pub async fn count_waiting_step_jobs(queue: &Queue) -> taquba::Result<usize> {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
             let page = queue
+                .view()
                 .list_jobs(WORKFLOW_QUEUE_NAME, status, cursor.as_deref(), SCAN_PAGE)
                 .await?;
             count += page
@@ -408,6 +411,7 @@ impl<H> TerminalReconciler<H> {
         let key = run_entry_key(&outcome.run_id);
         let bytes = self
             .queue
+            .view()
             .kv_get(&key)
             .await
             .map_err(|e| StepError::transient(format!("reading run index entry: {e}")))?;
@@ -495,6 +499,7 @@ impl<H> TerminalReconciler<H> {
         loop {
             let page = self
                 .queue
+                .view()
                 .list_jobs(
                     WORKFLOW_QUEUE_NAME,
                     JobStatus::Dead,
@@ -508,7 +513,8 @@ impl<H> TerminalReconciler<H> {
                     continue;
                 }
                 if job.headers.get(HEADER_RUN_ID).map(String::as_str) == Some(run_id) {
-                    return ResearchState::from_bytes(&job.payload).ok();
+                    let payload = job_payload(self.queue.view(), &job).await.ok()??;
+                    return ResearchState::from_bytes(&payload).ok();
                 }
             }
             match page.next_cursor {
@@ -806,6 +812,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_payload_reads_an_offloaded_payload() {
+        use taquba::object_store::memory::InMemory;
+        use taquba::{OpenOptions, Queue};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let queue = Queue::open_with_options(
+            object_store,
+            "q",
+            OpenOptions::default().payload_offload_threshold(4),
+        )
+        .await
+        .unwrap();
+        let payload = b"an offloaded payload".to_vec();
+        queue
+            .enqueue(WORKFLOW_QUEUE_NAME, payload.clone())
+            .await
+            .unwrap();
+
+        let page = queue
+            .view()
+            .list_jobs(WORKFLOW_QUEUE_NAME, JobStatus::Pending, None, 1)
+            .await
+            .unwrap();
+        let job = &page.jobs[0];
+        assert!(job.payload.is_empty());
+        assert_eq!(job_payload(queue.view(), job).await.unwrap(), Some(payload));
+    }
+
+    #[tokio::test]
     async fn count_waiting_excludes_terminal_notifications() {
         use taquba::object_store::memory::InMemory;
         use taquba::{EnqueueOptions, Queue};
@@ -911,7 +946,8 @@ mod tests {
             .submit(RunSpec {
                 run_id: Some(run_id.clone()),
                 input: state.to_bytes(),
-                kv_writes: [(run_entry_key(&run_id), e.to_bytes())].into(),
+                effects: taquba::SettlementEffects::default()
+                    .kv_put(run_entry_key(&run_id), e.to_bytes()),
                 ..Default::default()
             })
             .await
@@ -928,6 +964,7 @@ mod tests {
         // acknowledgement; the summary comes from the dead job's
         // payload.
         let bytes = queue
+            .view()
             .kv_get(&run_entry_key(&run_id))
             .await
             .unwrap()

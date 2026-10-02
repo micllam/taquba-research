@@ -1602,7 +1602,8 @@ mod tests {
             .submit(RunSpec {
                 run_id: Some(run_id.clone()),
                 input: state.to_bytes(),
-                kv_writes: [(run_entry_key(&run_id), entry.to_bytes())].into(),
+                effects: taquba::SettlementEffects::default()
+                    .kv_put(run_entry_key(&run_id), entry.to_bytes()),
                 ..Default::default()
             })
             .await
@@ -1610,6 +1611,7 @@ mod tests {
 
         // The submit-time entry is readable as soon as submit returns.
         let bytes = queue
+            .view()
             .kv_get(&run_entry_key(&run_id))
             .await
             .unwrap()
@@ -1628,6 +1630,7 @@ mod tests {
 
         // The terminal entry was applied by the Succeed settlement.
         let bytes = queue
+            .view()
             .kv_get(&run_entry_key(&run_id))
             .await
             .unwrap()
