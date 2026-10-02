@@ -29,7 +29,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rig_core::providers::{anthropic, ollama, openai};
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
-use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, parse_url};
+use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, parse_url_opts};
 use taquba::{
     JobStatus, OpenOptions, Queue, QueueConfig, QueueReader, ReaderMode, ReaderOptions,
     SettlementEffects,
@@ -347,8 +347,8 @@ async fn resolve_store(flag: Option<&str>) -> Result<StoreCtx> {
     // an opaque scheme parse_url knows about.
     if looks_like_url(&raw) {
         let url = Url::parse(&raw).with_context(|| format!("parsing --store as URL: {raw}"))?;
-        let (store, path) =
-            parse_url(&url).with_context(|| format!("opening object store from URL `{raw}`"))?;
+        let (store, path) = parse_url_opts(&url, store_options(std::env::vars()))
+            .with_context(|| format!("opening object store from URL `{raw}`"))?;
         return Ok(StoreCtx {
             object_store: Arc::from(store),
             prefix: path,
@@ -370,6 +370,22 @@ async fn resolve_store(flag: Option<&str>) -> Result<StoreCtx> {
         object_store: Arc::new(local),
         prefix: ObjectPath::default(),
         source: raw,
+    })
+}
+
+/// The object store options among the environment variables `vars`: the
+/// variables of the three providers, with the name in lowercase as the option
+/// key. The prefixes exclude a variable of another program whose lowercase name
+/// is an option key, such as `TOKEN` or `ENDPOINT`.
+fn store_options(
+    vars: impl Iterator<Item = (String, String)>,
+) -> impl Iterator<Item = (String, String)> {
+    vars.filter_map(|(name, value)| {
+        let key = name.to_ascii_lowercase();
+        ["aws_", "google_", "azure_"]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+            .then_some((key, value))
     })
 }
 
@@ -502,8 +518,8 @@ fn resolve_output(raw: Option<&str>) -> Result<OutputTarget> {
         return Ok(OutputTarget::Local(PathBuf::from(raw)));
     }
     let url = Url::parse(raw).with_context(|| format!("parsing --output as URL: {raw}"))?;
-    let (store, path) =
-        parse_url(&url).with_context(|| format!("opening output store from URL `{raw}`"))?;
+    let (store, path) = parse_url_opts(&url, store_options(std::env::vars()))
+        .with_context(|| format!("opening output store from URL `{raw}`"))?;
     Ok(OutputTarget::Remote {
         object_store: Arc::from(store),
         path,
@@ -1340,7 +1356,29 @@ impl TerminalHook for CaptureHook {
 
 #[cfg(test)]
 mod tests {
-    use super::ellipsize;
+    use super::{ellipsize, store_options};
+
+    #[test]
+    fn store_options_are_the_provider_variables_in_lowercase() {
+        let vars = [
+            ("AWS_ENDPOINT", "http://127.0.0.1:9000"),
+            ("ENDPOINT", "other"),
+            ("GOOGLE_SERVICE_ACCOUNT", "sa.json"),
+            ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
+            ("HOME", "/home/u"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+        let options: Vec<(String, String)> = store_options(vars.into_iter()).collect();
+        assert_eq!(
+            options,
+            [
+                ("aws_endpoint", "http://127.0.0.1:9000"),
+                ("google_service_account", "sa.json"),
+                ("azure_storage_account_name", "account"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+        );
+    }
 
     #[test]
     fn ellipsize_keeps_strings_within_the_limit() {

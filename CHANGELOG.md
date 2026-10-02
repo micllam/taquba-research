@@ -213,6 +213,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetch `JobRunner` down, leaving its polling task running for the
   process lifetime; the fetch runner is now shut down on every exit
   path.
+- A `--store` or `--output` URL with a cloud scheme reads the
+  provider's environment variables (`AWS_*`, `GOOGLE_*` and
+  `AZURE_*`) for its credentials, its region and its endpoint, as the
+  README states. The variables were not read, so static keys, a
+  region or a custom endpoint from the environment had no effect.
 
 ## [0.4.0] - 2026-06-17
 
