@@ -55,7 +55,6 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use rig_core::client::ProviderClient;
 //! use taquba::{Queue, object_store::local::LocalFileSystem};
 //! use taquba_research::{ResearchAgent, ResearchConfig, search::Tavily};
 //!
@@ -63,9 +62,9 @@
 //! let store = Arc::new(LocalFileSystem::new_with_prefix("./store")?);
 //! let queue = Arc::new(Queue::open(store.clone(), "taquba-research").await?);
 //!
-//! let rig = rig_core::providers::openai::Client::from_env()?;
+//! let rig = rig_core::providers::openai::OpenAI::from_env()?;
 //!
-//! // ...or .anthropic(rig_core::providers::anthropic::Client::from_env()?)
+//! // ...or .anthropic(rig_core::providers::anthropic::Anthropic::from_env()?)
 //! //       paired with a matching model id (e.g. "claude-haiku-4-5").
 //! let agent = ResearchAgent::builder()
 //!     .openai(rig)

@@ -62,12 +62,13 @@ impl ResearchConfig {
 /// calls yet" or "the provider didn't report usage."
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsage {
-    /// Sum of input ("prompt") tokens reported across all calls.
+    /// Sum of input ("prompt") tokens reported across all calls, cache reads
+    /// and writes included.
     pub input_tokens: u64,
     /// Sum of output ("completion") tokens reported across all calls.
     pub output_tokens: u64,
-    /// Sum of provider-reported `total_tokens` across all calls. Some
-    /// providers report only this aggregate.
+    /// Sum of `total_tokens` across all calls. A call reports a total only with
+    /// both its input and its output count.
     pub total_tokens: u64,
     /// Input tokens read from a provider-managed prompt cache.
     pub cached_input_tokens: u64,

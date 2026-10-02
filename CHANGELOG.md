@@ -182,7 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defaults per model, e.g. 64k for `claude-haiku-4-5`). Previously a
   flat 4096 bounded every call, which made it the most likely cause
   of truncated output.
-- Bumped `rig-core` and `rig-agent` to 0.42. Inherited behaviour
+- Bumped `rig-core` and `rig-agent` to 0.43. Inherited behaviour
   changes: a turn truncated before producing any answer surfaces as an
   error, classified transient, where it previously succeeded with an
   empty completion; Anthropic `TokenUsage::reasoning_tokens` is
@@ -190,6 +190,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and OpenAI non-success HTTP responses classify through the
   provider-response status path, with the transient/permanent mapping
   unchanged.
+- `TokenUsage::input_tokens` counts cache reads and writes on every provider,
+  and a call adds to `total_tokens` only when it reports both the input and the
+  output count. An Anthropic run with cached input reports more input tokens
+  than with rig 0.42.
+- **Breaking:** `ResearchStepRunner::new_openai`, `new_anthropic` and
+  `new_ollama` and the `ResearchAgentBuilder` methods `openai`, `anthropic` and
+  `ollama` take the rig 0.43 clients `OpenAI`, `Anthropic` and `Ollama`. Build a
+  client with `rig_core::providers::openai::OpenAI::from_env()` in place of
+  `openai::Client::from_env()`, and likewise for the other providers.
 
 ### Fixed
 - A workflow worker error or panic was reported as an interruption

@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use rig_agent::agent::{CompletionCall, PromptResponse, TypedPromptResponse};
-use rig_agent::client::AgentClientExt;
-use rig_agent::completion::{Prompt, PromptError, StructuredOutputError, TypedPrompt};
-use rig_core::client::CompletionClient;
+use rig_agent::agent::{AgentBuilder, CompletionCall, PromptResponse, TypedPromptResponse};
+use rig_agent::completion::{PromptError, StructuredOutputError};
+use rig_core::DynModel;
 use rig_core::completion::{
     FinishReason, Usage,
     message::{self, AssistantContent, UserContent},
 };
+use rig_core::operation::Completion;
 use rig_core::providers::anthropic::completion as anthropic_completion;
 use rig_core::providers::{anthropic, ollama, openai};
 use schemars::JsonSchema;
@@ -87,9 +87,20 @@ pub struct ResearchStepRunner {
 
 /// Per-provider LLM client.
 pub(crate) enum ProviderClient {
-    OpenAi(openai::Client),
-    Anthropic(anthropic::Client),
-    Ollama(ollama::Client),
+    OpenAi(Box<openai::OpenAI>),
+    Anthropic(anthropic::Anthropic),
+    Ollama(ollama::Ollama),
+}
+
+impl ProviderClient {
+    /// The completion model `model` of this provider.
+    fn completion_model(&self, model: &str) -> DynModel<Completion> {
+        match self {
+            Self::OpenAi(client) => client.completion(model).into(),
+            Self::Anthropic(client) => client.completion(model).into(),
+            Self::Ollama(client) => client.completion(model).into(),
+        }
+    }
 }
 
 /// What the terminal hook persists for a finished run. Distinct from the
@@ -110,18 +121,18 @@ pub struct RunRecord {
 
 impl ResearchStepRunner {
     /// Build a runner from a Rig OpenAI client and a search backend.
-    pub fn new_openai(client: openai::Client, search: Arc<dyn SearchBackend>) -> Self {
-        Self::from_provider(ProviderClient::OpenAi(client), search)
+    pub fn new_openai(client: openai::OpenAI, search: Arc<dyn SearchBackend>) -> Self {
+        Self::from_provider(ProviderClient::OpenAi(Box::new(client)), search)
     }
 
     /// Build a runner from a Rig Anthropic client and a search backend.
-    pub fn new_anthropic(client: anthropic::Client, search: Arc<dyn SearchBackend>) -> Self {
+    pub fn new_anthropic(client: anthropic::Anthropic, search: Arc<dyn SearchBackend>) -> Self {
         Self::from_provider(ProviderClient::Anthropic(client), search)
     }
 
     /// Build a runner from a Rig Ollama client and a search backend, for
     /// local models.
-    pub fn new_ollama(client: ollama::Client, search: Arc<dyn SearchBackend>) -> Self {
+    pub fn new_ollama(client: ollama::Ollama, search: Arc<dyn SearchBackend>) -> Self {
         Self::from_provider(ProviderClient::Ollama(client), search)
     }
 
@@ -758,21 +769,14 @@ impl ResearchStepRunner {
         prompt: &str,
         state: &mut ResearchState,
     ) -> Result<PromptOutput, StepError> {
-        let model = &state.config.model;
+        let model = self.provider.completion_model(&state.config.model);
         let max_tokens = state.config.max_tokens_per_call;
-        let response = under_lease(lease, LLM_CALL_TIMEOUT, "LLM call", async {
-            match self.provider.as_ref() {
-                ProviderClient::OpenAi(client) => {
-                    prompt_extended(client, model, max_tokens, prompt).await
-                }
-                ProviderClient::Anthropic(client) => {
-                    prompt_extended(client, model, max_tokens, prompt).await
-                }
-                ProviderClient::Ollama(client) => {
-                    prompt_extended(client, model, max_tokens, prompt).await
-                }
-            }
-        })
+        let response = under_lease(
+            lease,
+            LLM_CALL_TIMEOUT,
+            "LLM call",
+            prompt_extended(model, max_tokens, prompt),
+        )
         .await?;
         record_usage(&mut state.token_usage, &response.usage);
         Ok(PromptOutput {
@@ -789,17 +793,15 @@ impl ResearchStepRunner {
         state: &mut ResearchState,
     ) -> Result<(String, Vec<SourceQuote>), StepError> {
         match self.provider.as_ref() {
-            ProviderClient::Anthropic(client) if !source_documents.is_empty() => {
+            ProviderClient::Anthropic(_) if !source_documents.is_empty() => {
                 let message = anthropic_document_message(prompt, source_documents);
-                let response = under_lease(lease, LLM_CALL_TIMEOUT, "LLM call", async {
-                    prompt_extended(
-                        client,
-                        &state.config.model,
-                        state.config.max_tokens_per_call,
-                        message,
-                    )
-                    .await
-                })
+                let model = self.provider.completion_model(&state.config.model);
+                let response = under_lease(
+                    lease,
+                    LLM_CALL_TIMEOUT,
+                    "LLM call",
+                    prompt_extended(model, state.config.max_tokens_per_call, message),
+                )
                 .await?;
                 record_usage(&mut state.token_usage, &response.usage);
                 let evidence =
@@ -825,74 +827,53 @@ impl ResearchStepRunner {
     where
         T: JsonSchema + DeserializeOwned + Send + 'static,
     {
-        let model = &state.config.model;
+        let model = self.provider.completion_model(&state.config.model);
         let max_tokens = state.config.max_tokens_per_call;
-        let response = under_lease(lease, LLM_CALL_TIMEOUT, "LLM call", async {
-            match self.provider.as_ref() {
-                ProviderClient::OpenAi(client) => {
-                    prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
-                }
-                ProviderClient::Anthropic(client) => {
-                    prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
-                }
-                ProviderClient::Ollama(client) => {
-                    prompt_typed_extended::<_, T>(client, model, max_tokens, prompt).await
-                }
-            }
-        })
+        let response = under_lease(
+            lease,
+            LLM_CALL_TIMEOUT,
+            "LLM call",
+            prompt_typed_extended::<T>(model, max_tokens, prompt),
+        )
         .await?;
         record_usage(&mut state.token_usage, &response.usage);
         Ok(response.output)
     }
 }
 
-/// Build a Rig agent for `model` with the shared preamble and per-call
-/// token cap, then run `prompt` with extended details. The concrete agent
-/// type differs per provider, so this is generic over the client; the
-/// returned [`PromptResponse`] is provider-independent.
-async fn prompt_extended<C>(
-    client: &C,
-    model: &str,
-    max_tokens: Option<u64>,
-    prompt: impl Into<message::Message> + Send,
-) -> Result<PromptResponse, StepError>
-where
-    C: CompletionClient + AgentClientExt,
-    C::CompletionModel: 'static,
-{
-    let mut builder = client.agent(model).preamble(AGENT_PREAMBLE);
+/// A Rig agent on `model` with the shared preamble and per-call token cap.
+fn build_agent(model: DynModel<Completion>, max_tokens: Option<u64>) -> rig_agent::Agent {
+    let mut builder = AgentBuilder::new(model).preamble(AGENT_PREAMBLE);
     if let Some(max_tokens) = max_tokens {
         builder = builder.max_tokens(max_tokens);
     }
-    builder
-        .build()
+    builder.build()
+}
+
+/// Run `prompt` on a Rig agent for `model`.
+async fn prompt_extended(
+    model: DynModel<Completion>,
+    max_tokens: Option<u64>,
+    prompt: impl Into<message::Message>,
+) -> Result<PromptResponse, StepError> {
+    build_agent(model, max_tokens)
         .prompt(prompt)
-        .extended_details()
         .await
         .map_err(classify_rig_err)
 }
 
 /// Structured counterpart to [`prompt_extended`], running Rig's
 /// `prompt_typed` for the schema `T`.
-async fn prompt_typed_extended<C, T>(
-    client: &C,
-    model: &str,
+async fn prompt_typed_extended<T>(
+    model: DynModel<Completion>,
     max_tokens: Option<u64>,
     prompt: &str,
 ) -> Result<TypedPromptResponse<T>, StepError>
 where
-    C: CompletionClient + AgentClientExt,
-    C::CompletionModel: 'static,
     T: JsonSchema + DeserializeOwned + Send + 'static,
 {
-    let mut builder = client.agent(model).preamble(AGENT_PREAMBLE);
-    if let Some(max_tokens) = max_tokens {
-        builder = builder.max_tokens(max_tokens);
-    }
-    builder
-        .build()
+    build_agent(model, max_tokens)
         .prompt_typed::<T>(prompt)
-        .extended_details()
         .await
         .map_err(classify_structured_err)
 }
@@ -908,19 +889,22 @@ fn record_usage(total: &mut TokenUsage, call: &Usage) {
         reasoning = call.reasoning_tokens,
         "LLM call usage",
     );
-    total.input_tokens = total.input_tokens.saturating_add(call.input_tokens);
-    total.output_tokens = total.output_tokens.saturating_add(call.output_tokens);
-    total.total_tokens = total.total_tokens.saturating_add(call.total_tokens);
-    total.cached_input_tokens = total
-        .cached_input_tokens
-        .saturating_add(call.cached_input_tokens);
-    total.cache_creation_input_tokens = total
-        .cache_creation_input_tokens
-        .saturating_add(call.cache_creation_input_tokens);
-    total.tool_use_prompt_tokens = total
-        .tool_use_prompt_tokens
-        .saturating_add(call.tool_use_prompt_tokens);
-    total.reasoning_tokens = total.reasoning_tokens.saturating_add(call.reasoning_tokens);
+    let add = |sum: &mut u64, counter: Option<u64>| {
+        *sum = sum.saturating_add(counter.unwrap_or(0));
+    };
+    add(&mut total.input_tokens, call.input_tokens);
+    add(&mut total.output_tokens, call.output_tokens);
+    add(&mut total.total_tokens, call.total_tokens);
+    add(&mut total.cached_input_tokens, call.cached_input_tokens);
+    add(
+        &mut total.cache_creation_input_tokens,
+        call.cache_creation_input_tokens,
+    );
+    add(
+        &mut total.tool_use_prompt_tokens,
+        call.tool_use_prompt_tokens,
+    );
+    add(&mut total.reasoning_tokens, call.reasoning_tokens);
 }
 
 /// Extend `lease` to cover `bound`, then run `work` under a timeout
@@ -1158,7 +1142,7 @@ fn anthropic_citation_document_span(
 /// are mapped according to whether retrying would plausibly help.
 fn classify_structured_err(err: StructuredOutputError) -> StepError {
     match err {
-        StructuredOutputError::PromptError(inner) => classify_rig_err(*inner),
+        StructuredOutputError::PromptError(inner) => classify_rig_err(inner),
         StructuredOutputError::DeserializationError(e) => {
             StepError::permanent(format!("typed prompt: schema deserialize failed: {e}"))
         }
@@ -1174,9 +1158,8 @@ fn classify_structured_err(err: StructuredOutputError) -> StepError {
 mod tests {
     use super::*;
     use reqwest::StatusCode;
-    use rig_core::ProviderResponseError;
-    use rig_core::completion::CompletionError;
     use rig_core::http_client;
+    use rig_core::{ProviderError, ProviderResponseError};
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
     use taquba_workflow::{MemoStore, RunId, StepErrorKind};
@@ -1215,8 +1198,12 @@ mod tests {
         );
     }
 
-    fn http_status(code: u16) -> http_client::Error {
-        http_client::Error::InvalidStatusCode(StatusCode::from_u16(code).unwrap())
+    fn http_status(code: u16) -> ProviderError {
+        ProviderError::from_transport_error(http_client::Error::non_success_with_details(
+            StatusCode::from_u16(code).unwrap(),
+            Default::default(),
+            String::new(),
+        ))
     }
 
     #[tokio::test]
@@ -1357,19 +1344,19 @@ mod tests {
 
     #[test]
     fn classify_rig_err_http_401_is_permanent() {
-        let err = PromptError::CompletionError(CompletionError::HttpError(http_status(401)));
+        let err = PromptError::CompletionError(http_status(401));
         assert_permanent(&classify_rig_err(err));
     }
 
     #[test]
     fn classify_rig_err_http_429_is_transient() {
-        let err = PromptError::CompletionError(CompletionError::HttpError(http_status(429)));
+        let err = PromptError::CompletionError(http_status(429));
         assert_transient(&classify_rig_err(err));
     }
 
     #[test]
     fn classify_rig_err_provider_response_4xx_is_permanent() {
-        let err = PromptError::CompletionError(CompletionError::ProviderResponse(
+        let err = PromptError::CompletionError(ProviderError::ProviderResponse(
             ProviderResponseError::new(StatusCode::BAD_REQUEST, "invalid request"),
         ));
         assert_permanent(&classify_rig_err(err));
@@ -1377,7 +1364,7 @@ mod tests {
 
     #[test]
     fn classify_rig_err_provider_response_2xx_envelope_is_transient() {
-        let err = PromptError::CompletionError(CompletionError::ProviderResponse(
+        let err = PromptError::CompletionError(ProviderError::ProviderResponse(
             ProviderResponseError::new(StatusCode::OK, "{\"error\":{\"message\":\"overloaded\"}}"),
         ));
         assert_transient(&classify_rig_err(err));
@@ -1389,7 +1376,7 @@ mod tests {
             tool_name: "lookup".to_string(),
             available_tools: Vec::new(),
             allowed_tools: Vec::new(),
-            chat_history: Box::new(Vec::new()),
+            chat_history: Vec::new(),
         };
         assert_permanent(&classify_rig_err(err));
     }
@@ -1426,11 +1413,11 @@ mod tests {
     fn length_truncated_reads_the_final_completion_call() {
         assert!(!length_truncated(&[]));
 
-        let mut cut = CompletionCall::new(0, Usage::default());
+        let mut cut = CompletionCall::new(0, Usage::default(), serde_json::Value::Null);
         cut.finish_reason = Some(FinishReason::Length);
         assert!(length_truncated(&[cut.clone()]));
 
-        let complete = CompletionCall::new(1, Usage::default());
+        let complete = CompletionCall::new(1, Usage::default(), serde_json::Value::Null);
         assert!(!length_truncated(&[cut, complete]));
     }
 
@@ -1543,7 +1530,6 @@ mod tests {
     #[tokio::test]
     async fn run_index_entry_joins_submit_and_succeed_settlements() {
         use crate::store::run_entry_key;
-        use rig_core::client::ProviderClient as _;
         use taquba_workflow::{RunSpec, TerminalStatus, WorkflowRuntime};
 
         let object_store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -1569,7 +1555,7 @@ mod tests {
         state.phase = Phase::Writing;
 
         let runner = ResearchStepRunner::from_provider(
-            ProviderClient::Ollama(rig_core::providers::ollama::Client::from_env().unwrap()),
+            ProviderClient::Ollama(rig_core::providers::ollama::Ollama::from_env().unwrap()),
             Arc::new(NoSearch),
         )
         .with_report_store(object_store.clone(), &Path::default());

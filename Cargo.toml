@@ -34,8 +34,8 @@ features = ["aws"]
 [dependencies]
 taquba = "0.14"
 taquba-workflow = "0.13"
-rig-core = "0.42"
-rig-agent = "0.42"
+rig-core = { version = "0.43", features = ["reqwest"] }
+rig-agent = "0.43"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }

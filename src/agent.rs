@@ -227,19 +227,19 @@ pub struct ResearchAgentBuilder {
 
 impl ResearchAgentBuilder {
     /// Set the Rig OpenAI client.
-    pub fn openai(mut self, client: openai::Client) -> Self {
-        self.provider = Some(ProviderClient::OpenAi(client));
+    pub fn openai(mut self, client: openai::OpenAI) -> Self {
+        self.provider = Some(ProviderClient::OpenAi(Box::new(client)));
         self
     }
 
     /// Set the Rig Anthropic client.
-    pub fn anthropic(mut self, client: anthropic::Client) -> Self {
+    pub fn anthropic(mut self, client: anthropic::Anthropic) -> Self {
         self.provider = Some(ProviderClient::Anthropic(client));
         self
     }
 
     /// Set the Rig Ollama client, for local models.
-    pub fn ollama(mut self, client: ollama::Client) -> Self {
+    pub fn ollama(mut self, client: ollama::Ollama) -> Self {
         self.provider = Some(ProviderClient::Ollama(client));
         self
     }

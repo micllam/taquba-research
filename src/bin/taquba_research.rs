@@ -26,7 +26,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
-use rig_core::client::ProviderClient;
 use rig_core::providers::{anthropic, ollama, openai};
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
@@ -559,17 +558,17 @@ fn build_runner(cli: &Cli, sentinel: &CancelSentinel) -> Result<ResearchStepRunn
     let search: Arc<dyn SearchBackend> = Arc::new(tavily);
     let runner = match CliProvider::resolve(cli.provider) {
         CliProvider::OpenAi => {
-            let client = openai::Client::from_env().context("OPENAI_API_KEY missing or invalid")?;
+            let client = openai::OpenAI::from_env().context("OPENAI_API_KEY missing or invalid")?;
             ResearchStepRunner::new_openai(client, search)
         }
         CliProvider::Anthropic => {
             let client =
-                anthropic::Client::from_env().context("ANTHROPIC_API_KEY missing or invalid")?;
+                anthropic::Anthropic::from_env().context("ANTHROPIC_API_KEY missing or invalid")?;
             ResearchStepRunner::new_anthropic(client, search)
         }
         CliProvider::Ollama => {
             // No API key; defaults to localhost:11434 (OLLAMA_API_BASE_URL).
-            let client = ollama::Client::from_env().context("failed to build Ollama client")?;
+            let client = ollama::Ollama::from_env().context("failed to build Ollama client")?;
             ResearchStepRunner::new_ollama(client, search)
         }
     };

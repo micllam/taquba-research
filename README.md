@@ -131,7 +131,6 @@ carry over to any agent; the phase state machine here is research-specific.
 
 ```rust
 use std::sync::Arc;
-use rig_core::client::ProviderClient;
 use taquba::{Queue, object_store::local::LocalFileSystem};
 use taquba_research::{ResearchAgent, ResearchConfig, search::Tavily};
 
@@ -141,8 +140,8 @@ async fn main() -> anyhow::Result<()> {
     let queue = Arc::new(Queue::open(store.clone(), "research").await?);
 
     let agent = ResearchAgent::builder()
-        .openai(rig_core::providers::openai::Client::from_env()?)
-        // ...or .anthropic(rig_core::providers::anthropic::Client::from_env()?)
+        .openai(rig_core::providers::openai::OpenAI::from_env()?)
+        // ...or .anthropic(rig_core::providers::anthropic::Anthropic::from_env()?)
         //       and a matching model id, e.g. "claude-haiku-4-5"
         .search(Tavily::from_env()?)
         .config(ResearchConfig::new("gpt-5-nano"))
