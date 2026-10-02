@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-03
+
 ### Added
 - `TokenUsage::tool_use_prompt_tokens`, mirroring the field rig 0.40
   added to `Usage`. Decodes as zero from state persisted by earlier
