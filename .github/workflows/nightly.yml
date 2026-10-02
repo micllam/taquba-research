@@ -1,0 +1,43 @@
+name: Nightly
+
+# The inputs of these jobs change without a push: the advisory database and
+# the newest compatible version of each dependency.
+on:
+  schedule:
+    # 02:00 UTC.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit
+      # Vulnerabilities fail the job. Unmaintained and unsound crates are
+      # reported without failing it.
+      - run: cargo audit
+
+  # Tests the resolution a library consumer gets, which ignores the lockfile.
+  unlocked-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - name: Resolve every dependency to its newest compatible version
+        run: cargo update
+      - run: cargo test
