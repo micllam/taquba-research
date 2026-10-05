@@ -382,9 +382,9 @@ async fn resolve_store(flag: Option<&str>) -> Result<StoreCtx> {
 }
 
 /// The object store options among the environment variables `vars`: the
-/// variables of the three providers, with the name in lowercase as the option
-/// key. The prefixes exclude a variable of another program whose lowercase name
-/// is an option key, such as `TOKEN` or `ENDPOINT`.
+/// variables of the three providers, with the name in lower case as the option
+/// key. The prefixes exclude a variable of another program whose lower-case
+/// name is an option key, such as `TOKEN` or `ENDPOINT`.
 fn store_options(
     vars: impl Iterator<Item = (String, String)>,
 ) -> impl Iterator<Item = (String, String)> {

@@ -1852,7 +1852,8 @@ mod tests {
         let mut state = ResearchState::new("query", config);
         state.phase = Phase::Investigating;
 
-        // The runner lacks a job runner, so only the skip completes the step.
+        // The runner does not have a job runner, so only the skip completes the
+        // step.
         let wait = runner
             .run_investigating(&test_step("run", 4), &mut state)
             .await

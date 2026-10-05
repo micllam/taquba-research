@@ -304,7 +304,8 @@ mod tests {
             .unwrap();
         tokio::spawn(driver);
 
-        // Without the `CallKeys` hook, the journal lacks a key for the call.
+        // Without the `CallKeys` hook, the journal does not have a key for the
+        // call.
         let outcome = dispatcher
             .dispatch(
                 &key,

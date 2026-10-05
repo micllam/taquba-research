@@ -124,7 +124,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// Stable lowercase identifier used in CLI output.
+    /// Stable lower-case identifier used in CLI output.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Planning => "planning",

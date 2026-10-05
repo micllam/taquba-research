@@ -149,7 +149,7 @@ pub enum StoredStatus {
 }
 
 impl StoredStatus {
-    /// Stable lowercase identifier, matching the serde encoding.
+    /// Stable lower-case identifier, matching the serde encoding.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
@@ -202,8 +202,8 @@ pub enum RunDisplayStatus {
     /// A step dead-lettered outside the worker also reports pending, until the
     /// next worker terminates its run as failed.
     Queued,
-    /// The run is absent from the view and the entry lacks a terminal record:
-    /// the memo sweep removed the run's terminal record before a worker
+    /// The run is absent from the view and the entry does not have a terminal
+    /// record: the memo sweep removed the run's terminal record before a worker
     /// processed its notification, store corruption or a version mismatch.
     /// Collectable via the CLI's `gc --status unknown`.
     Unknown,
@@ -306,8 +306,8 @@ pub async fn get_run(reader: &QueueReader, run_id: &str) -> anyhow::Result<Optio
 }
 
 /// The step job of `run_id` among the jobs of the workflow queue in `status`,
-/// in the stored form of [`QueueView::list_jobs`]. `None` when the listing
-/// lacks a step job of the run. A terminal notification (reserved
+/// in the stored form of [`QueueView::list_jobs`]. `None` when the listing does
+/// not have a step job of the run. A terminal notification (reserved
 /// `workflow.terminal` header) is not a step job. The listing is a scan of
 /// every job in `status`, so a caller passes the status that
 /// [`WorkflowView::status`] reports for the run.
