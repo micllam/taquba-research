@@ -8,16 +8,15 @@
 //! - `status <RUN_ID>`: print a run's derived status and progress.
 //! - `show <RUN_ID> [--output ...]`: print or write the stored report.
 //! - `cancel <RUN_ID>`: cooperatively cancel an in-flight run.
-//! - `init`: verify the configured store is reachable (fail-fast cred /
-//!   bucket check before submitting an expensive run).
-//! - `gc [--older-than-days N] [--status S]... [--force]`: delete
-//!   terminal runs' index entries, sentinels and default-location
-//!   reports.
+//! - `init`: verify the configured store is reachable (a check of the
+//!   credentials and the bucket before a run submits model calls).
+//! - `gc [--older-than-days N] [--status S]... [--force]`: delete terminal
+//!   runs' index entries, sentinels and default-location reports.
 //!
-//! `list`, `status`, `show` and `cancel` read through a
-//! [`QueueReader`] and work from a second process against a live
-//! store. `resume` and `gc` need the exclusive writer; they refuse
-//! while claimed jobs are visible unless `--force` is passed.
+//! `list`, `status`, `show` and `cancel` read through a [`QueueReader`] and
+//! work from a second process against a live store. `resume` and `gc` need the
+//! exclusive writer and refuse while claimed jobs are visible unless `--force`
+//! is passed.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,14 +52,12 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 
 const QUEUE_DB_NAME: &str = "queue";
-/// How long workflow memo blobs are retained after the run reaches a
-/// terminal state. Matches the value used by the library's
-/// `ResearchAgent::run`; keep in sync.
+/// How long workflow memo blobs are retained after the run reaches a terminal
+/// state. It must equal the value of the library's `ResearchAgent::run`.
 const MEMO_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Lease duration for every queue in the store (workflow steps and
-/// fetch jobs). Set explicitly because it is the bound on detecting a
-/// dead or hung delivery; slow calls extend the lease through
-/// `LeaseHandle` to cover their own timeout, so it stays short.
+/// Lease duration for every queue in the store (workflow steps and fetch jobs).
+/// It bounds the detection of a dead or hung delivery. A slow call extends the
+/// lease through `LeaseHandle` by its own timeout.
 const LEASE_DURATION: Duration = Duration::from_secs(30);
 
 /// Provider choice surfaced through `--provider`.
@@ -73,7 +70,7 @@ enum CliProvider {
 }
 
 impl CliProvider {
-    /// Default model identifier when the user doesn't pass `--model`.
+    /// Default model identifier when the user does not pass `--model`.
     fn default_model(self) -> &'static str {
         match self {
             CliProvider::OpenAi => openai::completion::GPT_5_NANO,
@@ -83,10 +80,10 @@ impl CliProvider {
     }
 
     /// Resolve `--provider` against env vars. If the user passed
-    /// `--provider <p>` explicitly, that wins (the only way to select
-    /// `ollama`, since it has no API key to auto-detect). Otherwise: if
-    /// `ANTHROPIC_API_KEY` is set and `OPENAI_API_KEY` is not, pick
-    /// Anthropic; otherwise default to OpenAI.
+    /// `--provider <p>` explicitly, that wins (the only way to select `ollama`,
+    /// because it does not have an API key to auto-detect). Otherwise, if
+    /// `ANTHROPIC_API_KEY` is set and `OPENAI_API_KEY` is not, choose
+    /// Anthropic. In every other case, choose OpenAI.
     fn resolve(explicit: Option<CliProvider>) -> CliProvider {
         if let Some(p) = explicit {
             return p;
@@ -105,7 +102,7 @@ impl CliProvider {
     }
 }
 
-/// Durable research agent; single-binary CLI.
+/// Durable research agent, as a single-binary CLI.
 #[derive(Debug, Parser)]
 #[command(
     name = "taquba-research",
@@ -115,16 +112,15 @@ impl CliProvider {
     arg_required_else_help = false,
 )]
 struct Cli {
-    /// Positional query for the default "start a new run" mode. If both
-    /// this and a subcommand are given, the subcommand wins.
+    /// Positional query for the default "start a new run" mode. If both this
+    /// and a subcommand are given, the subcommand wins.
     query: Option<String>,
 
-    /// Write an additional copy of the final report on completion.
-    /// Accepts a local path or an object-storage URL
-    /// (`s3://bucket/key.md`, `gs://...`, etc.). The report is always
-    /// persisted as `<store>/reports/<run_id>.md` inside the
-    /// configured store, so an S3-backed deployment keeps the markdown
-    /// next to the queue and index.
+    /// Write an additional copy of the final report on completion. Accepts a
+    /// local path or an object-storage URL (`s3://bucket/key.md`, `gs://...`
+    /// and the other store schemes). The report is always persisted as
+    /// `<store>/reports/<run_id>.md` inside the configured store, so an
+    /// S3-backed deployment keeps the markdown next to the queue and index.
     #[arg(long, value_parser = validate_store_arg)]
     output: Option<String>,
 
@@ -136,29 +132,28 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     max_sources: usize,
 
-    /// LLM provider (`openai`, `anthropic`, or `ollama`). If unset, the
-    /// CLI picks one based on which `*_API_KEY` env var is set:
-    /// `ANTHROPIC_API_KEY` alone selects `anthropic`; otherwise `openai`
-    /// is used. `ollama` (local models) is never auto-selected: pass
+    /// LLM provider (`openai`, `anthropic` or `ollama`). If unset, the CLI
+    /// chooses one based on which `*_API_KEY` env var is set:
+    /// `ANTHROPIC_API_KEY` alone selects `anthropic`, and every other case
+    /// selects `openai`. `ollama` (local models) is never auto-selected: pass
     /// `--provider ollama` explicitly.
     #[arg(long, value_enum)]
     provider: Option<CliProvider>,
 
-    /// Specific model identifier passed to the provider. If unset,
-    /// the CLI picks a provider-appropriate default
-    /// (`gpt-5-nano` for OpenAI, `claude-haiku-4-5` for Anthropic,
-    /// `llama3.2` for Ollama).
+    /// Specific model identifier passed to the provider. If unset, the CLI
+    /// chooses a provider-appropriate default (`gpt-5-nano` for OpenAI,
+    /// `claude-haiku-4-5` for Anthropic, `llama3.2` for Ollama).
     #[arg(long)]
     model: Option<String>,
 
-    /// Search backend: only `tavily` is wired in v0.1.
+    /// Search backend. The CLI supports only `tavily`.
     #[arg(long, default_value = "tavily")]
     search: String,
 
-    /// Store location. Accepts either a local path or an object-storage
-    /// URL (`s3://bucket/prefix`, `gs://...`, `az://...`, `file:///...`).
-    /// Cloud URLs require the matching cargo feature
-    /// (`--features aws`/`gcp`/`azure`). Defaults to `~/.taquba-research/`.
+    /// Store location. Accepts either a local path or an object-storage URL
+    /// (`s3://bucket/prefix`, `gs://...`, `az://...`, `file:///...`). Cloud
+    /// URLs require the cargo feature of their provider (`aws`, `gcp` or
+    /// `azure`). Defaults to `~/.taquba-research/`.
     #[arg(long, value_parser = validate_store_arg)]
     store: Option<String>,
 
@@ -176,9 +171,9 @@ enum Command {
     Resume {
         /// Run identifier to resume.
         run_id: String,
-        /// Proceed even when claimed jobs are visible in the store.
-        /// Opening the writer fences a live worker and requeues its
-        /// claimed jobs; pass this only when no worker is running.
+        /// Proceed even when claimed jobs are visible in the store. Opening the
+        /// writer fences a live worker and requeues its claimed jobs. Pass this
+        /// only when no worker is running.
         #[arg(long)]
         force: bool,
     },
@@ -189,12 +184,12 @@ enum Command {
         /// Run identifier.
         run_id: String,
     },
-    /// Print the rendered report for a finished run, or write it to a path / URL.
+    /// Print the report of a finished run, or write it to a path or URL.
     Show {
         /// Run identifier.
         run_id: String,
-        /// Optional destination. Same syntax as `run --output`. When
-        /// omitted, the report is printed to stdout.
+        /// Optional destination. Same syntax as `run --output`. When omitted,
+        /// the report is printed to stdout.
         #[arg(long, value_parser = validate_store_arg)]
         output: Option<String>,
     },
@@ -203,15 +198,14 @@ enum Command {
         /// Run identifier.
         run_id: String,
     },
-    /// Verify the configured store is reachable. Useful before running
-    /// an expensive query to catch typos, missing creds, or unreachable
-    /// buckets.
+    /// Verify the configured store is reachable. Run it before a query to catch
+    /// typos, missing credentials or unreachable buckets.
     Init,
-    /// Delete terminal runs' index entries, cancellation sentinels
-    /// and default-location reports. Use `--dry-run` to preview.
+    /// Delete terminal runs' index entries, cancellation sentinels and
+    /// default-location reports. Use `--dry-run` to preview.
     Gc {
-        /// Delete only runs whose `submitted_at` is at least this many
-        /// days in the past.
+        /// Delete only runs whose `submitted_at` is at least this many days in
+        /// the past.
         #[arg(long)]
         older_than_days: Option<i64>,
         /// Restrict deletion to specific statuses (repeatable). Allowed:
@@ -221,9 +215,9 @@ enum Command {
         /// terminal record are never deleted: their state is in the queue.
         #[arg(long = "status", value_parser = parse_gc_status)]
         statuses: Vec<GcStatus>,
-        /// Proceed even when claimed jobs are visible in the store.
-        /// Opening the writer fences a live worker and requeues its
-        /// claimed jobs; pass this only when no worker is running.
+        /// Proceed even when claimed jobs are visible in the store. Opening the
+        /// writer fences a live worker and requeues its claimed jobs. Pass this
+        /// only when no worker is running.
         #[arg(long)]
         force: bool,
         /// List candidates without deleting anything.
@@ -253,16 +247,14 @@ fn parse_gc_status(s: &str) -> std::result::Result<GcStatus, String> {
     }
 }
 
-/// Resolved store handle: the shared `ObjectStore` and the key prefix
-/// within it under which queue / runs / reports all live.
+/// Resolved store handle: the shared `ObjectStore` and the key prefix within it
+/// under which queue / runs / reports all live.
 #[derive(Clone)]
 struct StoreCtx {
     object_store: Arc<dyn ObjectStore>,
     prefix: ObjectPath,
-    /// User-visible source string for the store (the raw path or URL),
-    /// used in CLI messages so the user knows which bucket they're
-    /// looking at without us having to reconstruct a URL from
-    /// `Arc<dyn ObjectStore>`.
+    /// User-visible source string for the store (the raw path or URL), which
+    /// CLI messages print to identify the store.
     source: String,
 }
 
@@ -327,10 +319,10 @@ fn init_tracing(quiet: bool) {
 /// Resolve `--store` (or `TAQUBA_RESEARCH_STORE`, or the default) into a
 /// concrete [`StoreCtx`]. Accepts:
 ///
-/// - object-storage URLs: `s3://bucket/prefix`, `gs://bucket/prefix`,
-///   `az://container/prefix`, `file:///abs/path` (cloud schemes require
-///   the matching cargo feature);
-/// - bare paths: treated as a local directory, created if missing.
+/// - Object-storage URLs: `s3://bucket/prefix`, `gs://bucket/prefix`,
+///   `az://container/prefix`, `file:///abs/path` (cloud schemes require the
+///   matching cargo feature).
+/// - Bare paths: treated as a local directory, created if missing.
 async fn resolve_store(flag: Option<&str>) -> Result<StoreCtx> {
     let raw = match flag {
         Some(s) => s.to_string(),
@@ -342,8 +334,8 @@ async fn resolve_store(flag: Option<&str>) -> Result<StoreCtx> {
         }),
     };
 
-    // URL form? `scheme://...` (any of the cloud schemes), `file://`, or
-    // an opaque scheme parse_url knows about.
+    // The URL form: `scheme://...` (any of the cloud schemes), `file://` or an
+    // opaque scheme that parse_url knows.
     if looks_like_url(&raw) {
         let url = Url::parse(&raw).with_context(|| format!("parsing --store as URL: {raw}"))?;
         let (store, path) = parse_url_opts(&url, store_options(std::env::vars()))
@@ -355,10 +347,10 @@ async fn resolve_store(flag: Option<&str>) -> Result<StoreCtx> {
         });
     }
 
-    // Bare path: ensure the directory exists, then wrap in LocalFileSystem
-    // with that directory as the LocalFileSystem prefix. The key prefix
-    // inside the store is the empty path; SlateDB / RunStore / reports
-    // all live directly under it.
+    // Bare path: create the directory if missing, then wrap it in
+    // LocalFileSystem with that directory as the LocalFileSystem prefix. The
+    // key prefix inside the store is the empty path, and SlateDB, the run store
+    // and the reports all live directly under it.
     let dir = PathBuf::from(&raw);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -389,15 +381,15 @@ fn store_options(
 }
 
 fn looks_like_url(s: &str) -> bool {
-    // A scheme has to start with a letter and contain `://`.
+    // A scheme starts with a letter, and the URL contains `://`.
     s.contains("://") && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
 }
 
 /// Clap value parser for `--store` / `--output`. Bare paths pass through
-/// untouched; URL forms are checked for parseability and a known scheme
-/// so typos like `S3://...` or `aws://...` are caught at arg-parse time
-/// rather than mid-flow. The real connectivity check (creds, bucket
-/// exists) is what `taquba-research init` is for.
+/// untouched. A URL form must parse and have a known scheme, so the parser
+/// rejects a typo such as `S3://...` or `aws://...` at argument parsing.
+/// `taquba-research init` checks the connectivity (the credentials and the
+/// existence of the bucket).
 fn validate_store_arg(s: &str) -> std::result::Result<String, String> {
     if !looks_like_url(s) {
         return Ok(s.to_string());
@@ -429,9 +421,9 @@ async fn open_queue(ctx: &StoreCtx) -> Result<Arc<Queue>> {
     Ok(Arc::new(queue))
 }
 
-/// Whether a queue has ever been created in this store. A
-/// [`QueueReader`] cannot open a store without a manifest, so the
-/// inspection commands map that case to "no runs".
+/// Whether a queue has ever been created in this store. A [`QueueReader`]
+/// cannot open a store without a manifest, so the inspection commands map that
+/// case to "no runs".
 async fn queue_exists(ctx: &StoreCtx) -> Result<bool> {
     use futures_util::TryStreamExt;
     let prefix = ctx.prefix.clone().join(QUEUE_DB_NAME);
@@ -443,8 +435,8 @@ async fn queue_exists(ctx: &StoreCtx) -> Result<bool> {
         .is_some())
 }
 
-/// Open a read-only view of the queue store. `FollowLatest` performs
-/// no object-store writes, so read-only credentials suffice.
+/// Open a read-only view of the queue store. `FollowLatest` does not perform
+/// object-store writes, so read-only credentials suffice.
 async fn open_reader(ctx: &StoreCtx) -> Result<QueueReader> {
     QueueReader::open_with_options(
         ctx.object_store.clone(),
@@ -455,10 +447,9 @@ async fn open_reader(ctx: &StoreCtx) -> Result<QueueReader> {
     .context("opening queue reader")
 }
 
-/// Run `op` against a read-only view of the queue store, retrying
-/// once on failure. A `FollowLatest` read can fail on an object
-/// collected under its view; the retry opens a fresh reader whose
-/// view postdates the collection.
+/// Run `op` against a read-only view of the queue store, retrying once on
+/// failure. A `FollowLatest` read can fail on an object collected under its
+/// view. The retry opens a fresh reader whose view postdates the collection.
 async fn with_reader<T>(ctx: &StoreCtx, op: impl AsyncFn(&QueueReader) -> Result<T>) -> Result<T> {
     let reader = open_reader(ctx).await?;
     let first = op(&reader).await;
@@ -504,11 +495,11 @@ fn step_job_listings(state: &RunState) -> &'static [JobStatus] {
     }
 }
 
-/// Number of claimed jobs visible through `reader`, across both
-/// queues. Guards an exclusive writer open: opening the writer fences
-/// a live worker and requeues its claimed jobs. Best-effort in both
-/// directions: a reader cannot distinguish a live claim from an
-/// abandoned one, and reader lag can hide a recent claim.
+/// Number of claimed jobs visible through `reader`, across both queues. Guards
+/// an exclusive writer open: opening the writer fences a live worker and
+/// requeues its claimed jobs. Best-effort in both directions: a reader cannot
+/// distinguish a live claim from an abandoned one, and reader lag can hide a
+/// recent claim.
 async fn count_claimed_jobs(reader: &QueueReader) -> Result<usize> {
     let mut claimed = 0usize;
     for queue in [WORKFLOW_QUEUE_NAME, FETCH_QUEUE_NAME] {
@@ -522,10 +513,7 @@ async fn count_claimed_jobs(reader: &QueueReader) -> Result<usize> {
     Ok(claimed)
 }
 
-/// Resolve where the final report should land. Returns `None` for the
-/// default (write to the unified store under `<store>/reports/<id>.md`).
-/// Returns `Some(Local)` for a local filesystem path and
-/// `Some(Remote)` for a URL pointing into an object store.
+/// Destination of the final report, resolved from `--output`.
 enum OutputTarget {
     /// Write into the run's unified `StoreCtx` at `reports/<run_id>.md`.
     DefaultInStore,
@@ -594,7 +582,7 @@ async fn write_report(
 fn build_runner(cli: &Cli, sentinel: &CancelSentinel) -> Result<ResearchStepRunner> {
     if cli.search != "tavily" {
         bail!(
-            "search backend `{}` is not wired in v0.1 (only `tavily` is); see --help",
+            "unsupported search backend `{}`: the CLI supports only `tavily`",
             cli.search
         );
     }
@@ -611,7 +599,8 @@ fn build_runner(cli: &Cli, sentinel: &CancelSentinel) -> Result<ResearchStepRunn
             ResearchStepRunner::new_anthropic(client, search)
         }
         CliProvider::Ollama => {
-            // No API key; defaults to localhost:11434 (OLLAMA_API_BASE_URL).
+            // Without an API key. The default is localhost:11434
+            // (OLLAMA_API_BASE_URL).
             let client = ollama::Ollama::from_env().context("failed to build Ollama client")?;
             ResearchStepRunner::new_ollama(client, search)
         }
@@ -632,13 +621,11 @@ fn build_config(cli: &Cli) -> ResearchConfig {
     }
 }
 
-/// Build a [`WorkflowRuntime`] with our standard config (one claimer,
-/// a `TerminalReconciler`-wrapped `CaptureHook` for the terminal
-/// channel) and spawn its worker task.
-/// The worker exits on either Ctrl+C or a terminal-hook signal sent via
-/// [`WorkerHandles::shutdown_tx`]; the Ctrl+C branch prints an
-/// immediate "Interrupting..." acknowledgement so the user doesn't
-/// experience a silent ~10-30s drain.
+/// Build a [`WorkflowRuntime`] with one claimer and a `CaptureHook` wrapped in
+/// a `TerminalReconciler` for the terminal channel, and spawn its worker task.
+/// The worker exits on Ctrl+C or on a terminal-hook signal sent through
+/// [`WorkerHandles::shutdown_tx`]. The Ctrl+C branch prints an
+/// "Interrupting..." acknowledgement before the drain of the current step.
 fn spawn_runtime(
     store_ctx: &StoreCtx,
     queue: Arc<Queue>,
@@ -663,8 +650,7 @@ fn spawn_runtime(
         .with_queue(queue.clone())
         .with_report_store(store_ctx.object_store.clone(), &store_ctx.prefix);
 
-    // Sequential workflow: one claimer is enough. See agent.rs for
-    // context.
+    // Sequential workflow: one claimer is enough. See agent.rs for context.
     let runtime = WorkflowRuntime::builder(queue, store_ctx.object_store.clone(), runner, hook)
         .queue_name(WORKFLOW_QUEUE_NAME)
         .memo_prefix(WORKFLOW_MEMO_PREFIX)
@@ -677,10 +663,8 @@ fn spawn_runtime(
     let worker = tokio::spawn(async move {
         worker_runtime
             .run(async move {
-                // Exit on EITHER Ctrl+C OR a terminal-hook signal from
-                // `finalize`. Without the second branch the worker
-                // would never return after a successful run, leaving
-                // the CLI hung until the user hits Ctrl+C.
+                // Exit on Ctrl+C or on the shutdown signal that `finalize`
+                // sends after a terminal outcome.
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
                         eprintln!();
@@ -724,9 +708,8 @@ async fn cmd_run(
         );
     }
 
-    // The run id is generated before submit so the index entry's KV
-    // key can join the submit transaction: the run and its entry
-    // commit together.
+    // The run id is generated before submit so the index entry's KV key can
+    // join the submit transaction: the run and its entry commit together.
     let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
     let (runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id)?;
 
@@ -765,9 +748,9 @@ async fn cmd_resume(
     let run_id: RunId = run_id
         .parse()
         .with_context(|| format!("invalid run id `{run_id}`"))?;
-    // Guard against resuming a finished, dead-lettered or unknown run
-    // before the (exclusive) writer open. A reader-side check
-    // suffices: the worker acts on the same entry and step job.
+    // Guard against resuming a finished, dead-lettered or unknown run before
+    // the (exclusive) writer open. A reader-side check suffices: the worker
+    // acts on the same entry and step job.
     {
         if !queue_exists(store_ctx).await? {
             bail!("no run index entry for {run_id} (store contains no runs)");
@@ -827,37 +810,35 @@ async fn cmd_resume(
     let runner = build_runner(cli, sentinel)?;
     let queue = open_queue(store_ctx).await?;
 
-    // The runtime is discarded: cmd_resume submits no new work; it
-    // starts a worker to process the existing pending step.
+    // The runtime is discarded: cmd_resume does not submit new work. It starts
+    // a worker to process the existing pending step.
     let (_runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id)?;
 
     println!("Resuming {run_id}...");
 
-    // The run's step jobs already exist in the queue; the terminal
-    // hook fires when the run reaches a terminal step.
+    // The run's step jobs already exist in the queue. The terminal hook fires
+    // when the run reaches a terminal step.
     finalize(cli, store_ctx, handles, &run_id).await
 }
 
-/// Handles tied to a running `WorkflowRuntime` worker task and its
-/// paired fetch-job `JobRunner`.
+/// Handles tied to a running `WorkflowRuntime` worker task and its paired
+/// fetch-job `JobRunner`.
 struct WorkerHandles {
     /// Terminal-hook signal.
     rx: oneshot::Receiver<RunOutcome>,
     /// Spawned workflow worker task.
     worker: tokio::task::JoinHandle<taquba_workflow::Result<()>>,
-    /// Sends a clean-shutdown signal so the workflow worker stops
-    /// polling once the run is done (without waiting for Ctrl+C).
+    /// Sends a clean-shutdown signal so the workflow worker stops polling once
+    /// the run is done (without waiting for Ctrl+C).
     shutdown_tx: oneshot::Sender<()>,
-    /// Handle to the fetch JobRunner's worker task. Shutdown only
-    /// after the workflow worker has drained (any in-flight
-    /// FetchPage was awaited by the workflow step that submitted it),
-    /// so there's no work left at that point.
+    /// Handle to the fetch JobRunner's worker task. It must shut down only
+    /// after the workflow worker drains. The workflow step that submits a
+    /// FetchPage awaits it, so no fetch work remains then.
     job_handle: RunnerHandle,
 }
 
-/// Flatten a worker task's join result: a panic or abort
-/// (`JoinError`) and a [`WorkflowRuntime::run`] error are both
-/// returned as the error.
+/// Flatten a worker task's join result: a panic or abort (`JoinError`) and a
+/// [`WorkflowRuntime::run`] error are both returned as the error.
 fn flatten_worker_exit(
     joined: std::result::Result<taquba_workflow::Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
@@ -870,9 +851,9 @@ async fn finalize(
     handles: WorkerHandles,
     run_id: &str,
 ) -> Result<()> {
-    // Either the terminal hook fires (run reached a terminal step) or
-    // the worker exited (Ctrl+C or a worker error). Whichever happens
-    // first determines the exit message.
+    // Either the terminal hook fires (run reached a terminal step) or the
+    // worker exited (Ctrl+C or a worker error). Whichever happens first
+    // determines the exit message.
     let WorkerHandles {
         mut rx,
         mut worker,
@@ -881,10 +862,9 @@ async fn finalize(
     } = handles;
     let result = tokio::select! {
         out = &mut rx => {
-            // Run reached a terminal step. Tell the worker to stop so it
-            // doesn't keep polling the queue, then await its clean exit
-            // before writing the report. The outcome is already
-            // committed, so an exit error is logged only.
+            // Run reached a terminal step. Tell the worker to stop polling the
+            // queue, then await its clean exit before writing the report. The
+            // outcome is already committed, so an exit error is logged only.
             let _ = shutdown_tx.send(());
             if let Err(e) = flatten_worker_exit((&mut worker).await) {
                 tracing::warn!(error = %e, "worker exit error after the terminal outcome");
@@ -892,9 +872,9 @@ async fn finalize(
             handle_terminal(cli, store_ctx, run_id, out.ok()).await
         }
         joined = &mut worker => {
-            // Worker exited without a terminal signal. The pending
-            // step job keeps the run resumable; no index write is
-            // needed. Drop shutdown_tx; the receiver is dropped.
+            // Worker exited without a terminal signal. The pending step job
+            // keeps the run resumable, without an index write. Drop
+            // shutdown_tx, whose receiver is dropped.
             drop(shutdown_tx);
             match flatten_worker_exit(joined) {
                 // Clean exit: the worker's Ctrl+C branch resolved.
@@ -908,8 +888,8 @@ async fn finalize(
             }
         }
     };
-    // Workflow worker has stopped (terminal or Ctrl+C). Drain the
-    // fetch JobRunner so its task exits before this fn returns.
+    // The workflow worker stopped (terminal or Ctrl+C). Drain the fetch
+    // JobRunner so its task exits before this fn returns.
     let _ = job_handle.shutdown().await;
     result
 }
@@ -932,7 +912,7 @@ async fn handle_terminal(
                 .ok_or_else(|| anyhow!("succeeded run has no report"))?;
 
             // The Writing step already wrote the canonical copy under
-            // `reports/`; `--output` adds a copy elsewhere.
+            // `reports/`, and `--output` adds a copy elsewhere.
             let stored = format!(
                 "{} (in configured store)",
                 store::report_path(&store_ctx.prefix, run_id)
@@ -960,7 +940,7 @@ async fn handle_terminal(
             std::process::exit(1);
         }
         TerminalStatus::Cancelled => {
-            // User-initiated stop. Not an error; exit 0.
+            // User-initiated stop, which exits 0.
             let reason = outcome.error.as_deref().unwrap_or("(no reason supplied)");
             eprintln!("⊘ Run {run_id} cancelled: {reason}");
         }
@@ -975,8 +955,8 @@ fn print_interrupted(run_id: &str) {
     );
 }
 
-/// Truncate `s` to at most `max` characters, replacing the removed
-/// tail with `...`. The cut is on a character boundary.
+/// Truncate `s` to at most `max` characters, replacing the removed tail with
+/// `...`. The cut is on a character boundary.
 fn ellipsize(s: &str, max: usize) -> String {
     if s.char_indices().nth(max).is_none() {
         return s.to_string();
@@ -1164,13 +1144,12 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
 }
 
 async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) -> Result<()> {
-    // The canonical report blob is written by the terminal path in
-    // every case; its absence means the run is unknown, unfinished or
-    // did not succeed. The index entry is consulted only for a more
-    // specific error message.
+    // The canonical report blob is written by the terminal path in every case,
+    // and its absence means the run is unknown, unfinished or did not succeed.
+    // The index entry is consulted only for a more specific error message.
     let key = store::report_path(&store_ctx.prefix, &run_id);
-    // The body read shares the get's error handling: either call can
-    // return NotFound depending on the backend.
+    // The body read shares the get's error handling: either call can return
+    // NotFound depending on the backend.
     let read = match store_ctx.object_store.get(&key).await {
         Ok(resp) => resp.bytes().await,
         Err(e) => Err(e),
@@ -1203,8 +1182,8 @@ async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) ->
             print!("{markdown}");
         }
         Some(raw) => {
-            // `show --output` always writes to a concrete destination;
-            // the store already holds the canonical copy.
+            // `show --output` always writes to a concrete destination. The
+            // store already contains the canonical copy.
             let target = resolve_output(Some(raw))?;
             let where_ = write_report(&target, store_ctx, &run_id, &markdown).await?;
             println!("✓ Report written to {where_}");
@@ -1253,9 +1232,9 @@ async fn cmd_init(store_ctx: &StoreCtx) -> Result<()> {
     use futures_util::TryStreamExt;
     println!("Probing store: {}", store_ctx.source);
 
-    // Pulling one entry off a `list` is the cheapest cross-backend
-    // check: it round-trips credentials and bucket existence without
-    // mutating anything, and an empty store returns `None` cleanly.
+    // The first entry of a `list` checks the credentials and the existence of
+    // the bucket on every backend without a write, and an empty store returns
+    // `None`.
     let mut stream = store_ctx.object_store.list(Some(&store_ctx.prefix));
     let has_any = stream
         .try_next()
@@ -1351,8 +1330,8 @@ async fn cmd_gc(
         return Ok(());
     }
 
-    // Reader-side guard before taking the exclusive writer; the
-    // caveats are on `count_claimed_jobs`.
+    // Reader-side guard before taking the exclusive writer. The caveats are on
+    // `count_claimed_jobs`.
     if claimed > 0 && !force {
         bail!(
             "claimed jobs are visible in this store; a worker may be live. \
@@ -1360,7 +1339,7 @@ async fn cmd_gc(
         );
     }
 
-    // KV deletes need the writer; the guard above ran first.
+    // KV deletes need the writer, which opens after the claimed-jobs guard.
     let queue = open_queue(store_ctx).await?;
     let mut deleted = 0usize;
     let mut errors = 0usize;
@@ -1374,8 +1353,8 @@ async fn cmd_gc(
             tracing::warn!(run_id = %e.run_id, error = %err, "gc sentinel delete failed");
             row_failed = true;
         }
-        // Default-location report. Custom `--output` destinations are
-        // not tracked and are not deleted.
+        // Default-location report. Custom `--output` destinations are not
+        // tracked and are not deleted.
         let report = store::report_path(&store_ctx.prefix, &e.run_id);
         match store_ctx.object_store.delete(&report).await {
             Ok(_) | Err(taquba::object_store::Error::NotFound { .. }) => {}
@@ -1395,8 +1374,8 @@ async fn cmd_gc(
 }
 
 struct CaptureHook {
-    /// Run this invocation submitted or resumed. Notifications for any
-    /// other run are stale; see `on_termination`.
+    /// Run this invocation submitted or resumed. Notifications for any other
+    /// run are stale (see `on_termination`).
     run_id: RunId,
     tx: Mutex<Option<oneshot::Sender<RunOutcome>>>,
 }
@@ -1407,12 +1386,11 @@ impl TerminalHook for CaptureHook {
         outcome: &RunOutcome,
         _effects: &TerminalEffects,
     ) -> std::result::Result<(), StepError> {
-        // Terminal notifications are durable jobs: one left unclaimed
-        // by a terminated process is delivered to the next worker on
-        // the queue. Consuming a foreign notification here would
-        // misattribute the outcome, so it is acked and logged; its
-        // run's terminal index entry is staged by the step settlement
-        // or by the wrapping `TerminalReconciler`.
+        // Terminal notifications are durable jobs: one left unclaimed by a
+        // terminated process is delivered to the next worker on the queue. The
+        // hook acks and logs a foreign notification without consuming its
+        // outcome. The step settlement or the wrapping `TerminalReconciler`
+        // stages that run's terminal index entry.
         if outcome.run_id != self.run_id {
             tracing::warn!(
                 run_id = %outcome.run_id,
@@ -1421,9 +1399,9 @@ impl TerminalHook for CaptureHook {
             );
             return Ok(());
         }
-        // Take the sender out of the mutex before sending so the lock
-        // guard is not held across `tx.send`. A redelivered
-        // notification finds no sender and is a no-op.
+        // Take the sender out of the mutex before sending so the lock guard is
+        // not held across `tx.send`. A redelivered notification does not find a
+        // sender and is a no-op.
         let tx = self.tx.lock().await.take();
         if let Some(tx) = tx {
             let _ = tx.send(outcome.clone());

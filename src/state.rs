@@ -1,7 +1,7 @@
 //! Per-run state that lives inside the step payload between transitions.
 //!
-//! The runner is stateless across calls; everything it needs to advance
-//! the next step is serialized into [`ResearchState`] and returned via
+//! The runner is stateless across calls. Every value that the next step reads
+//! is serialized into [`ResearchState`] and returned via
 //! [`taquba_workflow::StepOutcome::Continue`].
 
 use std::collections::{BTreeMap, VecDeque};
@@ -14,36 +14,36 @@ use crate::report::Citation;
 use crate::search::SearchResult;
 
 /// Configuration the user passes to a research run. Build with
-/// [`ResearchConfig::new`], passing the provider-specific model
-/// identifier explicitly; the other fields take their defaults from
-/// `new` and can be overridden field by field.
+/// [`ResearchConfig::new`], passing the provider-specific model identifier
+/// explicitly. The other fields take their defaults from `new` and can be
+/// overridden field by field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchConfig {
-    /// Number of sub-questions the planning step should decompose the
-    /// query into. The planner is free to return fewer if the query
-    /// doesn't warrant `depth` distinct sub-questions.
+    /// Number of sub-questions the planning step decomposes the query into. The
+    /// planner can return fewer when the query does not warrant `depth`
+    /// distinct sub-questions.
     pub depth: usize,
-    /// Hard cap on URLs queued for fetching. Search results beyond this
-    /// cap are dropped before the fetch phase starts.
+    /// Hard cap on URLs queued for fetching. Search results beyond this cap are
+    /// dropped before the fetch phase starts.
     pub max_sources: usize,
-    /// Model identifier passed to Rig. Provider-specific: e.g.
-    /// `"gpt-5-nano"` for OpenAI, `"claude-haiku-4-5"` for Anthropic.
-    /// Must be a valid identifier for whichever provider the runner
-    /// was built against (see [`crate::ResearchStepRunner::new_openai`]
-    /// / [`crate::ResearchStepRunner::new_anthropic`]).
+    /// Model identifier passed to Rig. Provider-specific, such as
+    /// `"gpt-5-nano"` for OpenAI or `"claude-haiku-4-5"` for Anthropic. Must be
+    /// a valid identifier for whichever provider the runner was built against
+    /// (see [`crate::ResearchStepRunner::new_openai`] /
+    /// [`crate::ResearchStepRunner::new_anthropic`]).
     pub model: String,
-    /// Maximum tokens per single LLM call. When `None`, no explicit
-    /// limit is sent and the provider's or model's default applies.
+    /// Maximum tokens per single LLM call. When `None`, no explicit limit is
+    /// sent and the provider's or model's default applies.
     pub max_tokens_per_call: Option<u64>,
-    /// Per-page text limit fed to the summarization step (UTF-8 chars).
-    /// Larger pages are truncated.
+    /// Per-page text limit fed to the summarising step (UTF-8 chars). Larger
+    /// pages are truncated.
     pub max_page_chars: usize,
 }
 
 impl ResearchConfig {
-    /// Build a `ResearchConfig` with the given model identifier and
-    /// the standard defaults for every other field. The model string
-    /// must match the provider you'll construct the runner against.
+    /// Build a `ResearchConfig` with the given model identifier and the
+    /// standard defaults for every other field. The model string must match the
+    /// provider of the runner.
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             depth: 6,
@@ -55,11 +55,10 @@ impl ResearchConfig {
     }
 }
 
-/// Aggregate token usage across every LLM call in a run. Mirrors the
-/// fields of `rig_core::completion::Usage` but lives in this crate
-/// so the on-disk JSON layout of the persisted run state doesn't
-/// depend on Rig's struct definition. All zeros means either "no
-/// calls yet" or "the provider didn't report usage."
+/// Aggregate token usage across every LLM call in a run. Mirrors the fields of
+/// `rig_core::completion::Usage`, and the on-disk JSON layout of the persisted
+/// run state does not depend on Rig's struct definition. All zeros means either
+/// "no calls yet" or "the provider did not report usage."
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsage {
     /// Sum of input ("prompt") tokens reported across all calls, cache reads
@@ -74,27 +73,26 @@ pub struct TokenUsage {
     pub cached_input_tokens: u64,
     /// Input tokens written into a provider-managed prompt cache.
     pub cache_creation_input_tokens: u64,
-    /// Input tokens consumed by provider tool-use prompts. Zero for
-    /// this crate's tool-less agents.
+    /// Input tokens consumed by provider tool-use prompts. Zero for this
+    /// crate's tool-less agents.
     #[serde(default)]
     pub tool_use_prompt_tokens: u64,
-    /// Tokens consumed by internal reasoning / "thinking" by
-    /// reasoning-capable models.
+    /// Tokens consumed by internal reasoning / "thinking" by reasoning-capable
+    /// models.
     pub reasoning_tokens: u64,
 }
 
 impl TokenUsage {
-    /// `true` when all fields are zero. Means either no LLM calls
-    /// have been recorded yet or the provider didn't report usage
-    /// for any of them.
+    /// `true` when all fields are zero: either no LLM call is recorded yet or
+    /// the provider did not report usage for any of them.
     pub fn is_zero(&self) -> bool {
         *self == Self::default()
     }
 }
 
-/// Lifecycle phase of a research run. Each step advances the state
-/// machine through these phases; some phases iterate (e.g. `Searching`
-/// pops one item off `search_queue` per step).
+/// Lifecycle phase of a research run. Each step advances the state machine
+/// through these phases. Some phases iterate: `Searching` pops one item off
+/// `search_queue` per step.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Phase {
     /// Decomposing the user query into sub-questions via the LLM.
@@ -103,7 +101,7 @@ pub enum Phase {
     Searching,
     /// Fetching each unique URL via HTTP.
     Fetching,
-    /// Summarizing each fetched page via the LLM.
+    /// Summarising each fetched page via the LLM.
     Summarizing,
     /// Combining per-page summaries into a single narrative via the LLM.
     Synthesizing,
@@ -131,18 +129,18 @@ impl std::fmt::Display for Phase {
     }
 }
 
-/// Progress snapshot of an in-flight run, decoded from a step job's
-/// payload by inspection commands.
+/// Progress snapshot of an in-flight run, decoded from a step job's payload by
+/// inspection commands.
 #[derive(Debug, Clone)]
 pub struct StateSummary {
     /// Phase the next (or current) step will run.
     pub phase: Phase,
-    /// Steps the runner has completed so far.
+    /// Steps the runner completed so far.
     pub steps_completed: u32,
 }
 
-/// Decode the progress-relevant fields of a step-job payload. Returns
-/// `None` when the payload is not a serialized research state.
+/// Decode the progress-relevant fields of a step-job payload. Returns `None`
+/// when the payload is not a serialized research state.
 pub fn summarize_state(payload: &[u8]) -> Option<StateSummary> {
     let state = ResearchState::from_bytes(payload).ok()?;
     Some(StateSummary {
@@ -151,20 +149,19 @@ pub fn summarize_state(payload: &[u8]) -> Option<StateSummary> {
     })
 }
 
-/// Per-page fetched text, plus the title we'll use in citations.
+/// Per-page fetched text, plus the title that citations use.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchedPage {
     /// Best-effort page title (from `<title>` or the original search result).
     pub title: String,
-    /// Extracted plain text, truncated to
-    /// [`ResearchConfig::max_page_chars`].
+    /// Extracted plain text, truncated to [`ResearchConfig::max_page_chars`].
     pub text: String,
 }
 
-/// Per-page summary produced by the summarization step.
+/// Per-page summary produced by the summarising step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Summary {
-    /// Title carried forward from the fetched page.
+    /// Title copied from the fetched page.
     pub title: String,
     /// One-paragraph summary keyed to the user's query.
     pub text: String,
@@ -172,9 +169,9 @@ pub struct Summary {
     pub relevance: f32,
 }
 
-/// A verbatim span quoted from a cited source, keyed to the [`Citation`]
-/// it backs. Only ever populated from provider-returned citation metadata
-/// (currently Anthropic document citations); empty otherwise.
+/// A verbatim span quoted from a cited source, keyed to the [`Citation`] it
+/// backs. Only ever populated from provider-returned citation metadata
+/// (currently Anthropic document citations), and empty otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SourceQuote {
     /// 1-based index of the [`Citation`] this quote supports.
@@ -183,9 +180,8 @@ pub(crate) struct SourceQuote {
     pub excerpt: String,
 }
 
-/// Product of the synthesizing step: the narrative, the numbered source
-/// list it references, and any provider-returned excerpts backing those
-/// references.
+/// Product of the synthesizing step: the narrative, the numbered source list it
+/// references, and any provider-returned excerpts backing those references.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SynthesisOutput {
     /// Synthesized narrative produced by the synthesizing step.
@@ -197,9 +193,9 @@ pub(crate) struct SynthesisOutput {
     pub evidence: Vec<SourceQuote>,
 }
 
-/// The entire bytes-in / bytes-out state the runner threads between
-/// steps. Serialized as JSON so a `taquba-research show` against a future
-/// version can still decode old runs.
+/// The entire bytes-in / bytes-out state the runner threads between steps.
+/// Serialized as JSON so a `taquba-research show` against a future version can
+/// still decode old runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchState {
     /// User query that started the run.
@@ -210,9 +206,9 @@ pub struct ResearchState {
     pub phase: Phase,
     /// Wall-clock instant the run was submitted (for `RunStats`).
     pub started_at: DateTime<Utc>,
-    /// Monotonically counted steps the runner has executed, separate from
-    /// the workflow runtime's `step_number` (which counts queue
-    /// transitions including ones that returned `ContinueAfter`).
+    /// Monotonically counted steps the runner executed, separate from the
+    /// workflow runtime's `step_number` (which counts queue transitions
+    /// including ones that returned `ContinueAfter`).
     pub steps_completed: u32,
     /// Sub-questions produced by the planning step.
     pub sub_questions: Vec<String>,
@@ -220,17 +216,17 @@ pub struct ResearchState {
     pub search_queue: VecDeque<usize>,
     /// Search results per sub-question (key = sub-question index).
     pub search_results: BTreeMap<usize, Vec<SearchResult>>,
-    /// Queue of URLs yet to be fetched. Deduplicated against
-    /// `fetched.keys()` before insertion.
+    /// Queue of URLs yet to be fetched. Deduplicated against `fetched.keys()`
+    /// before insertion.
     pub fetch_queue: VecDeque<Url>,
-    /// Successfully fetched pages keyed by URL.
+    /// Successfully fetched pages, with the URL as the key.
     pub fetched: BTreeMap<Url, FetchedPage>,
-    /// Queue of URLs yet to be summarized.
+    /// Queue of URLs yet to be summarised.
     pub summarize_queue: VecDeque<Url>,
-    /// Per-page summaries keyed by URL.
+    /// Per-page summaries, with the URL as the key.
     pub summaries: BTreeMap<Url, Summary>,
-    /// Synthesized narrative and citation evidence produced by the
-    /// synthesizing step.
+    /// Synthesized narrative and citation evidence produced by the synthesizing
+    /// step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthesis: Option<SynthesisOutput>,
     /// Aggregate token usage across every LLM call made by this run.
@@ -258,7 +254,7 @@ impl ResearchState {
         }
     }
 
-    /// Encode the state into the bytes carried as the step payload.
+    /// Encode the state into the bytes of the step payload.
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("ResearchState is serde-derivable")
     }

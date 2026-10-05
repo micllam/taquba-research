@@ -1,28 +1,26 @@
-//! Run-level index of submitted runs, stored in the queue's user KV
-//! namespace, plus the cross-process cancellation sentinel.
+//! Run-level index of submitted runs, stored in the queue's user KV namespace,
+//! plus the cross-process cancellation sentinel.
 //!
-//! The index stores only what cannot be derived from the queue. An
-//! entry is written at most twice per run:
+//! The index stores only what cannot be derived from the queue. An entry is
+//! written at most twice per run:
 //!
-//! - **At submission** (query, submit time), joining the submit
-//!   transaction via
-//!   [`RunSpec::effects`](taquba_workflow::RunSpec::effects), so a run
-//!   cannot exist without an entry or an entry without a run.
-//! - **At termination**: for runner-issued outcomes (`Succeed` /
-//!   `Cancel`) the terminal record joins the terminal step's
-//!   settlement transaction via
-//!   [`Step::effects`](taquba_workflow::Delivery::effects); for
-//!   terminations that apply no step effects (a dead-lettered step, an
-//!   external cancellation) it joins the terminal notification's
-//!   settlement, staged by [`TerminalReconciler`].
+//! - **At submission** (query, submit time), joining the submit transaction via
+//!   [`RunSpec::effects`](taquba_workflow::RunSpec::effects), so a run cannot
+//!   exist without an entry or an entry without a run.
+//! - **At termination**: for runner-issued outcomes (`Succeed` / `Cancel`) the
+//!   terminal record joins the terminal step's settlement transaction via
+//!   [`Step::effects`](taquba_workflow::Delivery::effects). For terminations
+//!   that do not apply step effects (a dead-lettered step, an external
+//!   cancellation) it joins the terminal notification's settlement, staged by
+//!   [`TerminalReconciler`].
 //!
 //! Every in-flight status is derived at read time from the run state that a
 //! [`WorkflowView`](taquba_workflow::WorkflowView) reports through a
 //! [`QueueReader`](taquba::QueueReader), see
 //! [`derive_display_status`](crate::store::derive_display_status). The
 //! cancellation sentinel remains a plain object at
-//! `<store>/runs/<run_id>.cancel`, written by the `cancel` command and
-//! polled by the runner concurrently with phase work.
+//! `<store>/runs/<run_id>.cancel`, written by the `cancel` command and polled
+//! by the runner concurrently with phase work.
 
 use std::sync::Arc;
 
@@ -40,9 +38,9 @@ use taquba_workflow::{
 
 use crate::state::{ResearchState, TokenUsage};
 
-/// Queue name the CLI and [`crate::ResearchAgent`] configure on the
-/// workflow runtime. Set explicitly so the reader-side queries in this
-/// module target the same queue as the runtime.
+/// Name of the workflow queue. The CLI and [`crate::ResearchAgent`] configure
+/// the workflow runtime with it, and the reader-side queries in this module
+/// target the same queue.
 pub const WORKFLOW_QUEUE_NAME: &str = "research-workflow";
 
 /// Memo prefix the CLI and [`crate::ResearchAgent`] configure on the workflow
@@ -73,9 +71,8 @@ pub fn report_path(prefix: &Path, run_id: &str) -> Path {
         .join(format!("{run_id}.md"))
 }
 
-/// KV key of `run_id`'s index entry. Run ids are ULIDs assigned at
-/// submission, so a scan over [`RUNS_KV_PREFIX`] returns entries in
-/// submission order.
+/// KV key of `run_id`'s index entry. Run ids are ULIDs assigned at submission,
+/// so a scan over [`RUNS_KV_PREFIX`] returns entries in submission order.
 pub fn run_entry_key(run_id: &str) -> Vec<u8> {
     format!("{RUNS_KV_PREFIX}{run_id}").into_bytes()
 }
@@ -89,9 +86,9 @@ pub struct RunIndexEntry {
     pub query: String,
     /// Wall-clock submission time.
     pub submitted_at: DateTime<Utc>,
-    /// Terminal facts, present once the run terminated. Runner-issued
-    /// outcomes (`Succeed`, `Cancel`) stage the record in the terminal
-    /// step's settlement; outcomes that apply no step effects are
+    /// Terminal facts, present once the run terminated. Runner-issued outcomes
+    /// (`Succeed`, `Cancel`) stage the record in the terminal step's
+    /// settlement. For outcomes that do not apply step effects, the record is
     /// staged by [`TerminalReconciler`] on the terminal notification's
     /// settlement. Absent while the run is in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,29 +112,26 @@ impl RunIndexEntry {
 pub struct TerminalRecord {
     /// How the run terminated.
     pub status: StoredStatus,
-    /// Cancellation reason or failure message, when there is one.
+    /// Cancellation reason or failure message, when the run has either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Wall-clock instant of the terminal outcome.
     pub finished_at: DateTime<Utc>,
-    /// Summary statistics, so `status` prints without fetching the
-    /// report.
+    /// Summary statistics, so `status` prints without fetching the report.
     pub summary: RunSummary,
 }
 
-/// Terminal status stored in a [`TerminalRecord`]. Only terminal
-/// outcomes are stored; the full display set is [`RunDisplayStatus`],
-/// derived at read time.
+/// Terminal status stored in a [`TerminalRecord`]. Only terminal outcomes are
+/// stored. The full display set is [`RunDisplayStatus`], derived at read time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoredStatus {
     /// Reached `StepOutcome::Succeed` and produced a report.
     Succeeded,
-    /// The run terminated as failed (a dead-lettered step); recorded
-    /// by [`TerminalReconciler`].
+    /// The run terminated as failed (a dead-lettered step). Recorded by
+    /// [`TerminalReconciler`].
     Failed,
-    /// The runner observed the cancellation sentinel and terminated
-    /// the run.
+    /// The runner observed the cancellation sentinel and terminated the run.
     Cancelled,
 }
 
@@ -266,9 +260,8 @@ pub fn derive_display_status(
 /// Page size for KV and job-listing scans.
 const SCAN_PAGE: usize = 256;
 
-/// Enumerate every run index entry, oldest first (run ids are ULIDs,
-/// so key order is submission order). Malformed entries are logged and
-/// skipped.
+/// Enumerate every run index entry, oldest first (run ids are ULIDs, so key
+/// order is submission order). Malformed entries are logged and skipped.
 pub async fn list_runs(reader: &QueueReader) -> taquba::Result<Vec<RunIndexEntry>> {
     let mut out = Vec::new();
     let entries = reader
@@ -288,8 +281,8 @@ pub async fn list_runs(reader: &QueueReader) -> taquba::Result<Vec<RunIndexEntry
     Ok(out)
 }
 
-/// Load one run's index entry. `Ok(None)` when the run is unknown; a
-/// malformed entry is an error.
+/// Load a run's index entry. `Ok(None)` when the run is unknown, and an error
+/// for a malformed entry.
 pub async fn get_run(reader: &QueueReader, run_id: &str) -> anyhow::Result<Option<RunIndexEntry>> {
     let Some(bytes) = reader.view().kv_get(&run_entry_key(run_id)).await? else {
         return Ok(None);
@@ -355,19 +348,18 @@ pub async fn count_waiting_step_jobs(view: &QueueView) -> taquba::Result<usize> 
     Ok(count)
 }
 
-/// Terminal-hook decorator reconciling the run index with outcomes
-/// that applied no step effects. A dead-lettered step (and an external
+/// Terminal-hook decorator reconciling the run index with outcomes that did not
+/// apply step effects. A dead-lettered step (and an external
 /// [`WorkflowRuntime::cancel`](taquba_workflow::WorkflowRuntime::cancel))
-/// terminates a run without staging its terminal record; this hook
-/// stages the missing record on the notification's
-/// [`TerminalEffects`], so it commits atomically with the
-/// notification's acknowledgement. Entries whose record was staged
-/// step-side are left unchanged, and a retried notification stages
-/// the record again.
+/// terminates a run without staging its terminal record. This hook stages the
+/// missing record on the notification's [`TerminalEffects`], so it commits
+/// atomically with the notification's acknowledgement. Entries whose record was
+/// staged step-side are left unchanged, and a retried notification stages the
+/// record again.
 ///
-/// Wraps the host's own hook: reconciliation runs first and `inner`
-/// is invoked only after it succeeds. Every notification is
-/// processed, including one for a run another process submitted.
+/// Wraps the host's own hook: reconciliation runs first and `inner` is invoked
+/// only after it succeeds. Every notification is processed, including one for a
+/// run another process submitted.
 pub struct TerminalReconciler<H> {
     queue: Arc<Queue>,
     inner: H,
@@ -392,8 +384,7 @@ impl<H> TerminalReconciler<H> {
             .await
             .map_err(|e| StepError::transient(format!("reading run index entry: {e}")))?;
         let Some(bytes) = bytes else {
-            // Not a run this index manages, or the entry was already
-            // collected.
+            // Not a run this index manages, or the entry was already collected.
             return Ok(());
         };
         let mut entry = match RunIndexEntry::from_bytes(&bytes) {
@@ -430,10 +421,10 @@ impl<H> TerminalReconciler<H> {
             .map_err(|e| StepError::permanent(format!("staging reconciled run index entry: {e}")))
     }
 
-    /// Best-effort summary for a reconciled record. A failed run's
-    /// progress is decoded from its dead-letter job's payload; a
-    /// succeeded outcome's from its `RunRecord` result. When neither
-    /// source is available the summary holds the wall time alone.
+    /// Best-effort summary for a reconciled record. A failed run's progress is
+    /// decoded from its dead-letter job's payload, and a succeeded outcome's
+    /// from its `RunRecord` result. When neither source is available the
+    /// summary contains the wall time alone.
     async fn summary_for(
         &self,
         outcome: &RunOutcome,
@@ -468,8 +459,8 @@ impl<H> TerminalReconciler<H> {
         summary
     }
 
-    /// Final persisted state of `run_id`'s dead-lettered step, when
-    /// its dead-letter job is still present and its payload decodes.
+    /// Final persisted state of `run_id`'s dead-lettered step, when its
+    /// dead-letter job is still present and its payload decodes.
     async fn dead_job_state(&self, run_id: &str) -> Option<ResearchState> {
         let view = self.queue.view();
         let job = find_step_job(view, run_id, JobStatus::Dead).await.ok()??;
@@ -488,17 +479,17 @@ impl<H: TerminalHook> TerminalHook for TerminalReconciler<H> {
         self.inner.on_termination(outcome, effects).await
     }
 
-    // Reconciliation needs every notification, regardless of what
-    // `inner` would observe.
+    // Reconciliation needs every notification, regardless of what `inner`
+    // observes.
     fn observes(&self, _outcome: &RunOutcome) -> bool {
         true
     }
 }
 
-/// Handle to the per-run cancellation sentinels inside the configured
-/// object store, at `<prefix>/runs/<run_id>.cancel`.
+/// Handle to the per-run cancellation sentinels inside the configured object
+/// store, at `<prefix>/runs/<run_id>.cancel`.
 ///
-/// Cheap to clone (internal `Arc<dyn ObjectStore>`).
+/// A clone copies an internal `Arc<dyn ObjectStore>`.
 #[derive(Clone)]
 pub struct CancelSentinel {
     object_store: Arc<dyn ObjectStore>,
@@ -516,9 +507,8 @@ impl std::fmt::Debug for CancelSentinel {
 
 impl CancelSentinel {
     /// Build a handle rooted at `<prefix>/runs/` inside `object_store`.
-    /// `prefix` is the key prefix within the store under which queue
-    /// state and sentinels live; pass [`Path::default()`] to use the
-    /// store's bucket root.
+    /// `prefix` is the key prefix within the store under which queue state and
+    /// sentinels live. Pass [`Path::default()`] to use the store's bucket root.
     pub fn new(object_store: Arc<dyn ObjectStore>, prefix: &Path) -> Self {
         let runs_prefix = prefix.clone().join("runs");
         Self {
@@ -540,8 +530,8 @@ impl CancelSentinel {
             .map(|_| ())
     }
 
-    /// Whether the cancellation sentinel exists. `Ok(false)` only for
-    /// a missing sentinel; any other `head` failure is returned.
+    /// Whether the cancellation sentinel exists. `Ok(false)` only for a missing
+    /// sentinel. Any other `head` failure is returned.
     pub async fn is_set(&self, run_id: &str) -> object_store::Result<bool> {
         match self.object_store.head(&self.path(run_id)).await {
             Ok(_) => Ok(true),
@@ -550,9 +540,9 @@ impl CancelSentinel {
         }
     }
 
-    /// Instant the sentinel was written (its object's
-    /// `last_modified`). `Ok(None)` only when no sentinel exists; any
-    /// other `head` failure is returned.
+    /// Instant the sentinel was written (its object's `last_modified`).
+    /// `Ok(None)` only when no sentinel exists. Any other `head` failure is
+    /// returned.
     pub async fn requested_at(&self, run_id: &str) -> object_store::Result<Option<DateTime<Utc>>> {
         match self.object_store.head(&self.path(run_id)).await {
             Ok(meta) => Ok(Some(meta.last_modified)),
@@ -740,8 +730,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Opened after the writes, so the reader's initial view holds
-        // them without waiting for a manifest poll.
+        // Opened after the writes, so the reader's initial view contains them
+        // without waiting for a manifest poll.
         let reader = QueueReader::open_with_options(
             object_store.clone(),
             "q",
@@ -884,8 +874,8 @@ mod tests {
                 tx: std::sync::Mutex::new(Some(tx)),
             },
         );
-        // The reconciler's dead-job scan targets WORKFLOW_QUEUE_NAME;
-        // the runtime must use the same queue name.
+        // The reconciler's dead-job scan targets WORKFLOW_QUEUE_NAME, and the
+        // runtime must use the same queue name.
         let runtime =
             WorkflowRuntime::builder(queue.clone(), object_store.clone(), AlwaysFail, hook)
                 .queue_name(WORKFLOW_QUEUE_NAME)
@@ -921,16 +911,15 @@ mod tests {
             .await
             .unwrap();
 
-        // A permanent step error dead-letters immediately, with no
-        // retry backoff.
+        // A permanent step error dead-letters immediately, without a retry
+        // backoff.
         let outcome = rx.await.unwrap();
         assert_eq!(outcome.status, TerminalStatus::Failed);
         let _ = shutdown_tx.send(());
         let _ = worker.await;
 
         // The reconciled record committed with the notification's
-        // acknowledgement; the summary comes from the dead job's
-        // payload.
+        // acknowledgement. The summary comes from the dead job's payload.
         let bytes = queue
             .view()
             .kv_get(&run_entry_key(&run_id))

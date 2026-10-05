@@ -1,6 +1,6 @@
 //! Convenience wrapper around a Rig client, a search backend, a
-//! [`taquba_workflow::WorkflowRuntime`], and a one-shot terminal hook,
-//! exposed through a single `run(queue, query)` call.
+//! [`taquba_workflow::WorkflowRuntime`] and a one-shot terminal hook, exposed
+//! through a single `run(queue, query)` call.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,14 +27,13 @@ use crate::store::{
     count_waiting_step_jobs, run_entry_key,
 };
 
-/// How long workflow memo blobs are retained after the run reaches a
-/// terminal state. Any in-process at-least-once retry happens well
-/// before this elapses; the window only needs to outlive the longest
-/// realistic run wall-time plus an inspection buffer.
+/// How long workflow memo blobs are retained after the run reaches a terminal
+/// state. The window exceeds the longest realistic run wall-time plus an
+/// inspection buffer, so every in-process at-least-once retry occurs within it.
 const MEMO_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// High-level convenience for running a research agent once and getting
-/// back a [`Report`] without managing the workflow runtime yourself.
+/// High-level convenience that runs a research agent once and returns a
+/// [`Report`], with the workflow runtime managed internally.
 ///
 /// Build with [`ResearchAgent::builder`].
 pub struct ResearchAgent {
@@ -48,14 +47,14 @@ impl ResearchAgent {
         ResearchAgentBuilder::default()
     }
 
-    /// Submit `query` to a fresh run, drive the workflow runtime until
-    /// the run terminates, and return the rendered [`Report`].
+    /// Submit `query` to a fresh run, run the workflow runtime until the run
+    /// terminates, and return the rendered [`Report`].
     ///
     /// `object_store` backs the workflow runtime's [memo store] used to
-    /// short-circuit at-least-once retries of paid LLM calls. The common
-    /// case is to pass the same store the [`Queue`] was opened with. The
-    /// finished report is also written to `reports/<run_id>.md` in
-    /// `object_store` before the final step settles.
+    /// short-circuit at-least-once retries of paid LLM calls. The common case
+    /// is to pass the same store the [`Queue`] was opened with. The finished
+    /// report is also written to `reports/<run_id>.md` in `object_store` before
+    /// the final step settles.
     ///
     /// [memo store]: taquba_workflow::Memo
     pub async fn run(
@@ -65,9 +64,9 @@ impl ResearchAgent {
         query: impl Into<String>,
     ) -> Result<Report> {
         let query = query.into();
-        // The run id is generated before submit so the index entry's
-        // KV key can join the submit transaction and the terminal hook
-        // can filter notifications to this run.
+        // The run id is generated before submit so the index entry's KV key can
+        // join the submit transaction and the terminal hook can filter
+        // notifications to this run.
         let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
         let (tx, rx) = oneshot::channel::<RunOutcome>();
         let hook = TerminalReconciler::new(
@@ -78,8 +77,8 @@ impl ResearchAgent {
             },
         );
 
-        // The worker drains the shared workflow queue, so other queued
-        // runs' pending steps execute in this call too.
+        // The worker drains the shared workflow queue, so other queued runs'
+        // pending steps execute in this call too.
         let waiting = count_waiting_step_jobs(queue.view())
             .await
             .context("counting queued runs")?;
@@ -90,9 +89,9 @@ impl ResearchAgent {
             );
         }
 
-        // Build the JobRunner the Fetching step submits FetchPage jobs
-        // to. It shares the same Queue + ObjectStore as the workflow
-        // runtime, distinguished by queue_name.
+        // Build the JobRunner the Fetching step submits FetchPage jobs to. It
+        // shares the same Queue + ObjectStore as the workflow runtime,
+        // distinguished by queue_name.
         let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store);
         let runner = self
             .runner
@@ -105,9 +104,9 @@ impl ResearchAgent {
             );
 
         // The research workflow is strictly sequential: each
-        // `StepOutcome::Continue` enqueues the next step only after the
-        // current one acks. One worker is enough and avoids unnecessary
-        // claim transaction conflicts.
+        // `StepOutcome::Continue` enqueues the next step only after the current
+        // one acks. One worker is enough and avoids unnecessary claim
+        // transaction conflicts.
         let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
             .queue_name(WORKFLOW_QUEUE_NAME)
             .memo_prefix(WORKFLOW_MEMO_PREFIX)
@@ -122,8 +121,8 @@ impl ResearchAgent {
             terminal: None,
         };
         let input = ResearchStepRunner::initial_state(query.clone(), self.config.clone());
-        // Submit before spawning the worker, so a submit failure has
-        // only the fetch runner to shut down.
+        // Submit before spawning the worker, so a submit failure has only the
+        // fetch runner to shut down.
         if let Err(e) = runtime
             .submit(RunSpec {
                 run_id: Some(run_id.clone()),
@@ -149,22 +148,22 @@ impl ResearchAgent {
                 .await
         });
 
-        // Await the terminal signal and the worker together: a worker
-        // task that fails or panics before the run terminates would
-        // otherwise leave this call waiting on `rx` indefinitely.
+        // Await the terminal signal and the worker together, so a worker task
+        // that fails or panics before the run terminates ends this call with an
+        // error and does not leave it waiting on `rx`.
         let outcome = tokio::select! {
             out = rx => {
                 let _ = shutdown_tx.send(());
-                // The outcome is already committed, so a worker exit
-                // error is logged only.
+                // The outcome is already committed, so a worker exit error is
+                // logged only.
                 if let Err(e) = flatten_worker_exit((&mut worker).await) {
                     tracing::warn!(error = %e, "worker exit error after the terminal outcome");
                 }
                 out.map_err(|_| anyhow!("terminal hook dropped before signalling"))
             }
             joined = &mut worker => {
-                // The worker exited before the terminal signal; the
-                // run's step job stays in the queue.
+                // The worker exited before the terminal signal. The run's step
+                // job stays in the queue.
                 drop(shutdown_tx);
                 Err(match flatten_worker_exit(joined) {
                     Ok(()) => anyhow!("worker exited before the run terminated"),
@@ -172,10 +171,9 @@ impl ResearchAgent {
                 })
             }
         };
-        // Stop the JobRunner only after the workflow worker has
-        // exited: any still-in-flight FetchPage was awaited by the
-        // workflow step that submitted it, so by the time we get here
-        // there's nothing left for the job worker to do.
+        // Stop the JobRunner only after the workflow worker exits: the workflow
+        // step that submits a FetchPage awaits it, so at this point the job
+        // worker does not have a FetchPage in flight.
         let _ = job_handle.shutdown().await;
         let outcome = outcome?;
 
@@ -208,16 +206,15 @@ impl ResearchAgent {
 
 /// Builder for [`ResearchAgent`]. Required fields:
 ///
-/// - A provider client (call [`Self::openai`], [`Self::anthropic`], or
+/// - A provider client (call [`Self::openai`], [`Self::anthropic`] or
 ///   [`Self::ollama`]). Last call wins if more than one is invoked.
 /// - [`Self::search`]: a [`SearchBackend`] implementation.
-/// - [`Self::config`]: a [`ResearchConfig`] built via
-///   [`ResearchConfig::new`] with the model identifier you want.
+/// - [`Self::config`]: a [`ResearchConfig`] built via [`ResearchConfig::new`]
+///   with the model identifier of the run.
 ///
 /// Optional:
 ///
-/// - [`Self::cancellation`]: sentinel handle for cross-process
-///   cancellation.
+/// - [`Self::cancellation`]: sentinel handle for cross-process cancellation.
 #[derive(Default)]
 pub struct ResearchAgentBuilder {
     provider: Option<ProviderClient>,
@@ -263,14 +260,14 @@ impl ResearchAgentBuilder {
         self
     }
 
-    /// Attach a [`CancelSentinel`] so a `cancel` issued from another
-    /// process terminates the run.
+    /// Attach a [`CancelSentinel`] so a `cancel` issued from another process
+    /// terminates the run.
     pub fn cancellation(mut self, sentinel: CancelSentinel) -> Self {
         self.cancel = Some(sentinel);
         self
     }
 
-    /// Finalize the builder.
+    /// Finalise the builder.
     pub fn build(self) -> Result<ResearchAgent> {
         let provider = self.provider.ok_or_else(|| {
             anyhow!(
@@ -291,20 +288,19 @@ impl ResearchAgentBuilder {
     }
 }
 
-/// Flatten a worker task's join result: a panic or abort
-/// (`JoinError`) and a [`WorkflowRuntime::run`] error are both
-/// returned as the error.
+/// Flatten a worker task's join result: a panic or abort (`JoinError`) and a
+/// [`WorkflowRuntime::run`] error are both returned as the error.
 fn flatten_worker_exit(
     joined: std::result::Result<taquba_workflow::Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
     Ok(joined??)
 }
 
-/// Terminal hook that forwards the [`RunOutcome`] on a oneshot channel so
-/// the caller can `await` the whole run.
+/// Terminal hook that forwards the [`RunOutcome`] on a oneshot channel so the
+/// caller can `await` the whole run.
 struct CaptureOutcome {
-    /// Run this invocation submitted. Notifications for any other run
-    /// are stale; see `on_termination`.
+    /// Run this invocation submitted. `on_termination` acknowledges the
+    /// notifications of every other run as stale.
     run_id: RunId,
     tx: Mutex<Option<oneshot::Sender<RunOutcome>>>,
 }
@@ -315,12 +311,11 @@ impl TerminalHook for CaptureOutcome {
         outcome: &RunOutcome,
         _effects: &TerminalEffects,
     ) -> std::result::Result<(), StepError> {
-        // Terminal notifications are durable jobs: one left unclaimed
-        // by a terminated process is delivered to the next worker on
-        // the queue. Consuming a foreign notification here would
-        // misattribute the outcome, so it is acked and logged; its
-        // run's terminal index entry is staged by the step settlement
-        // or by the wrapping `TerminalReconciler`.
+        // Terminal notifications are durable jobs: a notification left
+        // unclaimed by a terminated process is delivered to the next worker on
+        // the queue. A foreign notification is acked and logged without
+        // forwarding its outcome. The step settlement or the wrapping
+        // `TerminalReconciler` stages its run's terminal index entry.
         if outcome.run_id != self.run_id {
             tracing::warn!(
                 run_id = %outcome.run_id,
@@ -329,9 +324,9 @@ impl TerminalHook for CaptureOutcome {
             );
             return Ok(());
         }
-        // Take the sender out of the mutex before sending so the lock
-        // guard is not held across `tx.send`. A redelivered
-        // notification finds no sender and is a no-op.
+        // Take the sender out of the mutex before sending so the lock guard is
+        // not held across `tx.send`. A redelivered notification does not find a
+        // sender and is a no-op.
         let tx = self.tx.lock().await.take();
         if let Some(tx) = tx {
             let _ = tx.send(outcome.clone());

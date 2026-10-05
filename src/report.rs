@@ -1,5 +1,5 @@
-//! The [`Report`] type returned at the end of a successful research run,
-//! plus markdown rendering with numeric citations.
+//! The [`Report`] type returned at the end of a successful research run, plus
+//! markdown rendering with numeric citations.
 
 use std::time::Duration;
 
@@ -16,11 +16,11 @@ pub struct Report {
     pub run_id: String,
     /// Original user query that started the run.
     pub query: String,
-    /// Rendered markdown report including inline `[N]` numeric citations
-    /// and a citations list at the end.
+    /// Rendered markdown report including inline `[N]` numeric citations and a
+    /// citations list at the end.
     pub markdown: String,
-    /// Citations referenced from `markdown`. Indices match the inline
-    /// `[N]` markers.
+    /// Citations referenced from `markdown`. Indices match the inline `[N]`
+    /// markers.
     pub citations: Vec<Citation>,
     /// Aggregated run-level statistics.
     pub stats: RunStats,
@@ -53,8 +53,8 @@ pub struct RunStats {
     pub finished_at: DateTime<Utc>,
     /// Aggregate token usage across every LLM call in the run.
     pub token_usage: TokenUsage,
-    /// Whether the Writing step's final completion stopped at the
-    /// output-token limit, leaving the report body truncated.
+    /// Whether the Writing step's final completion stopped at the output-token
+    /// limit. When set, the report body is truncated.
     pub output_truncated: bool,
 }
 
@@ -72,8 +72,8 @@ mod duration_secs {
     }
 }
 
-/// Render the metadata block, body, and citations list into a single
-/// markdown document.
+/// Render the metadata block, body and citations list into a single markdown
+/// document.
 pub(crate) fn render_markdown(
     query: &str,
     run_id: &str,
@@ -121,9 +121,9 @@ pub(crate) fn render_markdown(
     out
 }
 
-/// Render a compact " · tokens: <in> in / <out> out / <total>" suffix
-/// for the stats line. Returns an empty string when no provider
-/// reported usage (all-zero `TokenUsage`).
+/// Render a compact " · tokens: <in> in / <out> out / <total>" suffix for the
+/// stats line. Returns an empty string when no provider reported usage
+/// (all-zero `TokenUsage`).
 fn format_tokens(u: &TokenUsage) -> String {
     if u.is_zero() {
         return String::new();

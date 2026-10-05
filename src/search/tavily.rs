@@ -1,5 +1,4 @@
-//! [Tavily](https://tavily.com) search backend. Default for v0.1 because
-//! of its generous free tier and clean POST-JSON API.
+//! [Tavily](https://tavily.com) search backend, the default of the CLI.
 
 use std::env;
 use std::time::Duration;
@@ -47,8 +46,8 @@ impl Tavily {
         Ok(Self::new(key))
     }
 
-    /// Override the API endpoint. Mainly useful for testing against a
-    /// recorded fixture or a self-hosted proxy.
+    /// Override the API endpoint, for tests against a recorded fixture or a
+    /// self-hosted proxy.
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = endpoint.into();
         self

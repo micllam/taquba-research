@@ -1,4 +1,4 @@
-//! [`ResearchStepRunner`]: the [`StepRunner`] that drives a research run
+//! [`ResearchStepRunner`]: the [`StepRunner`] that advances a research run
 //! through its six phases.
 
 use std::collections::HashSet;
@@ -35,44 +35,43 @@ use crate::state::{
 };
 use crate::store::{CancelSentinel, RunIndexEntry, RunSummary, StoredStatus, TerminalRecord};
 
-/// Preamble applied to every Rig agent built by the runner. Kept
-/// terse: the per-phase prompts carry the task-specific instructions.
+/// Preamble applied to every Rig agent built by the runner. The per-phase
+/// prompts contain the task-specific instructions.
 const AGENT_PREAMBLE: &str = "Be precise and concise.";
-/// Cadence at which a step polls its cancellation sentinel while
-/// phase work is in flight. Sets the upper bound on how long an LLM
-/// or HTTP call keeps running after the CLI's `cancel` lands.
+/// Cadence at which a step polls its cancellation sentinel while phase work is
+/// in flight. Sets the upper bound on how long an LLM or HTTP call keeps
+/// running after the CLI's `cancel` lands.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Upper bound on a single LLM completion call. The step's lease is
-/// extended by this much before the call is issued, so the delivery
-/// is not re-queued mid-call. Sized for slow local models.
+/// Upper bound on a single LLM completion call. The step's lease is extended by
+/// this much before the call is issued, so the delivery is not re-queued
+/// mid-call. Sized for slow local models.
 const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(600);
-/// Upper bound on a single search-backend call, covered by the lease
-/// the same way.
+/// Upper bound on a single search-backend call, covered by the lease the same
+/// way.
 const SEARCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
-/// Upper bound on the canonical report blob write, covered by the
-/// lease the same way.
+/// Upper bound on the canonical report blob write, covered by the lease the
+/// same way.
 const REPORT_PUT_TIMEOUT: Duration = Duration::from_secs(20);
-/// Lease extension applied before each fetch-handle await: one
-/// FetchPage job's full retry cycle (3 attempts of 20s each plus
-/// backoff) plus the wait for a runner slot behind 16 concurrent
-/// jobs, rounded up. Each completed handle re-extends, so the lease
-/// stays within one job completion of live progress.
+/// Lease extension applied before each fetch-handle await: one FetchPage job's
+/// full retry cycle (3 attempts of 20s each plus backoff) plus the wait for a
+/// runner slot while 16 concurrent jobs run, rounded up. Each completed handle
+/// re-extends, so the lease stays within one job completion of live progress.
 const FETCH_JOIN_LEASE: Duration = Duration::from_secs(150);
 
-/// Memo user-keys for each phase's cached LLM response. Each is
-/// scoped per `(run_id, step_number)` by [`taquba_workflow::Memo`],
-/// so a plain string suffices.
+/// Memo user-keys for each phase's cached LLM response. Each is scoped per
+/// `(run_id, step_number)` by [`taquba_workflow::Memo`], so a plain string
+/// suffices.
 const MEMO_KEY_PLANNING: &str = "planning";
 const MEMO_KEY_SUMMARIZING: &str = "summarizing";
 const MEMO_KEY_SYNTHESIZING: &str = "synthesizing";
 const MEMO_KEY_WRITING: &str = "writing";
 
-/// Drives a research run through plan -> search -> fetch -> summarize ->
-/// synthesize -> write phases.
+/// Advances a research run through the plan -> search -> fetch -> summarise ->
+/// synthesise -> write phases.
 ///
-/// `ResearchStepRunner` is cheap to clone (internal `Arc`s). One instance
-/// is shared across all worker tasks of a single [`WorkflowRuntime`].
+/// Cloning a `ResearchStepRunner` copies its internal `Arc`s. One instance is
+/// shared across all worker tasks of a single [`WorkflowRuntime`].
 ///
 /// [`WorkflowRuntime`]: taquba_workflow::WorkflowRuntime
 #[derive(Clone)]
@@ -103,11 +102,9 @@ impl ProviderClient {
     }
 }
 
-/// What the terminal hook persists for a finished run. Distinct from the
-/// in-flight state because terminal records only need the final report
-/// plus enough metadata to render it. Failure reasons live on
-/// [`taquba_workflow::RunOutcome::error`] instead of here, since the
-/// runner builds a `RunRecord` only on success.
+/// What the terminal hook persists for a finished run: the final report and the
+/// metadata to render it. The runner builds a `RunRecord` only on success, and
+/// a failure reason is stored in [`taquba_workflow::RunOutcome::error`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     /// Final report.
@@ -130,8 +127,8 @@ impl ResearchStepRunner {
         Self::from_provider(ProviderClient::Anthropic(client), search)
     }
 
-    /// Build a runner from a Rig Ollama client and a search backend, for
-    /// local models.
+    /// Build a runner from a Rig Ollama client and a search backend, for local
+    /// models.
     pub fn new_ollama(client: ollama::Ollama, search: Arc<dyn SearchBackend>) -> Self {
         Self::from_provider(ProviderClient::Ollama(client), search)
     }
@@ -147,23 +144,22 @@ impl ResearchStepRunner {
         }
     }
 
-    /// Attach a [`CancelSentinel`] used to check for cross-process
-    /// cancellation throughout each step. The runner polls the sentinel
-    /// concurrently with the phase work, so a long-running LLM or HTTP
-    /// call is dropped within ~1 second of the sentinel appearing. When
-    /// unset, the runner ignores cancellation.
+    /// Attach a [`CancelSentinel`] used to check for cross-process cancellation
+    /// throughout each step. The runner polls the sentinel concurrently with
+    /// the phase work, so a long-running LLM or HTTP call is dropped within ~1
+    /// second of the sentinel appearing. When unset, the runner ignores
+    /// cancellation.
     pub fn with_cancellation(mut self, sentinel: CancelSentinel) -> Self {
         self.cancel = Some(sentinel);
         self
     }
 
-    /// Attach the [`JobRunner`] the fetching phase submits per-URL
-    /// `FetchPage` jobs to. Required when the workflow advances into
-    /// `Phase::Fetching`: the phase submits one job per URL and
-    /// `try_join_all`s the handles. The runner must already have
-    /// `FetchPage` registered and an `Arc<reqwest::Client>` on its
-    /// state; use [`crate::spawn_fetch_runner`] to build one with
-    /// both already attached.
+    /// Attach the [`JobRunner`] the fetching phase submits per-URL `FetchPage`
+    /// jobs to. Required when the workflow advances into `Phase::Fetching`: the
+    /// phase submits one job per URL and `try_join_all`s the handles. The
+    /// runner must already have `FetchPage` registered and an
+    /// `Arc<reqwest::Client>` on its state. [`crate::spawn_fetch_runner`]
+    /// builds one with both already attached.
     pub fn with_job_runner(mut self, job_runner: JobRunner) -> Self {
         self.job_runner = Some(job_runner);
         self
@@ -171,24 +167,23 @@ impl ResearchStepRunner {
 
     /// Attach the underlying [`Queue`] so the fetching phase can call
     /// `Queue::cancel(job_id)` on in-flight `FetchPage` jobs when the
-    /// surrounding run is cancelled. Without this, those jobs run to
-    /// completion (or to their reqwest timeout) after the run has
-    /// already terminated.
+    /// surrounding run is cancelled. Without this, those jobs run to completion
+    /// (or to their reqwest timeout) after the run has already terminated.
     pub fn with_queue(mut self, queue: Arc<Queue>) -> Self {
         self.queue = Some(queue);
         self
     }
 
-    /// Attach the object store and key prefix under which the Writing
-    /// step writes the canonical report blob
-    /// (`<prefix>/reports/<run_id>.md`), before the step settles. When
-    /// unset, no canonical report blob is written.
+    /// Attach the object store and key prefix under which the Writing step
+    /// writes the canonical report blob (`<prefix>/reports/<run_id>.md`),
+    /// before the step settles. When unset, no canonical report blob is
+    /// written.
     pub fn with_report_store(mut self, object_store: Arc<dyn ObjectStore>, prefix: &Path) -> Self {
         self.report_store = Some((object_store, prefix.clone()));
         self
     }
 
-    /// Encode the initial state for a research run, ready to hand to
+    /// Encode the initial state for a research run, ready to pass to
     /// [`taquba_workflow::RunSpec::input`].
     pub fn initial_state(query: impl Into<String>, config: ResearchConfig) -> Vec<u8> {
         ResearchState::new(query, config).to_bytes()
@@ -204,13 +199,12 @@ impl StepRunner for ResearchStepRunner {
         let mut state = ResearchState::from_bytes(&step.payload)
             .map_err(|e| StepError::permanent(format!("malformed research state: {e}")))?;
 
-        // Cross-process cancellation: the CLI's `cancel` subcommand
-        // writes a sentinel object the runner watches for. The
-        // workflow runtime's in-process registry doesn't see the
-        // cross-process cancel, so we surface it as `StepOutcome::Cancel`
-        // here. The watcher races the phase work, so a long LLM or HTTP
-        // call is dropped within `CANCEL_POLL_INTERVAL` of the sentinel
-        // appearing instead of blocking until the call completes.
+        // Cross-process cancellation: the CLI's `cancel` subcommand writes a
+        // sentinel object that the runner watches for. The in-process registry
+        // of the workflow runtime does not see the cross-process cancel, so the
+        // runner returns it as `StepOutcome::Cancel`. The watcher races the
+        // phase work, so a long LLM or HTTP call is dropped within
+        // `CANCEL_POLL_INTERVAL` of the sentinel appearing.
         let work = self.dispatch_phase(step, &mut state);
         let outcome = match &self.cancel {
             Some(sentinel) => {
@@ -223,10 +217,9 @@ impl StepRunner for ResearchStepRunner {
             }
             None => work.await?,
         };
-        // The terminal index entry for a cancellation joins the
-        // settlement transaction of the Cancel outcome. The Succeed
-        // entry is staged in `dispatch_phase`, where the report is
-        // available.
+        // The terminal index entry for a cancellation joins the settlement
+        // transaction of the Cancel outcome. The Succeed entry is staged in
+        // `dispatch_phase`, where the report is available.
         if let StepOutcome::Cancel { reason } = &outcome {
             stage_entry(step, &cancelled_entry(step, &state, reason))?;
         }
@@ -235,22 +228,22 @@ impl StepRunner for ResearchStepRunner {
 }
 
 /// Resolves when the run's cancellation sentinel appears. Polls at
-/// [`CANCEL_POLL_INTERVAL`] cadence; the initial check fires immediately
-/// so an already-cancelled run short-circuits before any phase work runs.
+/// [`CANCEL_POLL_INTERVAL`] cadence. The initial check fires immediately, so an
+/// already-cancelled run short-circuits before any phase work runs.
 async fn poll_cancelled(sentinel: &CancelSentinel, run_id: &str) {
     loop {
         match sentinel.is_set(run_id).await {
             Ok(true) => return,
             Ok(false) => {}
-            // Logged and retried at the poll cadence; the check must
-            // not fail phase work.
+            // Logged and retried at the poll cadence. The check must not fail
+            // phase work.
             Err(e) => tracing::warn!(error = %e, "cancellation sentinel check failed"),
         }
         tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
     }
 }
 
-/// Terminal index entry for a successful run, summarizing the report's
+/// Terminal index entry for a successful run, with a summary of the report's
 /// stats.
 fn succeeded_entry(step: &Step, state: &ResearchState, report: &Report) -> RunIndexEntry {
     RunIndexEntry {
@@ -270,8 +263,8 @@ fn succeeded_entry(step: &Step, state: &ResearchState, report: &Report) -> RunIn
     }
 }
 
-/// Terminal index entry for a cancelled run. The summary reflects
-/// progress up to the cancellation.
+/// Terminal index entry for a cancelled run. The summary reflects progress up
+/// to the cancellation.
 fn cancelled_entry(step: &Step, state: &ResearchState, reason: &str) -> RunIndexEntry {
     let finished_at = Utc::now();
     let wall_time = (finished_at - state.started_at)
@@ -294,26 +287,23 @@ fn cancelled_entry(step: &Step, state: &ResearchState, reason: &str) -> RunIndex
     }
 }
 
-/// Stage `entry` on the step's effects handle, so it commits in the
-/// same transaction as the terminal outcome's settlement.
+/// Stage `entry` on the step's effects handle, so it commits in the same
+/// transaction as the terminal outcome's settlement.
 fn stage_entry(step: &Step, entry: &RunIndexEntry) -> Result<(), StepError> {
     step.effects
         .put(crate::store::run_entry_key(&entry.run_id), entry.to_bytes())
         .map_err(|e| StepError::permanent(format!("staging run index entry: {e}")))
 }
 
-/// Drop-guard that fires `Queue::cancel` on a non-empty set of
-/// in-flight job IDs when dropped. Used by `run_fetching` to make
-/// FetchPage jobs stop running when the surrounding research run
-/// is cancelled mid-step, rather than running to the reqwest
-/// timeout after the run has already terminated. Call
-/// [`Self::disarm`] (which empties the ID list) on every controlled
-/// exit so normal flows don't issue spurious `Queue::cancel` calls.
+/// Drop-guard that fires `Queue::cancel` on a non-empty set of in-flight job
+/// IDs when dropped. `run_fetching` uses it to stop the FetchPage jobs of a
+/// research run that is cancelled mid-step, before the reqwest timeout. Call
+/// [`Self::disarm`] (which empties the ID list) on every controlled exit, so
+/// normal flows do not issue `Queue::cancel` calls.
 ///
-/// `Queue::cancel` is fire-and-forget here: the surrounding step is
-/// being cancelled anyway, and a cancel call against an already-
-/// terminal job is a no-op, so any individual failure to cancel is
-/// logged at `warn` and ignored.
+/// `Queue::cancel` is fire-and-forget here: the surrounding step is being
+/// cancelled anyway, and a cancel call against an already-terminal job is a
+/// no-op, so any individual failure to cancel is logged at `warn` and ignored.
 struct PendingJobsGuard {
     queue: Arc<Queue>,
     job_ids: Vec<String>,
@@ -339,10 +329,9 @@ impl Drop for PendingJobsGuard {
         }
         let queue = self.queue.clone();
         let ids = std::mem::take(&mut self.job_ids);
-        // Drop is sync; defer the awaits onto a background task.
-        // The task survives the current step's cancellation and
-        // gets the cancels to taquba before in-flight handlers
-        // can run to completion.
+        // Drop is sync, so the awaits run on a background task. The task
+        // persists across the current step's cancellation and sends the cancels
+        // to taquba before in-flight handlers can run to completion.
         tokio::spawn(async move {
             for id in ids {
                 if let Err(e) = queue.cancel(&id).await {
@@ -362,9 +351,9 @@ struct SynthesisDocument {
 }
 
 impl ResearchStepRunner {
-    /// Runs the phase indicated by `state.phase` and returns the
-    /// resulting `StepOutcome`. Separated from `run_step` so it can be
-    /// raced against the cancellation watcher via `tokio::select!`.
+    /// Runs the phase indicated by `state.phase` and returns the resulting
+    /// `StepOutcome`. Separated from `run_step` so it can be raced against the
+    /// cancellation watcher via `tokio::select!`.
     async fn dispatch_phase(
         &self,
         step: &Step,
@@ -378,10 +367,9 @@ impl ResearchStepRunner {
             Phase::Synthesizing => self.run_synthesizing(step, state).await?,
             Phase::Writing => {
                 let report = self.run_writing(step, state).await?;
-                // The blob is written before the step settles, so a
-                // terminal record saying succeeded implies the report
-                // exists. A redelivered step rewrites the same
-                // memoized bytes.
+                // The blob is written before the step settles, so a terminal
+                // record saying succeeded implies the report exists. A
+                // redelivered step rewrites the same memoized bytes.
                 self.put_report(step, &report).await?;
                 stage_entry(step, &succeeded_entry(step, state, &report))?;
                 let record = RunRecord {
@@ -399,10 +387,9 @@ impl ResearchStepRunner {
         Ok(StepOutcome::continue_now(state.to_bytes()))
     }
 
-    /// Write the canonical report blob at
-    /// `<prefix>/reports/<run_id>.md`. A no-op without a report store;
-    /// a failed write is a transient step error, so the Writing step
-    /// never settles without the blob.
+    /// Write the canonical report blob at `<prefix>/reports/<run_id>.md`. A
+    /// no-op without a report store. A failed write is a transient step error,
+    /// so the Writing step never settles without the blob.
     async fn put_report(&self, step: &Step, report: &Report) -> Result<(), StepError> {
         let Some((object_store, prefix)) = &self.report_store else {
             return Ok(());
@@ -427,9 +414,9 @@ impl ResearchStepRunner {
             state.config.depth, state.query
         );
 
-        // Memoize the LLM call so an at-least-once retry of this step
-        // (lease expiry, worker restart) reuses the prior attempt's
-        // response instead of re-paying for the same prompt.
+        // Memoize the LLM call so an at-least-once retry of this step (lease
+        // expiry, worker restart) reuses the prior attempt's response in place
+        // of a second request for the same prompt.
         let plan: Plan = memoized(&step.memo, MEMO_KEY_PLANNING, async {
             self.llm_prompt_typed(&step.lease, &prompt, state).await
         })
@@ -457,8 +444,8 @@ impl ResearchStepRunner {
 
     async fn run_searching(&self, step: &Step, state: &mut ResearchState) -> Result<(), StepError> {
         let Some(idx) = state.search_queue.pop_front() else {
-            // Defensive: shouldn't happen because the transition below
-            // moves us out of Searching as soon as the queue empties.
+            // Unreachable in normal flow: the phase leaves Searching as soon as
+            // the queue empties.
             state.phase = Phase::Fetching;
             return Ok(());
         };
@@ -467,8 +454,7 @@ impl ResearchStepRunner {
         let done = total - state.search_queue.len(); // already-popped count
         tracing::info!("searching ({done}/{total}): {q}");
 
-        // 5 results per sub-question is a reasonable starting point;
-        // the total is capped later by max_sources.
+        // 5 results per sub-question. `max_sources` caps the total.
         let results = under_lease(&step.lease, SEARCH_CALL_TIMEOUT, "search call", async {
             self.search.search(&q, 5).await.map_err(StepError::from)
         })
@@ -491,8 +477,8 @@ impl ResearchStepRunner {
 
         if state.search_queue.is_empty() {
             state.phase = if state.fetch_queue.is_empty() {
-                // No sources to fetch; skip ahead. The synthesis step
-                // will gracefully produce a "nothing found" report.
+                // No sources to fetch. The synthesis step produces a "nothing
+                // found" report.
                 Phase::Synthesizing
             } else {
                 Phase::Fetching
@@ -515,11 +501,10 @@ impl ResearchStepRunner {
             .as_ref()
             .ok_or_else(|| StepError::permanent("fetching phase requires a Queue"))?;
 
-        // Submit one FetchPage job per URL. Result-aware idempotent
-        // submit means a retry of this step re-submits the same
-        // payloads and either dedup-hits a still-pending submission
-        // or short-circuits to a cached result blob; either way no
-        // URL is fetched twice.
+        // Submit one FetchPage job per URL. Result-aware idempotent submit
+        // means a retry of this step re-submits the same payloads and either
+        // dedup-hits a still-pending submission or short-circuits to a cached
+        // result blob. Either way, no URL is fetched twice.
         let urls: Vec<Url> = state.fetch_queue.iter().cloned().collect();
         tracing::info!("fetching {} URLs in parallel", urls.len());
         let mut handles = Vec::with_capacity(urls.len());
@@ -536,26 +521,23 @@ impl ResearchStepRunner {
             handles.push(handle);
         }
 
-        // Arm a guard that cancels any still-in-flight jobs if this
-        // future is dropped before completing, i.e. the surrounding
-        // run was cancelled and the outer `run_step` is propagating
-        // `StepOutcome::Cancel`. Disarmed on every controlled exit
-        // (success, infra error) so normal flows don't issue
-        // spurious `Queue::cancel` calls.
+        // Arm a guard that cancels any still-in-flight jobs if this future is
+        // dropped before completing, which happens when the surrounding run was
+        // cancelled and the outer `run_step` is propagating
+        // `StepOutcome::Cancel`. Disarmed on every controlled exit (success,
+        // infra error), so normal flows do not issue `Queue::cancel` calls.
         let mut guard =
             PendingJobsGuard::new(queue.clone(), handles.iter().map(|h| h.id().to_string()));
 
-        // Await all the handles. A per-URL handler failure
-        // (`JoinError::Job`) is logged and skipped; an infrastructure
-        // error (`JoinError::Infra`) fails the step transiently so
-        // taquba re-delivers it.
+        // Await all the handles. A per-URL handler failure (`JoinError::Job`)
+        // is logged and skipped. An infrastructure error (`JoinError::Infra`)
+        // fails the step transiently so taquba re-delivers it.
         for (url, handle) in urls.iter().zip(handles) {
-            // Each completed handle is a progress point: re-extend the
-            // lease to cover the next job's worst-case completion.
+            // Each completed handle is a progress point: re-extend the lease to
+            // cover the next job's worst-case completion.
             if let Err(e) = step.lease.ensure_at_least(FETCH_JOIN_LEASE) {
-                // Let the still-in-flight jobs finish: a superseding
-                // delivery's idempotent re-submits await these same
-                // job ids.
+                // Let the still-in-flight jobs finish: a superseding delivery's
+                // idempotent re-submits await these same job ids.
                 guard.disarm();
                 return Err(lease_step_err(e));
             }
@@ -568,9 +550,9 @@ impl ResearchStepRunner {
                     tracing::warn!(url = %url, error = %je, "fetch failed, skipping page");
                 }
                 Err(JoinError::Infra(infra)) => {
-                    // Step will be retried; let the still-in-flight
-                    // jobs finish so the retry's idempotent submits
-                    // short-circuit to their cached results.
+                    // The step is retried. Let the still-in-flight jobs finish
+                    // so the retry's idempotent submits short-circuit to their
+                    // cached results.
                     guard.disarm();
                     return Err(StepError::transient(format!("fetch infra: {infra}")));
                 }
@@ -593,8 +575,8 @@ impl ResearchStepRunner {
             return Ok(());
         };
         let Some(page) = state.fetched.get(&url).cloned() else {
-            // Shouldn't happen as summarize_queue is populated only after
-            // a successful fetch.
+            // Unreachable in normal flow: `summarize_queue` receives a URL only
+            // after a successful fetch.
             if state.summarize_queue.is_empty() {
                 state.phase = Phase::Synthesizing;
             }
@@ -650,9 +632,9 @@ impl ResearchStepRunner {
                 .partial_cmp(&a.1.relevance)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        // The 1-based source number is the position in this sorted list and
-        // is shared by the prompt text, the citation list, and any cited
-        // excerpts. Building all three here keeps that numbering consistent.
+        // The 1-based source number is the position in this sorted list and is
+        // shared by the prompt text, the citation list and any cited excerpts.
+        // Building all three here keeps that numbering consistent.
         for (idx, &(url, s)) in sorted.iter().enumerate() {
             let index = idx + 1;
             sources.push_str(&format!(
@@ -759,8 +741,8 @@ impl ResearchStepRunner {
         })
     }
 
-    /// Run a single completion via Rig, dispatched to the configured
-    /// provider, with the delivery lease extended to cover the call's
+    /// Run a single completion via Rig, dispatched to the configured provider,
+    /// with the delivery lease extended to cover the call's
     /// [`LLM_CALL_TIMEOUT`] bound. Records this call's token usage on
     /// `state.token_usage` and logs the per-call counts at info level.
     async fn llm_prompt(
@@ -815,9 +797,9 @@ impl ResearchStepRunner {
         }
     }
 
-    /// Run a structured completion via Rig's `prompt_typed`, dispatched
-    /// to the configured provider. Same lease and usage-tracking
-    /// behaviour as [`Self::llm_prompt`].
+    /// Run a structured completion via Rig's `prompt_typed`, dispatched to the
+    /// configured provider. Same lease and usage-tracking behaviour as
+    /// [`Self::llm_prompt`].
     async fn llm_prompt_typed<T>(
         &self,
         lease: &LeaseHandle,
@@ -862,8 +844,8 @@ async fn prompt_extended(
         .map_err(classify_rig_err)
 }
 
-/// Structured counterpart to [`prompt_extended`], running Rig's
-/// `prompt_typed` for the schema `T`.
+/// Structured counterpart to [`prompt_extended`], running Rig's `prompt_typed`
+/// for the schema `T`.
 async fn prompt_typed_extended<T>(
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
@@ -878,8 +860,8 @@ where
         .map_err(classify_structured_err)
 }
 
-/// Accumulate one call's `Usage` into the run-aggregate `TokenUsage`,
-/// logging the per-call counts at info level.
+/// Accumulate one call's `Usage` into the run-aggregate `TokenUsage`, logging
+/// the per-call counts at info level.
 fn record_usage(total: &mut TokenUsage, call: &Usage) {
     tracing::info!(
         input = call.input_tokens,
@@ -907,10 +889,9 @@ fn record_usage(total: &mut TokenUsage, call: &Usage) {
     add(&mut total.reasoning_tokens, call.reasoning_tokens);
 }
 
-/// Extend `lease` to cover `bound`, then run `work` under a timeout
-/// of the same bound, so the delivery cannot outlive its lease
-/// mid-call. A timeout is a transient step error; `what` names the
-/// call in the error message.
+/// Extend `lease` to cover `bound`, then run `work` under a timeout of the same
+/// bound, so the delivery cannot outlive its lease mid-call. A timeout is a
+/// transient step error, and `what` identifies the call in the error message.
 async fn under_lease<T, F>(
     lease: &LeaseHandle,
     bound: Duration,
@@ -930,19 +911,18 @@ where
     }
 }
 
-/// Map a failed lease extension to a transient step error. The
-/// extension fails only when the claim was lost or the job's
-/// cancellation was requested; in both cases this delivery's
-/// settlement is rejected or its run terminated, so retrying is safe.
+/// Map a failed lease extension to a transient step error. The extension fails
+/// only when the claim was lost or the job's cancellation was requested. In
+/// both cases this delivery's settlement is rejected or its run terminated, so
+/// a retry is safe.
 fn lease_step_err(e: taquba::Error) -> StepError {
     StepError::transient(format!("lease extension failed: {e}"))
 }
 
-/// Returns the JSON-decoded value previously written to `memo`
-/// under `key`. If none exists, awaits `compute`, JSON-encodes its
-/// result into the memo, and returns it; an at-least-once retry of
-/// the surrounding step then finds the cached value and skips the
-/// compute call entirely.
+/// Returns the JSON-decoded value previously written to `memo` under `key`. If
+/// none exists, awaits `compute`, JSON-encodes its result into the memo, and
+/// returns it. An at-least-once retry of the surrounding step then finds the
+/// cached value and skips the compute call entirely.
 async fn memoized<T, F>(memo: &Memo, key: &str, compute: F) -> Result<T, StepError>
 where
     T: Serialize + DeserializeOwned,
@@ -970,13 +950,13 @@ fn classify_rig_err(err: PromptError) -> StepError {
             StepError::permanent(format!("LLM permanent failure: {msg}"))
         }
 
-        // Errors that preserve a provider HTTP status classify by that
-        // status; this covers both non-success responses and error
-        // envelopes returned with a 2xx status (2xx classifies as
-        // transient below). Errors without a status (transport, decode,
-        // `MemoryError`, any future variant; `PromptError` is
-        // non-exhaustive) default to transient and are dead-lettered
-        // after `max_attempts` when persistent.
+        // Errors that preserve a provider HTTP status classify by that status.
+        // This covers both non-success responses and error envelopes returned
+        // with a 2xx status (2xx classifies as transient in
+        // `is_transient_status`). Errors without a status (transport, decode,
+        // `MemoryError`, any future variant of the non-exhaustive
+        // `PromptError`) default to transient and are dead-lettered after
+        // `max_attempts` when persistent.
         err => match err.provider_response_status() {
             Some(status) => classify_status(status.as_u16(), &msg),
             None => StepError::transient(format!("LLM call failed: {msg}")),
@@ -994,10 +974,8 @@ fn classify_status(code: u16, msg: &str) -> StepError {
     }
 }
 
-/// HTTP retry policy.
-/// Transient: 429 (rate limit), 5xx (server errors), and any
-/// non-4xx code.
-/// Permanent: 4xx other than 429.
+/// HTTP retry policy: 429 (rate limit), 5xx (server errors) and any non-4xx
+/// code are transient, and any other 4xx is permanent.
 fn is_transient_status(code: u16) -> bool {
     code == 429 || !(400..500).contains(&code)
 }
@@ -1025,25 +1003,24 @@ struct Plan {
     sub_questions: Vec<String>,
 }
 
-/// Summarizing step response schema.
+/// `Summarizing` step response schema.
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct SummaryResp {
     summary: String,
     relevance: f32,
 }
 
-/// A plain completion's text plus whether its final completion call
-/// stopped at the output-token limit. The Writing step memoizes the
-/// whole value, so the truncation flag is preserved across a step
-/// retry.
+/// A plain completion's text plus whether its final completion call stopped at
+/// the output-token limit. The Writing step memoizes the whole value, so the
+/// truncation flag is preserved across a step retry.
 #[derive(Serialize, Deserialize)]
 struct PromptOutput {
     text: String,
     truncated: bool,
 }
 
-/// Whether the final completion call of an agent run stopped
-/// generating at the output-token limit.
+/// Whether the final completion call of an agent run stopped generating at the
+/// output-token limit.
 fn length_truncated(calls: &[CompletionCall]) -> bool {
     calls
         .last()
@@ -1137,17 +1114,16 @@ fn anthropic_citation_document_span(
     }
 }
 
-/// Classify a typed-prompt error. Delegates the wrapped `PromptError`
-/// case to [`classify_rig_err`]; structured-output-specific variants
-/// are mapped according to whether retrying would plausibly help.
+/// Classify a typed-prompt error. Delegates the wrapped `PromptError` case to
+/// [`classify_rig_err`]. A deserialization error is permanent and an empty
+/// response is transient.
 fn classify_structured_err(err: StructuredOutputError) -> StepError {
     match err {
         StructuredOutputError::PromptError(inner) => classify_rig_err(inner),
         StructuredOutputError::DeserializationError(e) => {
             StepError::permanent(format!("typed prompt: schema deserialize failed: {e}"))
         }
-        // Empty response is the one variant that's typically a one-off
-        // transient provider failure; retrying is appropriate.
+        // An empty response is typically a one-off provider failure.
         StructuredOutputError::EmptyResponse => {
             StepError::transient("typed prompt: model returned an empty response".to_string())
         }
@@ -1168,8 +1144,8 @@ mod tests {
         CancelSentinel::new(Arc::new(InMemory::new()), &Path::default())
     }
 
-    /// Build a `Step` with a fresh in-memory `Memo` and otherwise
-    /// inert fields, suitable for exercising memo-using helpers.
+    /// Build a `Step` with a fresh in-memory `Memo` and otherwise inert fields,
+    /// suitable for exercising memo-using helpers.
     fn test_step(run_id: &str, step_number: u32) -> Step {
         let run_id = RunId::new(run_id).unwrap();
         let mut step = Step::detached(Vec::new());
@@ -1211,8 +1187,8 @@ mod tests {
         let sentinel = test_sentinel();
         sentinel.mark("run-1").await.unwrap();
 
-        // Initial check fires before any sleep, so this returns
-        // without yielding to the timer.
+        // Initial check fires before any sleep, so this returns without
+        // yielding to the timer.
         poll_cancelled(&sentinel, "run-1").await;
     }
 
@@ -1225,8 +1201,8 @@ mod tests {
             writer.mark("run-2").await.unwrap();
         });
 
-        // With virtual time the polling loop's sleep auto-advances
-        // when the runtime is idle.
+        // With virtual time the polling loop's sleep auto-advances when the
+        // runtime is idle.
         poll_cancelled(&sentinel, "run-2").await;
     }
 
@@ -1536,8 +1512,8 @@ mod tests {
         let queue = Arc::new(Queue::open(object_store.clone(), "q").await.unwrap());
         let run_id = RunId::new("01RUNIDX").unwrap();
 
-        // Pre-populate the writing memo so the terminal step completes
-        // without an LLM call.
+        // Pre-populate the writing memo so the terminal step completes without
+        // an LLM call.
         MemoStore::new(object_store.clone(), "test-memo")
             .new_memo(&run_id, 0)
             .put(
@@ -1628,8 +1604,7 @@ mod tests {
         assert!(terminal.error.is_none());
         assert_eq!(terminal.summary.steps_completed, 1);
 
-        // The Writing step wrote the canonical report blob before it
-        // settled.
+        // The Writing step wrote the canonical report blob before it settled.
         let blob = object_store
             .get(&crate::store::report_path(&Path::default(), &run_id))
             .await

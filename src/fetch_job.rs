@@ -1,19 +1,15 @@
-//! `FetchPage`: the durable [`Job`] that fetches a single URL and
-//! returns its title + extracted plain text.
+//! `FetchPage`: the durable [`Job`] that fetches a single URL and returns its
+//! title and extracted plain text.
 //!
-//! Submitting one `FetchPage` per URL with a deterministic
-//! `idempotency_key` and `try_join_all`-ing the handles is how the
-//! [`Phase::Fetching`](crate::state::Phase::Fetching) step parallelises
-//! its work while staying correct under at-least-once retries. A
-//! retried step re-submits the same payloads, the job runner's
-//! result-aware idempotent submit short-circuits to the recorded
-//! results, and the awaits resolve without re-running any HTTP.
+//! The [`Phase::Fetching`](crate::state::Phase::Fetching) step parallelises its
+//! work by submitting a `FetchPage` per URL with a deterministic
+//! `idempotency_key` and awaiting the handles with `try_join_all`. A retried
+//! step re-submits the same payloads, the job runner's result-aware idempotent
+//! submit short-circuits to the recorded results, and the awaits resolve
+//! without a second HTTP request.
 //!
-//! Per-URL work has no LLM cost, so saving the bytes is incidental
-//! here; what matters is that the surrounding step becomes a single
-//! workflow step rather than N (one-per-URL), and the
-//! `(run_id, url)`-keyed idempotency replaces the per-step `Memo` we'd
-//! otherwise need.
+//! The fetching phase is a single workflow step for all URLs, and the
+//! idempotency key derived from `(run_id, url)` replaces a per-step `Memo`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,32 +24,30 @@ use url::Url;
 
 use crate::state::FetchedPage;
 
-/// Maximum bytes we'll read from a single fetch response, before
-/// applying the further `max_chars` cap on extracted text.
+/// Maximum bytes read from a single fetch response, before the `max_chars` cap
+/// on extracted text applies.
 const FETCH_RESPONSE_BYTE_CAP: usize = 2 * 1024 * 1024;
 /// Per-fetch HTTP timeout.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
-/// Logical queue name for fetch jobs. Distinct from the workflow
-/// runtime's queue so retention policies can diverge if needed.
+/// Logical queue name for fetch jobs, distinct from the workflow runtime's
+/// queue.
 pub const FETCH_QUEUE_NAME: &str = "research-fetch-jobs";
-/// How long a `FetchPage` run result record is retained after the
-/// job reaches a terminal state. Any in-process idempotent
-/// re-submission (workflow-step retry) of the same `(run_id, url)`
-/// short-circuits to the recorded result until this window elapses;
-/// after that the record is swept and a re-submission falls through
-/// to a fresh fetch. One week covers every realistic run wall-time +
-/// inspection gap.
+/// How long a `FetchPage` run result record is retained after the job reaches a
+/// terminal state. An in-process idempotent re-submission (a workflow-step
+/// retry) of the same `(run_id, url)` short-circuits to the recorded result
+/// until this window elapses. After that the record is swept and a
+/// re-submission fetches the page again. The week exceeds every realistic run
+/// wall-time plus an inspection gap.
 const FETCH_RESULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Build a [`JobRunner`] with the internal `FetchPage` job
-/// registered and an `Arc<reqwest::Client>` on its state, then spawn
-/// its worker. Returns the `JobRunner` for submission and a
-/// [`RunnerHandle`] for graceful shutdown.
+/// Build a [`JobRunner`] with the internal `FetchPage` job registered and an
+/// `Arc<reqwest::Client>` on its state, then spawn its worker. Returns the
+/// `JobRunner` for submission and a [`RunnerHandle`] for graceful shutdown.
 ///
-/// The runner shares the supplied `queue` and `object_store` with
-/// the surrounding workflow runtime; jobs are enqueued under the
-/// `research-fetch-jobs` queue-name and their memo and run result
-/// records live under a sibling prefix in the object store.
+/// The runner shares the supplied `queue` and `object_store` with the
+/// surrounding workflow runtime. Jobs are enqueued with the
+/// `research-fetch-jobs` queue name, and their memo and run result records are
+/// stored at a sibling prefix in the object store.
 pub fn spawn_fetch_runner(
     queue: &Arc<Queue>,
     object_store: &Arc<dyn ObjectStore>,
@@ -78,9 +72,8 @@ pub fn spawn_fetch_runner(
 /// One durable HTTP fetch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FetchPage {
-    /// The owning research run; combined with `url` into the
-    /// idempotency key so retries dedup or short-circuit to a
-    /// cached result.
+    /// The owning research run. Combined with `url` into the idempotency key,
+    /// so a retry is deduplicated or short-circuits to the recorded result.
     pub run_id: String,
     /// The URL to fetch.
     pub url: Url,
@@ -91,32 +84,31 @@ pub(crate) struct FetchPage {
 /// Failure modes for [`FetchPage`].
 #[derive(Debug, Error)]
 pub(crate) enum FetchError {
-    /// Transport-layer failure: connect timeout, DNS, TLS, broken
-    /// stream. Retryable.
+    /// Transport-layer failure: connect timeout, DNS, TLS, broken stream.
+    /// Retryable.
     #[error("send: {0}")]
     Transport(String),
     /// Reading the response body failed mid-stream.
     #[error("read body: {0}")]
     ReadBody(String),
-    /// The server returned a non-success status. Classification
-    /// depends on the code: 5xx and 429 retry, other 4xx fail fast.
+    /// The server returned a non-success status. Classification depends on the
+    /// code: 5xx and 429 retry, other 4xx fail fast.
     #[error("HTTP {0}")]
     HttpStatus(u16),
-    /// `Content-Type` was set to something that isn't text-like.
+    /// `Content-Type` is set to a type that is not text-like.
     #[error("non-text content-type: {0}")]
     NonText(String),
-    /// The page fetched fine but extraction yielded no readable
-    /// text. Treated as permanent.
+    /// The fetch succeeded but extraction did not yield readable text. Treated
+    /// as permanent.
     #[error("empty extracted text")]
     Empty,
-    /// The job's cancel-token fired mid-fetch (via `Queue::cancel`,
-    /// triggered when the surrounding research run is cancelled).
-    /// Treated as permanent so the job dead-letters cleanly rather
-    /// than retrying after the owning run is already gone.
+    /// The job's cancel-token fired mid-fetch (via `Queue::cancel`, issued when
+    /// the surrounding research run is cancelled). Treated as permanent, so the
+    /// job dead-letters and does not retry after the owning run ends.
     #[error("cancelled")]
     Cancelled,
-    /// Extending the delivery's lease to cover the fetch failed: the
-    /// claim was lost to a re-delivery. Retryable.
+    /// Extending the delivery's lease to cover the fetch failed: the claim was
+    /// lost to a re-delivery. Retryable.
     #[error("lease: {0}")]
     Lease(String),
 }
@@ -128,19 +120,18 @@ impl Job for FetchPage {
 
     async fn run(&self, ctx: JobContext<'_>) -> Result<FetchedPage, FetchError> {
         let http = ctx.state::<Arc<reqwest::Client>>();
-        // Extend the lease to cover the fetch's timeout before
-        // issuing it, so a slow page cannot outlive the lease.
+        // Extend the lease to cover the fetch's timeout before issuing it, so a
+        // slow page cannot outlive the lease.
         if let Err(e) = ctx.lease.ensure_at_least(FETCH_TIMEOUT) {
             return Err(match e {
                 taquba::Error::CancelRequested => FetchError::Cancelled,
                 other => FetchError::Lease(other.to_string()),
             });
         }
-        // Race the HTTP fetch against the job's cooperative
-        // cancellation. When the surrounding run is cancelled,
-        // run_fetching calls `Queue::cancel(job_id)`, which fires
-        // this token; we abort the in-flight HTTP request instead
-        // of running it out to the reqwest timeout.
+        // Race the HTTP fetch against the job's cooperative cancellation. When
+        // the surrounding run is cancelled, run_fetching calls
+        // `Queue::cancel(job_id)`, which fires this token. The in-flight HTTP
+        // request is then aborted before the reqwest timeout.
         tokio::select! {
             result = fetch_and_extract(http, &self.url, self.max_chars) => result,
             _ = ctx.cancel_token.cancelled() => Err(FetchError::Cancelled),
@@ -165,17 +156,16 @@ impl Job for FetchPage {
     }
 }
 
-/// HTTP retry policy: 5xx server errors, 429 rate-limit, and any
-/// non-4xx code are transient; the rest of 4xx (404, 401, 422, …)
-/// will not improve on retry.
+/// HTTP retry policy: 5xx server errors, 429 rate-limit and every non-4xx code
+/// are transient. The rest of 4xx (404, 401, 422, …) is permanent.
 fn is_transient_status(code: u16) -> bool {
     code == 429 || !(400..500).contains(&code)
 }
 
-/// Fetch `url`, decode the response, and return the page title +
-/// plain-text rendering of the body capped at `max_chars`. Returns a
-/// structured [`FetchError`] so [`FetchPage::classify`] can route
-/// retryable failures back through the queue.
+/// Fetch `url`, decode the response and return the page title and a plain-text
+/// rendering of the body capped at `max_chars`. Returns a structured
+/// [`FetchError`] that [`FetchPage::classify`] maps to a retry or a permanent
+/// failure.
 async fn fetch_and_extract(
     http: &reqwest::Client,
     url: &Url,
@@ -225,8 +215,7 @@ async fn fetch_and_extract(
 /// Extract the page's `<title>` and a plain-text rendering of the body.
 fn extract_html(html: &str) -> (String, String) {
     let title = extract_tag_content(html, "title").unwrap_or_default();
-    // Width is intentionally large to avoid injecting newlines
-    // mid-sentence and bloating tokens.
+    // The large width prevents newlines mid-sentence, which add tokens.
     let text = html2text::from_read(html.as_bytes(), 100_000).unwrap_or_default();
     (title.trim().to_string(), text)
 }

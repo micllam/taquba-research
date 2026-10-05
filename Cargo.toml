@@ -11,9 +11,9 @@ keywords = ["agent", "research", "rig", "taquba", "durable"]
 include = ["src/**", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE-APACHE", "LICENSE-MIT"]
 
 [features]
-# No cloud backend by default; the in-memory and local-disk stores work
-# without any feature. Pick exactly one for cloud builds. These mirror
-# taquba's mutually-exclusive cloud feature flags.
+# The in-memory and local-disk stores work without a feature. A cloud build
+# enables exactly one of the cloud features, which mirror the mutually exclusive
+# cloud feature flags of taquba.
 default = []
 aws = ["taquba/aws"]
 gcp = ["taquba/gcp"]
@@ -28,8 +28,7 @@ name = "taquba-research"
 path = "src/bin/taquba_research.rs"
 
 [package.metadata.docs.rs]
-# Build docs with one cloud backend on so cloud-store wiring is visible
-# on docs.rs.
+# docs.rs builds with one cloud backend enabled.
 features = ["aws"]
 
 [dependencies]
@@ -57,9 +56,8 @@ schemars = "1"
 html2text = "0.17"
 
 [dev-dependencies]
-# `test-util` enables `#[tokio::test(start_paused = true)]` for
-# deterministic, non-real-time scheduling in tests that exercise
-# the runner's polling/timeout paths.
+# `test-util` enables `#[tokio::test(start_paused = true)]`, the paused clock of
+# the tests of the polling and timeout paths of the runner.
 tokio = { version = "1", features = ["test-util"] }
 # `CancellationToken` for constructing `taquba_workflow::Step` in tests.
 tokio-util = { version = "0.7", default-features = false }
