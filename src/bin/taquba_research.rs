@@ -28,6 +28,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rig_core::providers::{anthropic, ollama, openai};
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
+use taquba::object_store::prefix::PrefixStore;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, parse_url_opts};
 use taquba::{
     JobRecord, JobStatus, OpenOptions, Queue, QueueConfig, QueueReader, ReaderMode, ReaderOptions,
@@ -266,12 +267,12 @@ fn parse_gc_status(s: &str) -> std::result::Result<GcStatus, String> {
     }
 }
 
-/// Resolved store handle: the shared `ObjectStore` and the key prefix within it
-/// under which queue / runs / reports all live.
+/// Resolved store handle: the shared `ObjectStore`, scoped to the path of
+/// `--store`, at whose root the queue, the memos, the runs and the reports all
+/// live.
 #[derive(Clone)]
 struct StoreCtx {
     object_store: Arc<dyn ObjectStore>,
-    prefix: ObjectPath,
     /// User-visible source string for the store (the raw path or URL), which
     /// CLI messages print to identify the store.
     source: String,
@@ -285,7 +286,7 @@ async fn main() -> Result<()> {
     let store_ctx = resolve_store(cli.store.as_deref())
         .await
         .context("opening store")?;
-    let sentinel = CancelSentinel::new(store_ctx.object_store.clone(), &store_ctx.prefix);
+    let sentinel = CancelSentinel::new(store_ctx.object_store.clone(), &ObjectPath::default());
 
     match &cli.command {
         Some(Command::Resume { run_id, force }) => {
@@ -361,16 +362,13 @@ async fn resolve_store(flag: Option<&str>) -> Result<StoreCtx> {
         let (store, path) = parse_url_opts(&url, store_options(std::env::vars()))
             .with_context(|| format!("opening object store from URL `{raw}`"))?;
         return Ok(StoreCtx {
-            object_store: Arc::from(store),
-            prefix: path,
+            object_store: Arc::new(PrefixStore::new(store, path)),
             source: raw,
         });
     }
 
     // Bare path: create the directory if missing, then wrap it in
-    // LocalFileSystem with that directory as the LocalFileSystem prefix. The
-    // key prefix inside the store is the empty path, and SlateDB, the run store
-    // and the reports all live directly under it.
+    // LocalFileSystem with that directory as the LocalFileSystem prefix.
     let dir = PathBuf::from(&raw);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -379,7 +377,6 @@ async fn resolve_store(flag: Option<&str>) -> Result<StoreCtx> {
         .with_context(|| format!("opening LocalFileSystem at {}", dir.display()))?;
     Ok(StoreCtx {
         object_store: Arc::new(local),
-        prefix: ObjectPath::default(),
         source: raw,
     })
 }
@@ -424,18 +421,10 @@ fn validate_store_arg(s: &str) -> std::result::Result<String, String> {
     }
 }
 
-fn queue_path(ctx: &StoreCtx) -> String {
-    if ctx.prefix.as_ref().is_empty() {
-        QUEUE_DB_NAME.to_string()
-    } else {
-        format!("{}/{}", ctx.prefix.as_ref(), QUEUE_DB_NAME)
-    }
-}
-
 async fn open_queue(ctx: &StoreCtx) -> Result<Arc<Queue>> {
     let opts = OpenOptions::default()
         .default_queue_config(QueueConfig::default().lease_duration(LEASE_DURATION));
-    let queue = Queue::open_with_options(ctx.object_store.clone(), &queue_path(ctx), opts)
+    let queue = Queue::open_with_options(ctx.object_store.clone(), QUEUE_DB_NAME, opts)
         .await
         .context("opening taquba queue")?;
     Ok(Arc::new(queue))
@@ -446,8 +435,9 @@ async fn open_queue(ctx: &StoreCtx) -> Result<Arc<Queue>> {
 /// case to "no runs".
 async fn queue_exists(ctx: &StoreCtx) -> Result<bool> {
     use futures_util::TryStreamExt;
-    let prefix = ctx.prefix.clone().join(QUEUE_DB_NAME);
-    let mut stream = ctx.object_store.list(Some(&prefix));
+    let mut stream = ctx
+        .object_store
+        .list(Some(&ObjectPath::from(QUEUE_DB_NAME)));
     Ok(stream
         .try_next()
         .await
@@ -460,7 +450,7 @@ async fn queue_exists(ctx: &StoreCtx) -> Result<bool> {
 async fn open_reader(ctx: &StoreCtx) -> Result<QueueReader> {
     QueueReader::open_with_options(
         ctx.object_store.clone(),
-        &queue_path(ctx),
+        QUEUE_DB_NAME,
         ReaderOptions::default().mode(ReaderMode::FollowLatest),
     )
     .await
@@ -591,7 +581,7 @@ async fn write_report(
 ) -> Result<String> {
     match target {
         OutputTarget::DefaultInStore => {
-            let key = store::report_path(&fallback.prefix, run_id);
+            let key = store::report_path(&ObjectPath::default(), run_id);
             fallback
                 .object_store
                 .put(&key, PutPayload::from(markdown.as_bytes().to_vec()))
@@ -692,7 +682,7 @@ fn spawn_runtime(
     let runner = runner
         .with_job_runner(job_runner)
         .with_queue(queue.clone())
-        .with_report_store(store_ctx.object_store.clone(), &store_ctx.prefix);
+        .with_report_store(store_ctx.object_store.clone(), &ObjectPath::default());
 
     // Sequential workflow: one claimer is enough. See agent.rs for context.
     let runtime =
@@ -972,7 +962,7 @@ async fn handle_terminal(
             // `reports/`, and `--output` adds a copy elsewhere.
             let stored = format!(
                 "{} (in configured store)",
-                store::report_path(&store_ctx.prefix, run_id)
+                store::report_path(&ObjectPath::default(), run_id)
             );
             let where_ = match resolve_output(cli.output.as_deref())? {
                 OutputTarget::DefaultInStore => stored,
@@ -1218,7 +1208,7 @@ async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) ->
     // The canonical report blob is written by the terminal path in every case,
     // and its absence means the run is unknown, unfinished or did not succeed.
     // The index entry is consulted only for a more specific error message.
-    let key = store::report_path(&store_ctx.prefix, &run_id);
+    let key = store::report_path(&ObjectPath::default(), &run_id);
     // The body read shares the get's error handling: either call can return
     // NotFound depending on the backend.
     let read = match store_ctx.object_store.get(&key).await {
@@ -1298,7 +1288,7 @@ async fn cmd_reply(store_ctx: &StoreCtx, run_id: String, text: &str) -> Result<(
 
 /// The reply box of the runs in the store of `store_ctx`.
 fn replies(store_ctx: &StoreCtx) -> ReplyBox {
-    ReplyBox::new(store_ctx.object_store.clone(), &store_ctx.prefix)
+    ReplyBox::new(store_ctx.object_store.clone(), &ObjectPath::default())
 }
 
 async fn cmd_cancel(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: String) -> Result<()> {
@@ -1344,7 +1334,7 @@ async fn cmd_init(store_ctx: &StoreCtx) -> Result<()> {
     // The first entry of a `list` checks the credentials and the existence of
     // the bucket on every backend without a write, and an empty store returns
     // `None`.
-    let mut stream = store_ctx.object_store.list(Some(&store_ctx.prefix));
+    let mut stream = store_ctx.object_store.list(None);
     let has_any = stream
         .try_next()
         .await
@@ -1468,7 +1458,7 @@ async fn cmd_gc(
         }
         // Default-location report. Custom `--output` destinations are not
         // tracked and are not deleted.
-        let report = store::report_path(&store_ctx.prefix, &e.run_id);
+        let report = store::report_path(&ObjectPath::default(), &e.run_id);
         match store_ctx.object_store.delete(&report).await {
             Ok(_) | Err(taquba::object_store::Error::NotFound { .. }) => {}
             Err(err) => {
@@ -1525,7 +1515,24 @@ impl TerminalHook for CaptureHook {
 
 #[cfg(test)]
 mod tests {
-    use super::{ellipsize, store_options};
+    use super::{WORKFLOW_MEMO_PREFIX, ellipsize, resolve_store, store_options};
+    use taquba_workflow::{MemoStore, RunId};
+
+    #[tokio::test]
+    async fn a_url_store_keeps_the_memos_under_its_path() {
+        let dir = std::env::temp_dir().join(format!("taquba-research-{}", ulid::Ulid::new()));
+        let ctx = resolve_store(Some(&format!("file://{}/sub", dir.display())))
+            .await
+            .unwrap();
+        MemoStore::new(ctx.object_store.clone(), WORKFLOW_MEMO_PREFIX)
+            .new_run_memo(&RunId::new("01RUN").unwrap())
+            .put("key", b"value")
+            .await
+            .unwrap();
+        let under_path = dir.join("sub").join(WORKFLOW_MEMO_PREFIX).exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(under_path);
+    }
 
     #[test]
     fn store_options_are_the_provider_variables_in_lowercase() {

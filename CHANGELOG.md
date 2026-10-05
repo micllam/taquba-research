@@ -57,6 +57,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that waits for a reply, so a struct literal of it fails to compile. Build the
   summary with `summarize_state`.
 
+### Fixed
+- The CLI keeps the workflow memos and the fetch job records of a `--store` URL
+  under the path of the URL, in place of the root of the bucket, or the
+  filesystem root for a `file://` URL, where a write can fail. Delete
+  `research-workflow-memo/` and `research-fetch-jobs-memo/` at the root of the
+  bucket, and expect a run in flight across the upgrade to call its memoized
+  steps again.
+
 <!-- vale off -->
 
 ## [0.5.0] - 2026-10-03
