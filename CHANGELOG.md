@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `status` command prints `step`, the current step number from the workflow
   view, and `error_kind`, the classification of the failure that ended a run.
   Its `progress` line becomes `phase`.
+- The investigating step, between summarising and synthesis, in which a Rig
+  agent with the `web_search` and `fetch_page` tools adds sources for the gaps
+  of the summaries, at up to 8 more model calls per run. The CLI flag
+  `--investigation-turns` sets the budget, and 0 skips the step.
 
 ### Changed
 - **Breaking:** `store::derive_display_status` takes the run's `RunState` from
@@ -32,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `WorkflowView` in place of a scan of every step job. A step
   dead-lettered outside the worker displays `queued`, and `resume` of its run
   proceeds, until the next worker terminates the run.
+- **Breaking:** `Phase` gains `Investigating`, so an exhaustive match on `Phase`
+  fails to compile. Add an arm for `Phase::Investigating`.
+- **Breaking:** `ResearchConfig` gains `investigation_turns`, the model-call
+  budget of the investigating step, so a struct literal without it fails to
+  compile and a state of 0.5.0 decodes with 0. Set the field, or start from
+  `ResearchConfig::new`, which sets 8.
 
 <!-- vale off -->
 

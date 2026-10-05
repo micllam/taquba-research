@@ -38,6 +38,10 @@ pub struct ResearchConfig {
     /// Per-page text limit fed to the summarising step (UTF-8 chars). Larger
     /// pages are truncated.
     pub max_page_chars: usize,
+    /// Model-call budget of the investigating step. With 0 the run skips the
+    /// step. A state persisted without the field decodes as 0.
+    #[serde(default)]
+    pub investigation_turns: usize,
 }
 
 impl ResearchConfig {
@@ -51,6 +55,7 @@ impl ResearchConfig {
             model: model.into(),
             max_tokens_per_call: None,
             max_page_chars: 16_000,
+            investigation_turns: 8,
         }
     }
 }
@@ -103,6 +108,9 @@ pub enum Phase {
     Fetching,
     /// Summarising each fetched page via the LLM.
     Summarizing,
+    /// Searching and fetching pages for the gaps of the summaries, through a
+    /// Rig agent with tools.
+    Investigating,
     /// Combining per-page summaries into a single narrative via the LLM.
     Synthesizing,
     /// Writing the final markdown report via the LLM.
@@ -117,6 +125,7 @@ impl Phase {
             Self::Searching => "searching",
             Self::Fetching => "fetching",
             Self::Summarizing => "summarizing",
+            Self::Investigating => "investigating",
             Self::Synthesizing => "synthesizing",
             Self::Writing => "writing",
         }
@@ -273,6 +282,7 @@ mod tests {
     fn round_trip_serde() {
         let mut s = ResearchState::new("a query", ResearchConfig::new("gpt-4o-mini"));
         s.config.max_tokens_per_call = Some(2048);
+        s.config.investigation_turns = 3;
         let url: Url = "https://example.com/page".parse().unwrap();
         s.fetched.insert(
             url.clone(),
@@ -326,6 +336,15 @@ mod tests {
         assert_eq!(back.synthesis, s.synthesis);
         assert_eq!(back.token_usage, s.token_usage);
         assert_eq!(back.config.max_tokens_per_call, Some(2048));
+        assert_eq!(back.config.investigation_turns, 3);
+    }
+
+    #[test]
+    fn research_config_decodes_without_investigation_turns() {
+        let json = r#"{"depth":6,"max_sources":30,"model":"m",
+            "max_tokens_per_call":null,"max_page_chars":100}"#;
+        let config: ResearchConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.investigation_turns, 0);
     }
 
     #[test]

@@ -132,6 +132,11 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     max_sources: usize,
 
+    /// Model-call budget of the investigating step, which searches and fetches
+    /// pages for the gaps of the summaries. With 0 the run skips the step.
+    #[arg(long, default_value_t = 8)]
+    investigation_turns: usize,
+
     /// LLM provider (`openai`, `anthropic` or `ollama`). If unset, the CLI
     /// chooses one based on which `*_API_KEY` env var is set:
     /// `ANTHROPIC_API_KEY` alone selects `anthropic`, and every other case
@@ -617,6 +622,7 @@ fn build_config(cli: &Cli) -> ResearchConfig {
     ResearchConfig {
         depth: cli.depth,
         max_sources: cli.max_sources,
+        investigation_turns: cli.investigation_turns,
         ..ResearchConfig::new(model)
     }
 }

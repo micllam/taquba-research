@@ -5,10 +5,11 @@ Durable research agent for Rust, built on
 [taquba](https://crates.io/crates/taquba) stack.
 
 Given a question, the agent plans, searches the web, fetches and reads pages,
-then synthesises a cited report. The multi-step run persists across process
-crashes: the agent writes every transition to object storage and memoizes every
-completed LLM call. A run that stops after twenty paid model calls resumes from
-the last completed step and does not pay for any of those calls again.
+investigates the gaps with a Rig agent that uses tools, then synthesises a cited
+report. The multi-step run persists across process crashes: the agent writes
+every transition to object storage and memoizes every completed LLM call. A run
+that stops after twenty paid model calls resumes from the last completed step
+and does not pay for any of those calls again.
 
 This crate is a reference implementation and a CLI tool. It is a worked example
 of how Rig (LLM orchestration) and taquba (durable queues, workflows and jobs on
@@ -37,8 +38,9 @@ and `ResearchStepRunner::new_ollama`, and the matching `.openai(...)`,
 Anthropic runs pass the fetched pages as citation-enabled document blocks during
 synthesis. When Claude returns citation metadata, the final report includes the
 cited source excerpts. OpenAI and Ollama runs keep the standard numeric list of
-sources. The `Planning` and `Summarizing` phases use structured completions, so
-an Ollama model must emit schema-valid JSON reliably, and a model that does not
+sources. The `Planning`, `Summarizing` and `Investigating` phases use structured
+completions, and `Investigating` also uses tool calls. An Ollama model must emit
+schema-valid JSON and tool calls reliably, and a model that does not
 dead-letters those steps.
 
 ## Run
@@ -158,6 +160,10 @@ async fn main() -> anyhow::Result<()> {
 - **A retry does not pay for a model call again.** Each LLM-backed phase
   memoizes its output in its per-step `Memo`. An at-least-once redelivery
   short-circuits to the stored value and does not call or bill the model again.
+- **A retried investigation replays its agent.** The investigating step records
+  each completion and tool result of its Rig agent in the per-step memo, and a
+  redelivery replays the recorded results. A failed call is not recorded, so a
+  retry calls it again.
 - **The delivery lease covers every slow call.** Every LLM and search call runs
   under a timeout, and the step extends its lease
   (`LeaseHandle::ensure_at_least`) by that bound before the call. The fetching
@@ -180,7 +186,8 @@ single workflow step that submits one `FetchPage` job per URL to a `JobRunner`
 `try_join_all`. The `JobRunner` shares the queue and uses a distinct queue name.
 The per-URL `idempotency_key` derives from `(run_id, url)`, so on a step retry
 the idempotent submit of the job runner returns the recorded result, and no URL
-is fetched twice.
+is fetched twice. The `fetch_page` tool of the investigating step submits the
+same job for each page it reads.
 
 `spawn_fetch_runner` builds and spawns this `JobRunner`. `ResearchAgent::run`
 and the CLI call it internally, and a caller with a custom `WorkflowRuntime`

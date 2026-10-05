@@ -1,5 +1,5 @@
 //! [`ResearchStepRunner`]: the [`StepRunner`] that advances a research run
-//! through its six phases.
+//! through its seven phases.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -28,6 +28,8 @@ use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
 use url::Url;
 
 use crate::fetch_job::FetchPage;
+use crate::investigate::{self, FetchPageTool, Investigator};
+use crate::journal::Journal;
 use crate::report::{Citation, Report, RunStats, render_markdown};
 use crate::search::{SearchBackend, SearchError};
 use crate::state::{
@@ -37,7 +39,7 @@ use crate::store::{CancelSentinel, RunIndexEntry, RunSummary, StoredStatus, Term
 
 /// Preamble applied to every Rig agent built by the runner. The per-phase
 /// prompts contain the task-specific instructions.
-const AGENT_PREAMBLE: &str = "Be precise and concise.";
+pub(crate) const AGENT_PREAMBLE: &str = "Be precise and concise.";
 /// Cadence at which a step polls its cancellation sentinel while phase work is
 /// in flight. Sets the upper bound on how long an LLM or HTTP call keeps
 /// running after the CLI's `cancel` lands.
@@ -46,10 +48,10 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Upper bound on a single LLM completion call. The step's lease is extended by
 /// this much before the call is issued, so the delivery is not re-queued
 /// mid-call. Sized for slow local models.
-const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const LLM_CALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Upper bound on a single search-backend call, covered by the lease the same
 /// way.
-const SEARCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const SEARCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Upper bound on the canonical report blob write, covered by the lease the
 /// same way.
 const REPORT_PUT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -57,7 +59,7 @@ const REPORT_PUT_TIMEOUT: Duration = Duration::from_secs(20);
 /// full retry cycle (3 attempts of 20s each plus backoff) plus the wait for a
 /// runner slot while 16 concurrent jobs run, rounded up. Each completed handle
 /// re-extends, so the lease stays within one job completion of live progress.
-const FETCH_JOIN_LEASE: Duration = Duration::from_secs(150);
+pub(crate) const FETCH_JOIN_LEASE: Duration = Duration::from_secs(150);
 
 /// Memo user-keys for each phase's cached LLM response. Each is scoped per
 /// `(run_id, step_number)` by [`taquba_workflow::Memo`], so a plain string
@@ -68,7 +70,7 @@ const MEMO_KEY_SYNTHESIZING: &str = "synthesizing";
 const MEMO_KEY_WRITING: &str = "writing";
 
 /// Advances a research run through the plan -> search -> fetch -> summarise ->
-/// synthesise -> write phases.
+/// investigate -> synthesise -> write phases.
 ///
 /// Cloning a `ResearchStepRunner` copies its internal `Arc`s. One instance is
 /// shared across all worker tasks of a single [`WorkflowRuntime`].
@@ -364,6 +366,7 @@ impl ResearchStepRunner {
             Phase::Searching => self.run_searching(step, state).await?,
             Phase::Fetching => self.run_fetching(step, state).await?,
             Phase::Summarizing => self.run_summarizing(step, state).await?,
+            Phase::Investigating => self.run_investigating(step, state).await?,
             Phase::Synthesizing => self.run_synthesizing(step, state).await?,
             Phase::Writing => {
                 let report = self.run_writing(step, state).await?;
@@ -477,9 +480,8 @@ impl ResearchStepRunner {
 
         if state.search_queue.is_empty() {
             state.phase = if state.fetch_queue.is_empty() {
-                // No sources to fetch. The synthesis step produces a "nothing
-                // found" report.
-                Phase::Synthesizing
+                // No sources to fetch. The investigating step searches again.
+                Phase::Investigating
             } else {
                 Phase::Fetching
             };
@@ -571,14 +573,14 @@ impl ResearchStepRunner {
         state: &mut ResearchState,
     ) -> Result<(), StepError> {
         let Some(url) = state.summarize_queue.pop_front() else {
-            state.phase = Phase::Synthesizing;
+            state.phase = Phase::Investigating;
             return Ok(());
         };
         let Some(page) = state.fetched.get(&url).cloned() else {
             // Unreachable in normal flow: `summarize_queue` receives a URL only
             // after a successful fetch.
             if state.summarize_queue.is_empty() {
-                state.phase = Phase::Synthesizing;
+                state.phase = Phase::Investigating;
             }
             return Ok(());
         };
@@ -612,8 +614,79 @@ impl ResearchStepRunner {
         );
 
         if state.summarize_queue.is_empty() {
-            state.phase = Phase::Synthesizing;
+            state.phase = Phase::Investigating;
         }
+        Ok(())
+    }
+
+    async fn run_investigating(
+        &self,
+        step: &Step,
+        state: &mut ResearchState,
+    ) -> Result<(), StepError> {
+        state.phase = Phase::Synthesizing;
+        let turns = state.config.investigation_turns;
+        if turns == 0 {
+            return Ok(());
+        }
+        let jobs = self
+            .job_runner
+            .as_ref()
+            .ok_or_else(|| StepError::permanent("investigating phase requires a JobRunner"))?;
+        let run_id = step.run_id.to_string();
+        let max_chars = state.config.max_page_chars;
+        tracing::info!("investigating gaps in {} sources", state.summaries.len());
+
+        let investigator = Investigator {
+            model: self.provider.completion_model(&state.config.model),
+            search: self.search.clone(),
+            fetch: FetchPageTool {
+                jobs: jobs.clone(),
+                run_id: run_id.clone(),
+                max_chars,
+            },
+            max_tokens: state.config.max_tokens_per_call,
+        };
+        let journal = Journal::new(step.memo.clone(), step.lease.clone());
+        let prompt = investigate::prompt(&state.query, &state.summaries, turns);
+        let investigated = investigator
+            .run(&journal, prompt, turns, state.token_usage)
+            .await?;
+        state.token_usage = investigated.usage;
+
+        // A finding enters the run only for a page that `fetch_page` returned.
+        // The page text comes from the recorded result of its `FetchPage` job.
+        let mut added = 0;
+        for finding in investigated.findings {
+            let Ok(url) = Url::parse(&finding.url) else {
+                continue;
+            };
+            if !investigated.fetched.contains(&url) || state.summaries.contains_key(&url) {
+                continue;
+            }
+            let page = under_lease(&step.lease, FETCH_JOIN_LEASE, "fetch", async {
+                Ok(investigate::fetch_page(jobs, &run_id, url.clone(), max_chars).await)
+            })
+            .await?;
+            let page = match page {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::warn!(url = %url, error = %e, "fetch failed, skipping finding");
+                    continue;
+                }
+            };
+            state.summaries.insert(
+                url.clone(),
+                Summary {
+                    title: page.title.clone(),
+                    text: finding.summary,
+                    relevance: finding.relevance.clamp(0.0, 1.0),
+                },
+            );
+            state.fetched.insert(url, page);
+            added += 1;
+        }
+        tracing::info!("investigation added {added} sources");
         Ok(())
     }
 
@@ -862,7 +935,7 @@ where
 
 /// Accumulate one call's `Usage` into the run-aggregate `TokenUsage`, logging
 /// the per-call counts at info level.
-fn record_usage(total: &mut TokenUsage, call: &Usage) {
+pub(crate) fn record_usage(total: &mut TokenUsage, call: &Usage) {
     tracing::info!(
         input = call.input_tokens,
         output = call.output_tokens,
@@ -918,7 +991,6 @@ where
 fn lease_step_err(e: taquba::Error) -> StepError {
     StepError::transient(format!("lease extension failed: {e}"))
 }
-
 /// Returns the JSON-decoded value previously written to `memo` under `key`. If
 /// none exists, awaits `compute`, JSON-encodes its result into the memo, and
 /// returns it. An at-least-once retry of the surrounding step then finds the
@@ -1117,7 +1189,7 @@ fn anthropic_citation_document_span(
 /// Classify a typed-prompt error. Delegates the wrapped `PromptError` case to
 /// [`classify_rig_err`]. A deserialization error is permanent and an empty
 /// response is transient.
-fn classify_structured_err(err: StructuredOutputError) -> StepError {
+pub(crate) fn classify_structured_err(err: StructuredOutputError) -> StepError {
     match err {
         StructuredOutputError::PromptError(inner) => classify_rig_err(inner),
         StructuredOutputError::DeserializationError(e) => {
@@ -1653,5 +1725,24 @@ mod tests {
         .await
         .expect_err("corrupt bytes must surface as an error");
         assert_permanent(&err);
+    }
+
+    #[tokio::test]
+    async fn investigating_with_zero_turns_skips_to_synthesizing() {
+        let runner = ResearchStepRunner::new_ollama(
+            ollama::Ollama::from_env().unwrap(),
+            Arc::new(crate::search::Tavily::new("unused")),
+        );
+        let mut config = ResearchConfig::new("model");
+        config.investigation_turns = 0;
+        let mut state = ResearchState::new("query", config);
+        state.phase = Phase::Investigating;
+
+        // The runner lacks a job runner, so only the skip completes the step.
+        runner
+            .run_investigating(&test_step("run", 4), &mut state)
+            .await
+            .unwrap();
+        assert_eq!(state.phase, Phase::Synthesizing);
     }
 }

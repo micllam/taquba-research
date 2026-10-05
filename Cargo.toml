@@ -61,3 +61,6 @@ html2text = "0.17"
 tokio = { version = "1", features = ["test-util"] }
 # `CancellationToken` for constructing `taquba_workflow::Step` in tests.
 tokio-util = { version = "0.7", default-features = false }
+# `test-utils` enables `MockCompletionModel`, the scripted model of the tests of
+# the investigating phase.
+rig-core = { version = "0.43", features = ["test-utils"] }

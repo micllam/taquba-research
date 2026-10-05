@@ -1,0 +1,505 @@
+//! The tools, the hook and the output schema of the investigating phase, in
+//! which a Rig agent searches and fetches pages for the gaps that the summaries
+//! of a run leave.
+
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use rig_agent::agent::{AgentBuilder, AgentHook, HookContext, OutcomeAction, OutcomeEvent};
+use rig_agent::bus::Bus;
+use rig_agent::completion::{PromptError, StructuredOutputError};
+use rig_agent::tool::RegisteredTool;
+use rig_agent::tool::server::ToolServer;
+use rig_core::DynModel;
+use rig_core::effect::{EffectKind, Outcome, model_key};
+use rig_core::error::ErrorReport;
+use rig_core::operation::Completion;
+use rig_core::serve::adapters::{ModelAdapter, ToolAdapter};
+use rig_core::tool::PortableTool;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use taquba_workflow::StepError;
+use taquba_workflow::jobs::JobRunner;
+use thiserror::Error;
+use url::Url;
+
+use crate::fetch_job::FetchPage;
+use crate::journal::Journal;
+use crate::runner::{
+    AGENT_PREAMBLE, FETCH_JOIN_LEASE, LLM_CALL_TIMEOUT, SEARCH_CALL_TIMEOUT,
+    classify_structured_err,
+};
+use crate::search::{SearchBackend, SearchError, SearchResult};
+use crate::state::{FetchedPage, Summary, TokenUsage};
+
+/// Results per `web_search` call.
+const SEARCH_LIMIT: usize = 5;
+
+/// Owner of the bus keys of the investigating agent, and the label of its
+/// model.
+const INVESTIGATOR: &str = "investigator";
+
+/// The investigating agent of a step: a model with the `web_search` and
+/// `fetch_page` tools.
+pub(crate) struct Investigator {
+    pub(crate) model: DynModel<Completion>,
+    pub(crate) search: Arc<dyn SearchBackend>,
+    pub(crate) fetch: FetchPageTool,
+    pub(crate) max_tokens: Option<u64>,
+}
+
+/// The findings of an investigation, the URLs that `fetch_page` returned and
+/// the token usage of the run.
+pub(crate) struct Investigated {
+    pub(crate) findings: Vec<Finding>,
+    pub(crate) fetched: HashSet<Url>,
+    pub(crate) usage: TokenUsage,
+}
+
+impl Investigator {
+    /// Run the agent over a bus whose model and tools are under `journal`, for
+    /// at most `turns` model calls, adding the usage of each completion to
+    /// `usage`. An agent that reaches `turns` returns an empty list of
+    /// findings.
+    pub(crate) async fn run(
+        self,
+        journal: &Journal,
+        prompt: String,
+        turns: usize,
+        usage: TokenUsage,
+    ) -> Result<Investigated, StepError> {
+        let (dispatcher, registrar, mut driver) = Bus::channel();
+        let model_key = model_key(INVESTIGATOR);
+        let model = ModelAdapter::new(INVESTIGATOR, self.model);
+        driver
+            .register(model_key.clone(), journal.wrap(model, LLM_CALL_TIMEOUT))
+            .map_err(bus_step_err)?;
+        let search = WebSearch {
+            search: self.search,
+        };
+        let tools = ToolServer::new()
+            .registered_tool(
+                RegisteredTool::from_handler(
+                    journal.wrap(ToolAdapter::new(search), SEARCH_CALL_TIMEOUT),
+                )
+                .map_err(bus_step_err)?,
+            )
+            .registered_tool(
+                RegisteredTool::from_handler(
+                    journal.wrap(ToolAdapter::new(self.fetch), FETCH_JOIN_LEASE),
+                )
+                .map_err(bus_step_err)?,
+            )
+            .run();
+        let observed = Observed::new(usage);
+        let mut builder = AgentBuilder::over_bus(dispatcher, registrar, INVESTIGATOR, model_key)
+            .preamble(AGENT_PREAMBLE)
+            .add_hook(journal.call_keys())
+            .add_hook(observed.clone());
+        if let Some(max_tokens) = self.max_tokens {
+            builder = builder.max_tokens(max_tokens);
+        }
+        let agent = builder.tool_server_handle(tools).build();
+
+        let run = agent
+            .prompt_typed::<Investigation>(prompt)
+            .max_turns(turns)
+            .into_future();
+        // The driver ends only after the agent drops its dispatcher.
+        let result = tokio::select! {
+            result = run => result,
+            () = driver => return Err(StepError::transient("investigating: the bus closed")),
+        };
+        if let Some(fault) = journal.take_fault() {
+            return Err(fault);
+        }
+        let findings = match result {
+            Ok(response) => response.output.findings,
+            Err(StructuredOutputError::PromptError(PromptError::MaxTurnsError {
+                max_turns,
+                ..
+            })) => {
+                tracing::warn!(max_turns, "investigation ran out of model calls");
+                Vec::new()
+            }
+            Err(e) => return Err(classify_structured_err(e)),
+        };
+        let observations = observed.take();
+        Ok(Investigated {
+            findings,
+            fetched: observations.fetched,
+            usage: observations.usage,
+        })
+    }
+}
+
+/// Map a refused handler registration on a Rig bus to a permanent step error.
+fn bus_step_err(report: ErrorReport) -> StepError {
+    StepError::permanent(format!("bus registration refused: {}", report.message))
+}
+
+/// The `web_search` tool over the search backend of the run.
+pub(crate) struct WebSearch {
+    pub(crate) search: Arc<dyn SearchBackend>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WebSearchArgs {
+    query: String,
+}
+
+impl PortableTool for WebSearch {
+    const NAME: &'static str = "web_search";
+    type Args = WebSearchArgs;
+    type Output = Vec<SearchResult>;
+    type Error = SearchError;
+
+    fn description(&self) -> String {
+        "Search the web. Returns the URL, title and snippet of each result.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "The search query." }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn call(&self, args: WebSearchArgs) -> Result<Vec<SearchResult>, SearchError> {
+        self.search.search(&args.query, SEARCH_LIMIT).await
+    }
+}
+
+/// The `fetch_page` tool, which fetches a page through a `FetchPage` job of the
+/// run.
+pub(crate) struct FetchPageTool {
+    pub(crate) jobs: JobRunner,
+    pub(crate) run_id: String,
+    pub(crate) max_chars: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FetchPageArgs {
+    url: Url,
+}
+
+/// A failed `FetchPage` job, as the model reads it.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub(crate) struct FetchPageError(String);
+
+impl PortableTool for FetchPageTool {
+    const NAME: &'static str = "fetch_page";
+    type Args = FetchPageArgs;
+    type Output = FetchedPage;
+    type Error = FetchPageError;
+
+    fn description(&self) -> String {
+        "Fetch a web page. Returns its title and its text.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The absolute URL of the page." }
+            },
+            "required": ["url"]
+        })
+    }
+
+    async fn call(&self, args: FetchPageArgs) -> Result<FetchedPage, FetchPageError> {
+        fetch_page(&self.jobs, &self.run_id, args.url, self.max_chars)
+            .await
+            .map_err(FetchPageError)
+    }
+}
+
+/// Fetch `url` through a `FetchPage` job. A job of the same run and URL returns
+/// its recorded result.
+pub(crate) async fn fetch_page(
+    jobs: &JobRunner,
+    run_id: &str,
+    url: Url,
+    max_chars: usize,
+) -> Result<FetchedPage, String> {
+    let job = FetchPage {
+        run_id: run_id.to_string(),
+        url,
+        max_chars,
+    };
+    let handle = jobs
+        .submit(job)
+        .await
+        .map_err(|e| format!("fetch submit: {e}"))?;
+    handle.await.map_err(|e| e.to_string())
+}
+
+/// The hook that collects, from every completion and tool outcome of the agent,
+/// the token usage and the URLs that `fetch_page` returned. A replayed outcome
+/// passes the hook like a fresh one.
+#[derive(Clone)]
+pub(crate) struct Observed(Arc<Mutex<Observations>>);
+
+#[derive(Default)]
+pub(crate) struct Observations {
+    pub(crate) fetched: HashSet<Url>,
+    pub(crate) usage: TokenUsage,
+}
+
+impl Observed {
+    /// A hook that adds the usage of each completion to `usage`.
+    pub(crate) fn new(usage: TokenUsage) -> Self {
+        Self(Arc::new(Mutex::new(Observations {
+            fetched: HashSet::new(),
+            usage,
+        })))
+    }
+
+    pub(crate) fn take(&self) -> Observations {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+impl AgentHook for Observed {
+    async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        let mut observations = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match (event.kind, event.outcome) {
+            (_, Ok(Outcome::Completion(response))) => {
+                crate::runner::record_usage(&mut observations.usage, &response.usage);
+            }
+            (EffectKind::ToolCall { name, args }, Ok(Outcome::ToolResult { result }))
+                if name == FetchPageTool::NAME && result.is_success() =>
+            {
+                if let Ok(args) = serde_json::from_str::<FetchPageArgs>(args) {
+                    observations.fetched.insert(args.url);
+                }
+            }
+            _ => {}
+        }
+        OutcomeAction::Proceed
+    }
+}
+
+/// The structured output of the investigating agent.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct Investigation {
+    /// One finding per fetched page that fills a gap.
+    pub(crate) findings: Vec<Finding>,
+}
+
+/// A page that the agent fetched, with its summary.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct Finding {
+    /// The URL passed to `fetch_page`.
+    pub(crate) url: String,
+    /// A summary of what the page says about the query.
+    pub(crate) summary: String,
+    /// Relevance to the query, from 0.0 to 1.0.
+    pub(crate) relevance: f32,
+}
+
+/// The prompt of the investigating agent, listing each summarised source.
+pub(crate) fn prompt(query: &str, summaries: &BTreeMap<Url, Summary>, turns: usize) -> String {
+    let mut sources = String::new();
+    for (url, summary) in summaries {
+        sources.push_str(&format!(
+            "- {title} ({url}): {text}\n",
+            title = summary.title,
+            text = summary.text,
+        ));
+    }
+    if sources.is_empty() {
+        sources.push_str("(no sources gathered)\n");
+    }
+    format!(
+        "You are a research investigator. The user is investigating:\n\n  {query}\n\n\
+         The sources gathered so far are listed below with their summaries. \
+         Identify the important gaps: aspects of the query that the sources do \
+         not cover, or on which they conflict. Use `web_search` to find pages \
+         that address the gaps and `fetch_page` to read them. You can make at \
+         most {turns} model calls, the final answer included.\n\n\
+         Return one finding for each fetched page that fills a gap: its URL, a \
+         2-4 sentence summary of what is relevant to the query, and a relevance \
+         score from 0.0 (off-topic) to 1.0 (highly relevant). Never return a \
+         page you did not fetch or a source from the list. Return no findings \
+         when the sources already cover the query.\n\n\
+         Sources:\n{sources}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use rig_core::completion::Usage;
+    use rig_core::test_utils::{MockCompletionModel, MockTurn};
+    use taquba::object_store::ObjectStore;
+    use taquba::object_store::memory::InMemory;
+    use taquba::{LeaseHandle, Queue};
+    use taquba_workflow::{Memo, MemoStore, RunId, StepErrorKind};
+
+    const FINDINGS: &str = r#"{"findings":[{"url":"https://example.com/gap",
+        "summary":"The page fills the gap.","relevance":0.8}]}"#;
+
+    #[derive(Default)]
+    struct CountingSearch(AtomicUsize);
+
+    #[async_trait]
+    impl SearchBackend for CountingSearch {
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchResult>, SearchError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![SearchResult {
+                url: "https://example.com/gap".parse().unwrap(),
+                title: "Gap".to_string(),
+                snippet: "fills the gap".to_string(),
+            }])
+        }
+    }
+
+    struct StalledSearch;
+
+    #[async_trait]
+    impl SearchBackend for StalledSearch {
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchResult>, SearchError> {
+            std::future::pending().await
+        }
+    }
+
+    fn step_memo() -> Memo {
+        MemoStore::new(Arc::new(InMemory::new()), "test-memo")
+            .new_memo(&RunId::new("run").unwrap(), 4)
+    }
+
+    /// An investigator over `model` and `search`, with a job runner whose
+    /// worker never starts.
+    async fn investigator(
+        model: &MockCompletionModel,
+        search: Arc<dyn SearchBackend>,
+    ) -> Investigator {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let queue = Arc::new(Queue::open(store.clone(), "q").await.unwrap());
+        let jobs = JobRunner::builder(queue, store)
+            .register::<FetchPage>()
+            .build();
+        Investigator {
+            model: model.clone().into(),
+            search,
+            fetch: FetchPageTool {
+                jobs,
+                run_id: "run".to_string(),
+                max_chars: 100,
+            },
+            max_tokens: None,
+        }
+    }
+
+    async fn run(
+        model: &MockCompletionModel,
+        search: Arc<dyn SearchBackend>,
+        memo: &Memo,
+        turns: usize,
+    ) -> Result<Investigated, StepError> {
+        let journal = Journal::new(memo.clone(), LeaseHandle::detached());
+        investigator(model, search)
+            .await
+            .run(&journal, "query".to_string(), turns, TokenUsage::default())
+            .await
+    }
+
+    fn usage(input_tokens: u64) -> Usage {
+        Usage {
+            input_tokens: Some(input_tokens),
+            ..Usage::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn investigator_replays_recorded_outcomes() {
+        let memo = step_memo();
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("call_1", "web_search", json!({ "query": "gaps" }))
+                .with_usage(usage(10)),
+            MockTurn::text(FINDINGS).with_usage(usage(20)),
+        ]);
+        let search = Arc::new(CountingSearch::default());
+        let first = run(&model, search.clone(), &memo, 4).await.unwrap();
+
+        // A model without a script fails each call, so the retry must replay.
+        let replay_model = MockCompletionModel::from_turns(Vec::<MockTurn>::new());
+        let replay_search = Arc::new(CountingSearch::default());
+        let replay = run(&replay_model, replay_search.clone(), &memo, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(model.request_count(), 2);
+        assert_eq!(search.0.load(Ordering::SeqCst), 1);
+        assert_eq!(replay_model.request_count(), 0);
+        assert_eq!(replay_search.0.load(Ordering::SeqCst), 0);
+        assert_eq!(replay.findings.len(), 1);
+        assert_eq!(replay.findings[0].url, "https://example.com/gap");
+        assert_eq!(replay.usage.input_tokens, 30);
+        assert_eq!(replay.usage, first.usage);
+    }
+
+    #[tokio::test]
+    async fn investigator_calls_the_model_again_after_a_failed_call() {
+        let memo = step_memo();
+        let failing = MockCompletionModel::from_turns([MockTurn::error("overloaded")]);
+        let err = run(&failing, Arc::new(CountingSearch::default()), &memo, 4)
+            .await
+            .err()
+            .expect("a failed completion must fail the step");
+        assert!(matches!(err.kind, StepErrorKind::Transient), "{err:?}");
+
+        let model = MockCompletionModel::from_turns([MockTurn::text(FINDINGS)]);
+        let retried = run(&model, Arc::new(CountingSearch::default()), &memo, 4)
+            .await
+            .unwrap();
+        assert_eq!(model.request_count(), 1);
+        assert_eq!(retried.findings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn investigator_returns_empty_findings_after_its_model_calls() {
+        let model = MockCompletionModel::from_turns([MockTurn::tool_call(
+            "call_1",
+            "web_search",
+            json!({ "query": "gaps" }),
+        )]);
+        let investigated = run(&model, Arc::new(CountingSearch::default()), &step_memo(), 1)
+            .await
+            .unwrap();
+        assert!(investigated.findings.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn investigator_fails_a_tool_call_after_its_bound() {
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("call_1", "web_search", json!({ "query": "gaps" })),
+            MockTurn::text(FINDINGS),
+        ]);
+        run(&model, Arc::new(StalledSearch), &step_memo(), 4)
+            .await
+            .unwrap();
+        let follow_up = format!("{:?}", model.requests()[1]);
+        assert!(
+            follow_up.contains("timed out after 60s"),
+            "the model must read the timeout: {follow_up}"
+        );
+    }
+}

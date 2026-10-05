@@ -2,11 +2,12 @@
 //!
 //! `taquba-research` is a multi-step research agent whose runs persist across
 //! process crashes. A run consists of a planning step, a fan-out of search and
-//! page-fetch steps, per-page summarisation, synthesis and a final
-//! report-writing step. The agent writes every transition to the
-//! object-storage-backed task queue of taquba and memoizes every completed LLM
-//! call. An interrupted run resumes from the last completed step and does not
-//! pay for any of its completed model calls again.
+//! page-fetch steps, per-page summarisation, an investigation of the gaps by a
+//! Rig agent with tools, synthesis and a final report-writing step. The agent
+//! writes every transition to the object-storage-backed task queue of taquba
+//! and memoizes every completed LLM call. An interrupted run resumes from the
+//! last completed step and does not pay for any of its completed model calls
+//! again.
 //!
 //! This crate is a reference implementation and a CLI tool. It is a worked
 //! example of how Rig (LLM orchestration) and the taquba stack (durable queues,
@@ -44,10 +45,10 @@
 //!   document blocks during synthesis. When Claude returns citation metadata,
 //!   the final report includes the cited source excerpts. OpenAI and Ollama
 //!   runs keep the standard numeric list of sources.
-//! - **Structured phases**: the `Planning` and `Summarizing` phases use
-//!   structured (`prompt_typed`) completions, so an Ollama model must emit
-//!   schema-valid JSON reliably, and a model that does not dead-letters those
-//!   steps.
+//! - **Structured phases**: the `Planning`, `Summarizing` and `Investigating`
+//!   phases use structured (`prompt_typed`) completions, and `Investigating`
+//!   also uses tool calls. An Ollama model must emit schema-valid JSON and tool
+//!   calls reliably, and a model that does not dead-letters those steps.
 //!
 //! # Quick start
 //!
@@ -137,6 +138,10 @@
 //!   memoizes its output in its per-step [`Memo`](taquba_workflow::Memo). An
 //!   at-least-once redelivery short-circuits to the stored value and does not
 //!   call or bill the model again.
+//! - **A retried investigation replays its agent.** The investigating step
+//!   records each completion and tool result of its Rig agent in the per-step
+//!   memo, and a redelivery replays the recorded results. A failed call is not
+//!   recorded, so a retry calls it again.
 //! - **The delivery lease covers every slow call.** Every LLM and search call
 //!   runs under a timeout, and the step extends its lease
 //!   ([`taquba::LeaseHandle::ensure_at_least`]) by that bound before the call.
@@ -161,7 +166,8 @@
 //! with `try_join_all`. The `JobRunner` shares the queue and uses a distinct
 //! queue name. The per-URL `idempotency_key` derives from `(run_id, url)`, so
 //! on a step retry the idempotent submit of the job runner returns the recorded
-//! result, and no URL is fetched twice.
+//! result, and no URL is fetched twice. The `fetch_page` tool of the
+//! investigating step submits the same job for each page it reads.
 //!
 //! [`spawn_fetch_runner`] builds and spawns this `JobRunner`.
 //! `ResearchAgent::run` and the CLI call it internally, and a caller with a
@@ -183,6 +189,8 @@
 
 mod agent;
 mod fetch_job;
+mod investigate;
+mod journal;
 mod report;
 mod runner;
 /// Web-search backends of the searching phase. An implementation of the
