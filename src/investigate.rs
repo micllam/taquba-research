@@ -4,15 +4,19 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
-use rig_agent::agent::{AgentBuilder, AgentHook, HookContext, OutcomeAction, OutcomeEvent};
+use rig_agent::agent::{
+    AgentBuilder, AgentHook, DispatchAction, DispatchEvent, HookContext, OutcomeAction,
+    OutcomeEvent,
+};
 use rig_agent::bus::Bus;
 use rig_agent::completion::{PromptError, StructuredOutputError};
 use rig_agent::tool::RegisteredTool;
 use rig_agent::tool::server::ToolServer;
 use rig_core::DynModel;
 use rig_core::effect::{EffectKind, Outcome, model_key};
-use rig_core::error::ErrorReport;
+use rig_core::error::{ErrorKind, ErrorReport};
 use rig_core::operation::Completion;
 use rig_core::serve::adapters::{ModelAdapter, ToolAdapter};
 use rig_core::tool::PortableTool;
@@ -31,37 +35,71 @@ use crate::runner::{
     classify_structured_err,
 };
 use crate::search::{SearchBackend, SearchError, SearchResult};
-use crate::state::{FetchedPage, Summary, TokenUsage};
+use crate::state::{Clarification, FetchedPage, Reply, Summary, TokenUsage};
 
 /// Results per `web_search` call.
 const SEARCH_LIMIT: usize = 5;
+
+/// Prefix of the keys of the journal of the investigating step in the run memo.
+pub(crate) const JOURNAL_PREFIX: &str = "investigating/";
 
 /// Owner of the bus keys of the investigating agent, and the label of its
 /// model.
 const INVESTIGATOR: &str = "investigator";
 
+/// Text of the `ask_user` result when the wait for a reply ran out.
+const ASSUMED: &str = "The user did not reply in time. Proceed on the most likely \
+     interpretation, and state that assumption in the summary of each finding it affects.";
+
+/// Text of the skipped result of a second `ask_user` call.
+const ONE_QUESTION: &str = "The run allows one question, and the user was already asked.";
+
+/// Upper bound on an `ask_user` call, which returns a reply that exists.
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The investigating agent of a step: a model with the `web_search` and
-/// `fetch_page` tools.
+/// `fetch_page` tools, and the `ask_user` tool unless `asking` is `Off`.
 pub(crate) struct Investigator {
     pub(crate) model: DynModel<Completion>,
     pub(crate) search: Arc<dyn SearchBackend>,
     pub(crate) fetch: FetchPageTool,
+    pub(crate) asking: Asking,
     pub(crate) max_tokens: Option<u64>,
 }
 
-/// The findings of an investigation, the URLs that `fetch_page` returned and
-/// the token usage of the run.
-pub(crate) struct Investigated {
-    pub(crate) findings: Vec<Finding>,
-    pub(crate) fetched: HashSet<Url>,
-    pub(crate) usage: TokenUsage,
+/// Whether the agent can ask the user a question.
+pub(crate) enum Asking {
+    /// The agent cannot ask.
+    Off,
+    /// The agent can ask a question.
+    Open,
+    /// The agent asked this question, and the user replied or the wait ended.
+    Replied(Clarification),
+}
+
+/// How a run of the investigating agent ended.
+pub(crate) enum Investigated {
+    /// The agent returned its findings.
+    Finished {
+        findings: Vec<Finding>,
+        /// The URLs that `fetch_page` returned.
+        fetched: HashSet<Url>,
+        usage: TokenUsage,
+    },
+    /// The agent called `ask_user`, and the run must wait for a reply.
+    Asked {
+        /// The journal key of the call.
+        key: String,
+        question: String,
+    },
 }
 
 impl Investigator {
     /// Run the agent over a bus whose model and tools are under `journal`, for
     /// at most `turns` model calls, adding the usage of each completion to
     /// `usage`. An agent that reaches `turns` returns an empty list of
-    /// findings.
+    /// findings. An agent that asks a question stops at the call, and a later
+    /// run over the same journal replays the agent up to the call.
     pub(crate) async fn run(
         self,
         journal: &Journal,
@@ -78,7 +116,7 @@ impl Investigator {
         let search = WebSearch {
             search: self.search,
         };
-        let tools = ToolServer::new()
+        let mut tools = ToolServer::new()
             .registered_tool(
                 RegisteredTool::from_handler(
                     journal.wrap(ToolAdapter::new(search), SEARCH_CALL_TIMEOUT),
@@ -90,17 +128,39 @@ impl Investigator {
                     journal.wrap(ToolAdapter::new(self.fetch), FETCH_JOIN_LEASE),
                 )
                 .map_err(bus_step_err)?,
-            )
-            .run();
+            );
+        let (gate, ask) = match self.asking {
+            Asking::Off => (None, None),
+            Asking::Open => (
+                Some(ClarificationGate::new(journal, None)),
+                Some(AskUser { reply: None }),
+            ),
+            Asking::Replied(clarification) => (
+                Some(ClarificationGate::new(journal, Some(clarification.key))),
+                Some(AskUser {
+                    reply: clarification.reply,
+                }),
+            ),
+        };
+        if let Some(ask) = ask {
+            tools = tools.registered_tool(
+                RegisteredTool::from_handler(journal.wrap(ToolAdapter::new(ask), ASK_TIMEOUT))
+                    .map_err(bus_step_err)?,
+            );
+        }
         let observed = Observed::new(usage);
         let mut builder = AgentBuilder::over_bus(dispatcher, registrar, INVESTIGATOR, model_key)
             .preamble(AGENT_PREAMBLE)
             .add_hook(journal.call_keys())
             .add_hook(observed.clone());
+        let pending = gate.as_ref().map(|gate| gate.pending.clone());
+        if let Some(gate) = gate {
+            builder = builder.add_hook(gate);
+        }
         if let Some(max_tokens) = self.max_tokens {
             builder = builder.max_tokens(max_tokens);
         }
-        let agent = builder.tool_server_handle(tools).build();
+        let agent = builder.tool_server_handle(tools.run()).build();
 
         let run = agent
             .prompt_typed::<Investigation>(prompt)
@@ -114,6 +174,10 @@ impl Investigator {
         if let Some(fault) = journal.take_fault() {
             return Err(fault);
         }
+        // The gate cancels the run at the `ask_user` call.
+        if let Some((key, question)) = pending.and_then(|pending| lock(&pending).take()) {
+            return Ok(Investigated::Asked { key, question });
+        }
         let findings = match result {
             Ok(response) => response.output.findings,
             Err(StructuredOutputError::PromptError(PromptError::MaxTurnsError {
@@ -126,11 +190,112 @@ impl Investigator {
             Err(e) => return Err(classify_structured_err(e)),
         };
         let observations = observed.take();
-        Ok(Investigated {
+        Ok(Investigated::Finished {
             findings,
             fetched: observations.fetched,
             usage: observations.usage,
         })
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The hook that stops the `ask_user` call until the user replies. Without a
+/// question, it records the first call and cancels the run. With a question, it
+/// lets that call through and skips any other `ask_user` call.
+struct ClarificationGate {
+    journal: Journal,
+    /// The journal key of the call that asked.
+    asked: Option<String>,
+    /// The key and the question of a call that the gate held.
+    pending: Arc<Mutex<Option<(String, String)>>>,
+}
+
+impl ClarificationGate {
+    fn new(journal: &Journal, asked: Option<String>) -> Self {
+        Self {
+            journal: journal.clone(),
+            asked,
+            pending: Arc::default(),
+        }
+    }
+}
+
+impl AgentHook for ClarificationGate {
+    async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        let (EffectKind::ToolCall { name, args }, Some(call_id)) = (event.kind, event.call_id)
+        else {
+            return DispatchAction::Proceed;
+        };
+        if name != AskUser::NAME {
+            return DispatchAction::Proceed;
+        }
+        let key = self.journal.tool_key(call_id);
+        match &self.asked {
+            Some(asked) if *asked == key => DispatchAction::Proceed,
+            Some(_) => DispatchAction::Deny(
+                ErrorReport::new(ErrorKind::Denied, ONE_QUESTION).with_retryable(false),
+            ),
+            None => {
+                let question = serde_json::from_str::<AskUserArgs>(args)
+                    .map_or_else(|_| args.clone(), |args| args.question);
+                *lock(&self.pending) = Some((key, question));
+                DispatchAction::Deny(ErrorReport::new(
+                    ErrorKind::Cancelled,
+                    "waiting for the reply of the user",
+                ))
+            }
+        }
+    }
+}
+
+/// The `ask_user` tool, which returns the reply to the question of the run. The
+/// [`ClarificationGate`] lets a call through only once the reply exists.
+pub(crate) struct AskUser {
+    reply: Option<Reply>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AskUserArgs {
+    question: String,
+}
+
+/// An `ask_user` call that ran before the reply existed.
+#[derive(Debug, Error)]
+#[error("the reply of the user is missing")]
+pub(crate) struct ReplyMissing;
+
+impl PortableTool for AskUser {
+    const NAME: &'static str = "ask_user";
+    type Args = AskUserArgs;
+    type Output = String;
+    type Error = ReplyMissing;
+
+    fn description(&self) -> String {
+        "Ask the user one short question, and wait for the reply. Use it once at \
+         most, when the sources conflict or the query is ambiguous in a way that \
+         changes the findings."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": { "type": "string", "description": "The question to the user." }
+            },
+            "required": ["question"]
+        })
+    }
+
+    async fn call(&self, _args: AskUserArgs) -> Result<String, ReplyMissing> {
+        match &self.reply {
+            Some(Reply::Given(text)) => Ok(text.clone()),
+            Some(Reply::Assumed) => Ok(ASSUMED.to_string()),
+            None => Err(ReplyMissing),
+        }
     }
 }
 
@@ -304,7 +469,18 @@ pub(crate) struct Finding {
 }
 
 /// The prompt of the investigating agent, listing each summarised source.
-pub(crate) fn prompt(query: &str, summaries: &BTreeMap<Url, Summary>, turns: usize) -> String {
+pub(crate) fn prompt(
+    query: &str,
+    summaries: &BTreeMap<Url, Summary>,
+    turns: usize,
+    can_ask: bool,
+) -> String {
+    let asking = if can_ask {
+        " When the sources conflict, or the query is ambiguous in a way that \
+         changes the findings, call `ask_user` once with one short question."
+    } else {
+        ""
+    };
     let mut sources = String::new();
     for (url, summary) in summaries {
         sources.push_str(&format!(
@@ -322,7 +498,7 @@ pub(crate) fn prompt(query: &str, summaries: &BTreeMap<Url, Summary>, turns: usi
          Identify the important gaps: aspects of the query that the sources do \
          not cover, or on which they conflict. Use `web_search` to find pages \
          that address the gaps and `fetch_page` to read them. You can make at \
-         most {turns} model calls, the final answer included.\n\n\
+         most {turns} model calls, the final answer included.{asking}\n\n\
          Return one finding for each fetched page that fills a gap: its URL, a \
          2-4 sentence summary of what is relevant to the query, and a relevance \
          score from 0.0 (off-topic) to 1.0 (highly relevant). Never return a \
@@ -393,6 +569,7 @@ mod tests {
     async fn investigator(
         model: &MockCompletionModel,
         search: Arc<dyn SearchBackend>,
+        asking: Asking,
     ) -> Investigator {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(Queue::open(store.clone(), "q").await.unwrap());
@@ -407,8 +584,23 @@ mod tests {
                 run_id: "run".to_string(),
                 max_chars: 100,
             },
+            asking,
             max_tokens: None,
         }
+    }
+
+    async fn run_asking(
+        model: &MockCompletionModel,
+        search: Arc<dyn SearchBackend>,
+        memo: &Memo,
+        turns: usize,
+        asking: Asking,
+    ) -> Result<Investigated, StepError> {
+        let journal = Journal::new(memo.clone(), JOURNAL_PREFIX, LeaseHandle::detached());
+        investigator(model, search, asking)
+            .await
+            .run(&journal, "query".to_string(), turns, TokenUsage::default())
+            .await
     }
 
     async fn run(
@@ -417,11 +609,17 @@ mod tests {
         memo: &Memo,
         turns: usize,
     ) -> Result<Investigated, StepError> {
-        let journal = Journal::new(memo.clone(), LeaseHandle::detached());
-        investigator(model, search)
-            .await
-            .run(&journal, "query".to_string(), turns, TokenUsage::default())
-            .await
+        run_asking(model, search, memo, turns, Asking::Off).await
+    }
+
+    /// The findings and the usage of a finished run.
+    fn finished(investigated: Investigated) -> (Vec<Finding>, TokenUsage) {
+        match investigated {
+            Investigated::Finished {
+                findings, usage, ..
+            } => (findings, usage),
+            Investigated::Asked { question, .. } => panic!("the agent asked: {question}"),
+        }
     }
 
     fn usage(input_tokens: u64) -> Usage {
@@ -440,31 +638,123 @@ mod tests {
             MockTurn::text(FINDINGS).with_usage(usage(20)),
         ]);
         let search = Arc::new(CountingSearch::default());
-        let first = run(&model, search.clone(), &memo, 4).await.unwrap();
+        let (_, first_usage) = finished(run(&model, search.clone(), &memo, 4).await.unwrap());
 
         // A model without a script fails each call, so the retry must replay.
         let replay_model = MockCompletionModel::from_turns(Vec::<MockTurn>::new());
         let replay_search = Arc::new(CountingSearch::default());
-        let replay = run(&replay_model, replay_search.clone(), &memo, 4)
-            .await
-            .unwrap();
+        let (findings, usage) = finished(
+            run(&replay_model, replay_search.clone(), &memo, 4)
+                .await
+                .unwrap(),
+        );
 
         assert_eq!(model.request_count(), 2);
         assert_eq!(search.0.load(Ordering::SeqCst), 1);
         assert_eq!(replay_model.request_count(), 0);
         assert_eq!(replay_search.0.load(Ordering::SeqCst), 0);
-        assert_eq!(replay.findings.len(), 1);
-        assert_eq!(replay.findings[0].url, "https://example.com/gap");
-        assert_eq!(replay.usage.input_tokens, 30);
-        assert_eq!(replay.usage, first.usage);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].url, "https://example.com/gap");
+        assert_eq!(usage.input_tokens, 30);
+        assert_eq!(usage, first_usage);
+    }
+
+    #[tokio::test]
+    async fn investigator_stops_at_a_question_and_replays_up_to_it_after_the_reply() {
+        let memo = step_memo();
+        let asking = MockCompletionModel::from_turns([MockTurn::tool_call(
+            "call_1",
+            "ask_user",
+            json!({ "question": "Which edition?" }),
+        )]);
+        let Investigated::Asked { key, question } = run_asking(
+            &asking,
+            Arc::new(CountingSearch::default()),
+            &memo,
+            4,
+            Asking::Open,
+        )
+        .await
+        .unwrap() else {
+            panic!("the agent must stop at the question");
+        };
+        assert_eq!(question, "Which edition?");
+
+        let replied = Clarification {
+            key,
+            question,
+            asked_at: chrono::Utc::now(),
+            reply: Some(Reply::Given("the 2024 edition".to_string())),
+        };
+        let model = MockCompletionModel::from_turns([MockTurn::text(FINDINGS)]);
+        let (findings, _) = finished(
+            run_asking(
+                &model,
+                Arc::new(CountingSearch::default()),
+                &memo,
+                4,
+                Asking::Replied(replied),
+            )
+            .await
+            .unwrap(),
+        );
+        // The completion that asked replays, so the model receives one request,
+        // with the reply as the result of `ask_user`.
+        assert_eq!(model.request_count(), 1);
+        assert!(format!("{:?}", model.requests()[0]).contains("the 2024 edition"));
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn investigator_skips_a_second_question() {
+        let memo = step_memo();
+        let asking = MockCompletionModel::from_turns([MockTurn::tool_call(
+            "call_1",
+            "ask_user",
+            json!({ "question": "Which edition?" }),
+        )]);
+        let Investigated::Asked { key, question } = run_asking(
+            &asking,
+            Arc::new(CountingSearch::default()),
+            &memo,
+            4,
+            Asking::Open,
+        )
+        .await
+        .unwrap() else {
+            panic!("the agent must stop at the question");
+        };
+
+        let replied = Clarification {
+            key,
+            question,
+            asked_at: chrono::Utc::now(),
+            reply: Some(Reply::Assumed),
+        };
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("call_2", "ask_user", json!({ "question": "Which year?" })),
+            MockTurn::text(FINDINGS),
+        ]);
+        finished(
+            run_asking(
+                &model,
+                Arc::new(CountingSearch::default()),
+                &memo,
+                4,
+                Asking::Replied(replied),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(format!("{:?}", model.requests()[1]).contains(ONE_QUESTION));
     }
 
     #[tokio::test]
     async fn journal_entries_list_completions_and_their_tool_calls() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let run_id = RunId::new("run").unwrap();
-        // The runtime's memo of step 4, which `store::journal_entries` reads.
-        let memo = MemoStore::new(object_store.clone(), WORKFLOW_MEMO_PREFIX).new_memo(&run_id, 4);
+        // The runtime's run memo, which `store::journal_entries` reads.
+        let memo = MemoStore::new(object_store.clone(), WORKFLOW_MEMO_PREFIX).new_run_memo(&run_id);
         let model = MockCompletionModel::from_turns([
             MockTurn::tool_call("call_1", "web_search", json!({ "query": "gaps" })),
             MockTurn::text(FINDINGS),
@@ -473,7 +763,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = journal_entries(object_store.clone(), &run_id, 4).await;
+        let entries = journal_entries(object_store.clone(), &run_id).await;
         assert_eq!(
             entries.unwrap(),
             vec![
@@ -486,7 +776,7 @@ mod tests {
                 JournalEntry::Completion,
             ]
         );
-        let other = journal_entries(object_store, &run_id, 5).await;
+        let other = journal_entries(object_store, &RunId::new("other").unwrap()).await;
         assert!(other.unwrap().is_empty());
     }
 
@@ -501,11 +791,13 @@ mod tests {
         assert!(matches!(err.kind, StepErrorKind::Transient), "{err:?}");
 
         let model = MockCompletionModel::from_turns([MockTurn::text(FINDINGS)]);
-        let retried = run(&model, Arc::new(CountingSearch::default()), &memo, 4)
-            .await
-            .unwrap();
+        let (findings, _) = finished(
+            run(&model, Arc::new(CountingSearch::default()), &memo, 4)
+                .await
+                .unwrap(),
+        );
         assert_eq!(model.request_count(), 1);
-        assert_eq!(retried.findings.len(), 1);
+        assert_eq!(findings.len(), 1);
     }
 
     #[tokio::test]
@@ -515,10 +807,12 @@ mod tests {
             "web_search",
             json!({ "query": "gaps" }),
         )]);
-        let investigated = run(&model, Arc::new(CountingSearch::default()), &step_memo(), 1)
-            .await
-            .unwrap();
-        assert!(investigated.findings.is_empty());
+        let (findings, _) = finished(
+            run(&model, Arc::new(CountingSearch::default()), &step_memo(), 1)
+                .await
+                .unwrap(),
+        );
+        assert!(findings.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -536,7 +830,7 @@ mod tests {
             follow_up.contains("timed out after 60s"),
             "the model must read the timeout: {follow_up}"
         );
-        let entries = read_entries(&memo).await.unwrap();
+        let entries = read_entries(&memo, JOURNAL_PREFIX).await.unwrap();
         assert!(matches!(
             entries[1],
             JournalEntry::ToolCall {

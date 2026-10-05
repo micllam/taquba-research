@@ -30,22 +30,23 @@ use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, parse_url_opts};
 use taquba::{
-    JobStatus, OpenOptions, Queue, QueueConfig, QueueReader, ReaderMode, ReaderOptions,
+    JobRecord, JobStatus, OpenOptions, Queue, QueueConfig, QueueReader, ReaderMode, ReaderOptions,
     SettlementEffects,
 };
 use taquba_research::jobs::RunnerHandle;
 use taquba_research::store::{
-    self, JournalEntry, RunDisplayStatus, RunIndexEntry, StoredStatus, TerminalReconciler,
-    WORKFLOW_MEMO_PREFIX, WORKFLOW_QUEUE_NAME,
+    self, JournalEntry, ReplyBox, RunDisplayStatus, RunIndexEntry, StoredStatus,
+    TerminalReconciler, WORKFLOW_MEMO_PREFIX, WORKFLOW_QUEUE_NAME,
 };
 use taquba_research::workflow::{
     RunId, RunOutcome, RunSpec, RunState, RunStatus, StepError, StepErrorKind, TerminalEffects,
     TerminalHook, TerminalStatus, WorkflowRuntime, WorkflowView,
 };
 use taquba_research::{
-    CancelSentinel, FETCH_QUEUE_NAME, Phase, ResearchConfig, ResearchStepRunner, RunRecord,
+    CancelSentinel, FETCH_QUEUE_NAME, Phase, ReplyWatcher, ResearchConfig, ResearchStepRunner,
+    RunRecord,
     search::{SearchBackend, Tavily},
-    spawn_fetch_runner, summarize_state,
+    spawn_fetch_runner, spawn_reply_watcher, summarize_state,
 };
 use tokio::sync::{Mutex, oneshot};
 use tracing_subscriber::EnvFilter;
@@ -137,6 +138,12 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     investigation_turns: usize,
 
+    /// Let the investigating step ask a single question per run, and wait up to
+    /// this many seconds for `reply`. After the wait the step proceeds on an
+    /// assumption. Without the flag, the step does not ask.
+    #[arg(long, value_name = "SECONDS")]
+    clarification_wait: Option<u64>,
+
     /// LLM provider (`openai`, `anthropic` or `ollama`). If unset, the CLI
     /// chooses one based on which `*_API_KEY` env var is set:
     /// `ANTHROPIC_API_KEY` alone selects `anthropic`, and every other case
@@ -198,6 +205,13 @@ enum Command {
         #[arg(long, value_parser = validate_store_arg)]
         output: Option<String>,
     },
+    /// Reply to the question of a run that waits for one.
+    Reply {
+        /// Run identifier.
+        run_id: String,
+        /// The reply.
+        text: String,
+    },
     /// Cooperatively cancel an in-flight run.
     Cancel {
         /// Run identifier.
@@ -206,7 +220,7 @@ enum Command {
     /// Verify the configured store is reachable. Run it before a query to catch
     /// typos, missing credentials or unreachable buckets.
     Init,
-    /// Delete terminal runs' index entries, cancellation sentinels and
+    /// Delete terminal runs' index entries, cancellation sentinels, replies and
     /// default-location reports. Use `--dry-run` to preview.
     Gc {
         /// Delete only runs whose `submitted_at` is at least this many days in
@@ -282,6 +296,7 @@ async fn main() -> Result<()> {
         Some(Command::Show { run_id, output }) => {
             cmd_show(&store_ctx, run_id.clone(), output.as_deref()).await
         }
+        Some(Command::Reply { run_id, text }) => cmd_reply(&store_ctx, run_id.clone(), text).await,
         Some(Command::Cancel { run_id }) => cmd_cancel(&store_ctx, &sentinel, run_id.clone()).await,
         Some(Command::Init) => cmd_init(&store_ctx).await,
         Some(Command::Gc {
@@ -484,6 +499,27 @@ async fn view_status(view: &WorkflowView, run_id: &RunId) -> Result<Option<RunSt
         .with_context(|| format!("reading the workflow status of {run_id}"))
 }
 
+/// The current step job of `run_id` and its payload, from the job listings that
+/// the run state in `status` implies.
+async fn current_step(
+    reader: &QueueReader,
+    run_id: &str,
+    status: Option<&RunStatus>,
+) -> Result<(Option<JobRecord>, Option<Vec<u8>>)> {
+    let mut job = None;
+    for listing in status.iter().flat_map(|s| step_job_listings(&s.state)) {
+        job = store::find_step_job(reader.view(), run_id, *listing).await?;
+        if job.is_some() {
+            break;
+        }
+    }
+    let payload = match &job {
+        Some(job) => store::job_payload(reader.view(), job).await?,
+        None => None,
+    };
+    Ok((job, payload))
+}
+
 /// The job listings that can contain the step job of a run in `state`, in the
 /// order they are searched. A run in [`RunState::Pending`] whose step was
 /// dead-lettered outside the worker has its job in the dead-letter set until
@@ -623,6 +659,7 @@ fn build_config(cli: &Cli) -> ResearchConfig {
         depth: cli.depth,
         max_sources: cli.max_sources,
         investigation_turns: cli.investigation_turns,
+        clarification_wait_secs: cli.clarification_wait,
         ..ResearchConfig::new(model)
     }
 }
@@ -634,6 +671,7 @@ fn build_config(cli: &Cli) -> ResearchConfig {
 /// "Interrupting..." acknowledgement before the drain of the current step.
 fn spawn_runtime(
     store_ctx: &StoreCtx,
+    sentinel: &CancelSentinel,
     queue: Arc<Queue>,
     runner: ResearchStepRunner,
     run_id: &RunId,
@@ -657,12 +695,13 @@ fn spawn_runtime(
         .with_report_store(store_ctx.object_store.clone(), &store_ctx.prefix);
 
     // Sequential workflow: one claimer is enough. See agent.rs for context.
-    let runtime = WorkflowRuntime::builder(queue, store_ctx.object_store.clone(), runner, hook)
-        .queue_name(WORKFLOW_QUEUE_NAME)
-        .memo_prefix(WORKFLOW_MEMO_PREFIX)
-        .max_concurrent_steps(1)
-        .memo_retention(MEMO_RETENTION)
-        .build();
+    let runtime =
+        WorkflowRuntime::builder(queue.clone(), store_ctx.object_store.clone(), runner, hook)
+            .queue_name(WORKFLOW_QUEUE_NAME)
+            .memo_prefix(WORKFLOW_MEMO_PREFIX)
+            .max_concurrent_steps(1)
+            .memo_retention(MEMO_RETENTION)
+            .build();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let worker_runtime = runtime.clone();
@@ -682,6 +721,13 @@ fn spawn_runtime(
             .await
     });
 
+    let watcher = spawn_reply_watcher(
+        runtime.clone(),
+        queue,
+        replies(store_ctx),
+        Some(sentinel.clone()),
+    );
+
     Ok((
         runtime,
         WorkerHandles {
@@ -689,6 +735,7 @@ fn spawn_runtime(
             worker,
             shutdown_tx,
             job_handle,
+            watcher,
         },
     ))
 }
@@ -717,7 +764,7 @@ async fn cmd_run(
     // The run id is generated before submit so the index entry's KV key can
     // join the submit transaction: the run and its entry commit together.
     let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
-    let (runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id)?;
+    let (runtime, handles) = spawn_runtime(store_ctx, sentinel, queue, runner, &run_id)?;
 
     let entry = RunIndexEntry {
         run_id: run_id.to_string(),
@@ -818,7 +865,7 @@ async fn cmd_resume(
 
     // The runtime is discarded: cmd_resume does not submit new work. It starts
     // a worker to process the existing pending step.
-    let (_runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id)?;
+    let (_runtime, handles) = spawn_runtime(store_ctx, sentinel, queue, runner, &run_id)?;
 
     println!("Resuming {run_id}...");
 
@@ -841,6 +888,8 @@ struct WorkerHandles {
     /// after the workflow worker drains. The workflow step that submits a
     /// FetchPage awaits it, so no fetch work remains then.
     job_handle: RunnerHandle,
+    /// The task that wakes a run waiting for a reply. Dropping it stops it.
+    watcher: ReplyWatcher,
 }
 
 /// Flatten a worker task's join result: a panic or abort (`JoinError`) and a
@@ -865,6 +914,8 @@ async fn finalize(
         mut worker,
         shutdown_tx,
         job_handle,
+        // Held until the run ends.
+        watcher: _watcher,
     } = handles;
     let result = tokio::select! {
         out = &mut rx => {
@@ -1061,18 +1112,8 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
         let entry = store::get_run(reader, &run_id).await?;
         let status = view_status(&workflow_view(store_ctx, reader), &parsed).await?;
         // The step job is read for its attempts, its last error and its
-        // payload. The listings searched follow from the run state.
-        let mut job = None;
-        for listing in status.iter().flat_map(|s| step_job_listings(&s.state)) {
-            job = store::find_step_job(reader.view(), &run_id, *listing).await?;
-            if job.is_some() {
-                break;
-            }
-        }
-        let payload = match &job {
-            Some(job) => store::job_payload(reader.view(), job).await?,
-            None => None,
-        };
+        // payload.
+        let (job, payload) = current_step(reader, &run_id, status.as_ref()).await?;
         // The attempt history is printed for dead-lettered steps only.
         let history = match &job {
             Some(job) if job.status == JobStatus::Dead => {
@@ -1132,17 +1173,16 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
     if let Some(status) = &status {
         println!("step:         {}", status.current_step);
     }
-    let phase = payload
-        .as_deref()
-        .and_then(summarize_state)
-        .map(|progress| progress.phase);
-    if let Some(phase) = phase {
-        println!("phase:        {phase}");
+    let progress = payload.as_deref().and_then(summarize_state);
+    if let Some(progress) = &progress {
+        println!("phase:        {}", progress.phase);
     }
-    if let (Some(Phase::Investigating), Some(status)) = (phase, &status) {
-        let journal =
-            store::journal_entries(store_ctx.object_store.clone(), &parsed, status.current_step)
-                .await?;
+    if let Some(question) = progress.as_ref().and_then(|p| p.pending_question.as_ref()) {
+        println!("question:     {question}");
+        println!("              reply with: taquba-research reply {run_id} \"<text>\"");
+    }
+    if progress.is_some_and(|p| p.phase == Phase::Investigating) {
+        let journal = store::journal_entries(store_ctx.object_store.clone(), &parsed).await?;
         if !journal.is_empty() {
             println!("journal:");
         }
@@ -1221,6 +1261,44 @@ async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) ->
         }
     }
     Ok(())
+}
+
+async fn cmd_reply(store_ctx: &StoreCtx, run_id: String, text: &str) -> Result<()> {
+    // An empty signal wakes a waiting run for its cancellation.
+    if text.trim().is_empty() {
+        bail!("a reply must contain text");
+    }
+    if !queue_exists(store_ctx).await? {
+        bail!("no run index entry for {run_id} (store contains no runs)");
+    }
+    let parsed: RunId = run_id
+        .parse()
+        .with_context(|| format!("invalid run id `{run_id}`"))?;
+    let payload = with_reader(store_ctx, async |reader| {
+        let status = view_status(&workflow_view(store_ctx, reader), &parsed).await?;
+        let (_, payload) = current_step(reader, &run_id, status.as_ref()).await?;
+        Ok(payload)
+    })
+    .await?;
+    let question = payload
+        .as_deref()
+        .and_then(summarize_state)
+        .and_then(|progress| progress.pending_question)
+        .ok_or_else(|| anyhow!("run {run_id} is not waiting for a reply"))?;
+    replies(store_ctx)
+        .put(&run_id, text)
+        .await
+        .context("writing reply")?;
+    println!(
+        "Reply stored for {run_id} to \"{question}\". A running worker delivers it within a few \
+         seconds. If no worker is running, the reply takes effect on the next `resume`."
+    );
+    Ok(())
+}
+
+/// The reply box of the runs in the store of `store_ctx`.
+fn replies(store_ctx: &StoreCtx) -> ReplyBox {
+    ReplyBox::new(store_ctx.object_store.clone(), &store_ctx.prefix)
 }
 
 async fn cmd_cancel(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: String) -> Result<()> {
@@ -1382,6 +1460,10 @@ async fn cmd_gc(
         }
         if let Err(err) = sentinel.clear(&e.run_id).await {
             tracing::warn!(run_id = %e.run_id, error = %err, "gc sentinel delete failed");
+            row_failed = true;
+        }
+        if let Err(err) = replies(store_ctx).clear(&e.run_id).await {
+            tracing::warn!(run_id = %e.run_id, error = %err, "gc reply delete failed");
             row_failed = true;
         }
         // Default-location report. Custom `--output` destinations are not

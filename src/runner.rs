@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rig_agent::agent::{AgentBuilder, CompletionCall, PromptResponse, TypedPromptResponse};
 use rig_agent::completion::{PromptError, StructuredOutputError};
 use rig_core::DynModel;
@@ -28,14 +28,18 @@ use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
 use url::Url;
 
 use crate::fetch_job::FetchPage;
-use crate::investigate::{self, FetchPageTool, Investigator};
+use crate::investigate::{self, Asking, FetchPageTool, Investigated, Investigator};
 use crate::journal::Journal;
 use crate::report::{Citation, Report, RunStats, render_markdown};
 use crate::search::{SearchBackend, SearchError};
 use crate::state::{
-    Phase, ResearchConfig, ResearchState, SourceQuote, Summary, SynthesisOutput, TokenUsage,
+    Clarification, Phase, Reply, ResearchConfig, ResearchState, SourceQuote, Summary,
+    SynthesisOutput, TokenUsage,
 };
-use crate::store::{CancelSentinel, RunIndexEntry, RunSummary, StoredStatus, TerminalRecord};
+use crate::store::{
+    CancelSentinel, RunIndexEntry, RunSummary, StoredStatus, TerminalRecord,
+    clarification_signal_key,
+};
 
 /// Preamble applied to every Rig agent built by the runner. The per-phase
 /// prompts contain the task-specific instructions.
@@ -245,6 +249,47 @@ async fn poll_cancelled(sentinel: &CancelSentinel, run_id: &str) {
     }
 }
 
+/// The wait of a run for the reply of the user.
+struct Wait {
+    /// The correlation key of a signal that ends the wait.
+    key: String,
+    /// The end of the wait without a signal.
+    timeout: Duration,
+}
+
+/// How a step after a wait resolves the question asked at `asked_at`.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolution {
+    Reply(Reply),
+    /// The run waits again for the rest of the wait.
+    Wait(Duration),
+}
+
+/// A signal with text is the reply, and a step without a signal follows the end
+/// of the wait, so the agent proceeds on an assumption. An empty signal wakes
+/// the step for a cancellation, and the run waits for the rest of `wait` at
+/// `now`.
+fn resolve_reply(
+    signal: Option<&[u8]>,
+    asked_at: DateTime<Utc>,
+    wait: Duration,
+    now: DateTime<Utc>,
+) -> Resolution {
+    match signal {
+        None => Resolution::Reply(Reply::Assumed),
+        Some(payload) if !payload.is_empty() => {
+            Resolution::Reply(Reply::Given(String::from_utf8_lossy(payload).into_owned()))
+        }
+        Some(_) => {
+            let waited = (now - asked_at).to_std().unwrap_or_default();
+            match wait.checked_sub(waited) {
+                Some(rest) if !rest.is_zero() => Resolution::Wait(rest),
+                _ => Resolution::Reply(Reply::Assumed),
+            }
+        }
+    }
+}
+
 /// Terminal index entry for a successful run, with a summary of the report's
 /// stats.
 fn succeeded_entry(step: &Step, state: &ResearchState, report: &Report) -> RunIndexEntry {
@@ -366,7 +411,16 @@ impl ResearchStepRunner {
             Phase::Searching => self.run_searching(step, state).await?,
             Phase::Fetching => self.run_fetching(step, state).await?,
             Phase::Summarizing => self.run_summarizing(step, state).await?,
-            Phase::Investigating => self.run_investigating(step, state).await?,
+            Phase::Investigating => {
+                // A wait is not a completed step.
+                if let Some(wait) = self.run_investigating(step, state).await? {
+                    return Ok(StepOutcome::continue_on_signal(
+                        state.to_bytes(),
+                        wait.key,
+                        wait.timeout,
+                    ));
+                }
+            }
             Phase::Synthesizing => self.run_synthesizing(step, state).await?,
             Phase::Writing => {
                 let report = self.run_writing(step, state).await?;
@@ -623,11 +677,11 @@ impl ResearchStepRunner {
         &self,
         step: &Step,
         state: &mut ResearchState,
-    ) -> Result<(), StepError> {
-        state.phase = Phase::Synthesizing;
+    ) -> Result<Option<Wait>, StepError> {
         let turns = state.config.investigation_turns;
         if turns == 0 {
-            return Ok(());
+            state.phase = Phase::Synthesizing;
+            return Ok(None);
         }
         let jobs = self
             .job_runner
@@ -635,8 +689,38 @@ impl ResearchStepRunner {
             .ok_or_else(|| StepError::permanent("investigating phase requires a JobRunner"))?;
         let run_id = step.run_id.to_string();
         let max_chars = state.config.max_page_chars;
+        let wait_for = |timeout| Wait {
+            key: clarification_signal_key(&run_id),
+            timeout,
+        };
+
+        let asking = match (
+            state
+                .config
+                .clarification_wait_secs
+                .map(Duration::from_secs),
+            &mut state.clarification,
+        ) {
+            (None, _) => Asking::Off,
+            (Some(_), None) => Asking::Open,
+            (Some(wait), Some(clarification)) => {
+                if clarification.reply.is_none() {
+                    match resolve_reply(
+                        step.signal.as_deref(),
+                        clarification.asked_at,
+                        wait,
+                        Utc::now(),
+                    ) {
+                        Resolution::Reply(reply) => clarification.reply = Some(reply),
+                        Resolution::Wait(rest) => return Ok(Some(wait_for(rest))),
+                    }
+                }
+                Asking::Replied(clarification.clone())
+            }
+        };
         tracing::info!("investigating gaps in {} sources", state.summaries.len());
 
+        let can_ask = !matches!(asking, Asking::Off);
         let investigator = Investigator {
             model: self.provider.completion_model(&state.config.model),
             search: self.search.clone(),
@@ -645,23 +729,52 @@ impl ResearchStepRunner {
                 run_id: run_id.clone(),
                 max_chars,
             },
+            asking,
             max_tokens: state.config.max_tokens_per_call,
         };
-        let journal = Journal::new(step.memo.clone(), step.lease.clone());
-        let prompt = investigate::prompt(&state.query, &state.summaries, turns);
-        let investigated = investigator
+        // The run memo keeps the journal across the steps of a wait.
+        let journal = Journal::new(
+            step.run_memo.clone(),
+            investigate::JOURNAL_PREFIX,
+            step.lease.clone(),
+        );
+        let prompt = investigate::prompt(&state.query, &state.summaries, turns, can_ask);
+        let (findings, fetched) = match investigator
             .run(&journal, prompt, turns, state.token_usage)
-            .await?;
-        state.token_usage = investigated.usage;
+            .await?
+        {
+            Investigated::Asked { key, question } => {
+                tracing::info!(
+                    %question,
+                    "waiting for a reply: taquba-research reply {run_id} \"<text>\""
+                );
+                state.clarification = Some(Clarification {
+                    key,
+                    question,
+                    asked_at: Utc::now(),
+                    reply: None,
+                });
+                let wait = state.config.clarification_wait_secs.unwrap_or_default();
+                return Ok(Some(wait_for(Duration::from_secs(wait))));
+            }
+            Investigated::Finished {
+                findings,
+                fetched,
+                usage,
+            } => {
+                state.token_usage = usage;
+                (findings, fetched)
+            }
+        };
 
         // A finding enters the run only for a page that `fetch_page` returned.
         // The page text comes from the recorded result of its `FetchPage` job.
         let mut added = 0;
-        for finding in investigated.findings {
+        for finding in findings {
             let Ok(url) = Url::parse(&finding.url) else {
                 continue;
             };
-            if !investigated.fetched.contains(&url) || state.summaries.contains_key(&url) {
+            if !fetched.contains(&url) || state.summaries.contains_key(&url) {
                 continue;
             }
             let page = under_lease(&step.lease, FETCH_JOIN_LEASE, "fetch", async {
@@ -687,7 +800,8 @@ impl ResearchStepRunner {
             added += 1;
         }
         tracing::info!("investigation added {added} sources");
-        Ok(())
+        state.phase = Phase::Synthesizing;
+        Ok(None)
     }
 
     async fn run_synthesizing(
@@ -1739,10 +1853,37 @@ mod tests {
         state.phase = Phase::Investigating;
 
         // The runner lacks a job runner, so only the skip completes the step.
-        runner
+        let wait = runner
             .run_investigating(&test_step("run", 4), &mut state)
             .await
             .unwrap();
+        assert!(wait.is_none());
         assert_eq!(state.phase, Phase::Synthesizing);
+    }
+
+    #[test]
+    fn resolve_reply_reads_the_signal_of_the_wait() {
+        let asked_at = Utc::now();
+        let wait = Duration::from_secs(60);
+        let before_end = asked_at + chrono::Duration::seconds(45);
+        let at_end = asked_at + chrono::Duration::seconds(60);
+
+        assert_eq!(
+            resolve_reply(Some(b"the 2024 edition"), asked_at, wait, at_end),
+            Resolution::Reply(Reply::Given("the 2024 edition".to_string()))
+        );
+        assert_eq!(
+            resolve_reply(None, asked_at, wait, before_end),
+            Resolution::Reply(Reply::Assumed)
+        );
+        // An empty signal wakes the step for a cancellation.
+        assert_eq!(
+            resolve_reply(Some(b""), asked_at, wait, before_end),
+            Resolution::Wait(Duration::from_secs(15))
+        );
+        assert_eq!(
+            resolve_reply(Some(b""), asked_at, wait, at_end),
+            Resolution::Reply(Reply::Assumed)
+        );
     }
 }

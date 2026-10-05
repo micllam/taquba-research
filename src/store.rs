@@ -58,17 +58,16 @@ pub fn workflow_view(reader: &QueueReader, object_store: Arc<dyn ObjectStore>) -
     )
 }
 
-/// The records of the journal of step `step_number` of `run_id`, from the
-/// runtime's memo store in `object_store`: each completion in order, followed
-/// by the tool calls that it requested. The investigating step keeps a journal,
-/// and the list is empty for any other step.
+/// The records of the journal of the investigating step of `run_id`, from the
+/// run memo in the runtime's memo store in `object_store`: each completion in
+/// order, followed by the tool calls that it requested. The list is empty
+/// before the investigating step starts.
 pub async fn journal_entries(
     object_store: Arc<dyn ObjectStore>,
     run_id: &RunId,
-    step_number: u32,
 ) -> anyhow::Result<Vec<JournalEntry>> {
-    let memo = MemoStore::new(object_store, WORKFLOW_MEMO_PREFIX).new_memo(run_id, step_number);
-    crate::journal::read_entries(&memo).await
+    let memo = MemoStore::new(object_store, WORKFLOW_MEMO_PREFIX).new_run_memo(run_id);
+    crate::journal::read_entries(&memo, crate::investigate::JOURNAL_PREFIX).await
 }
 
 /// Prefix of run index entries in the queue's user KV namespace.
@@ -575,6 +574,84 @@ impl CancelSentinel {
     }
 }
 
+/// Correlation key of the signal that ends the wait of `run_id` for the reply
+/// of the user. A [`WorkflowRuntime::signal`] with the reply as its payload
+/// delivers it, and an empty payload wakes the run to check its cancellation.
+///
+/// [`WorkflowRuntime::signal`]: taquba_workflow::WorkflowRuntime::signal
+pub fn clarification_signal_key(run_id: &str) -> String {
+    format!("research/clarify/{run_id}")
+}
+
+/// Handle to the reply of the user to the question of a run, inside the
+/// configured object store at `<prefix>/runs/<run_id>.reply`. The reply watcher
+/// of a worker ([`crate::spawn_reply_watcher`]) delivers it to the waiting run.
+///
+/// A clone copies an internal `Arc<dyn ObjectStore>`.
+#[derive(Clone)]
+pub struct ReplyBox {
+    object_store: Arc<dyn ObjectStore>,
+    runs_prefix: Path,
+}
+
+impl std::fmt::Debug for ReplyBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyBox")
+            .field("runs_prefix", &self.runs_prefix.as_ref())
+            .field("object_store", &self.object_store.to_string())
+            .finish()
+    }
+}
+
+impl ReplyBox {
+    /// Build a handle rooted at `<prefix>/runs/` inside `object_store`, the
+    /// prefix of the cancellation sentinels.
+    pub fn new(object_store: Arc<dyn ObjectStore>, prefix: &Path) -> Self {
+        Self {
+            object_store,
+            runs_prefix: prefix.clone().join("runs"),
+        }
+    }
+
+    /// Object key of the reply of `run_id`.
+    pub fn path(&self, run_id: &str) -> Path {
+        self.runs_prefix.clone().join(format!("{run_id}.reply"))
+    }
+
+    /// Write `reply` for `run_id`, replacing an earlier reply.
+    pub async fn put(&self, run_id: &str, reply: &str) -> object_store::Result<()> {
+        self.object_store
+            .put(
+                &self.path(run_id),
+                PutPayload::from(reply.as_bytes().to_vec()),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// The reply of `run_id`. `Ok(None)` only for a missing reply. A reply that
+    /// is not UTF-8 is decoded lossily.
+    pub async fn get(&self, run_id: &str) -> object_store::Result<Option<String>> {
+        let read = match self.object_store.get(&self.path(run_id)).await {
+            Ok(resp) => resp.bytes().await,
+            Err(e) => Err(e),
+        };
+        match read {
+            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Remove the reply. A missing reply is not an error.
+    pub async fn clear(&self, run_id: &str) -> object_store::Result<()> {
+        match self.object_store.delete(&self.path(run_id)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,5 +1043,21 @@ mod tests {
         assert!(!sentinel.is_set("run-1").await.unwrap());
         // Clearing an absent sentinel is not an error.
         sentinel.clear("run-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_box_round_trip() {
+        use taquba::object_store::memory::InMemory;
+        let replies = ReplyBox::new(Arc::new(InMemory::new()), &Path::default());
+        assert!(replies.get("run-1").await.unwrap().is_none());
+        replies.put("run-1", "the 2024 edition").await.unwrap();
+        assert_eq!(
+            replies.get("run-1").await.unwrap().as_deref(),
+            Some("the 2024 edition")
+        );
+        replies.clear("run-1").await.unwrap();
+        assert!(replies.get("run-1").await.unwrap().is_none());
+        // Clearing an absent reply is not an error.
+        replies.clear("run-1").await.unwrap();
     }
 }

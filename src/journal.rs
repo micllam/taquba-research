@@ -1,13 +1,14 @@
 //! The effect journal: handlers on a rig bus that record each completion and
-//! tool-call outcome in the step [`Memo`], and return the recorded outcome when
-//! a retried step dispatches the same effect.
+//! tool-call outcome in a [`Memo`], and return the recorded outcome when a
+//! later run of the agent over the same memo dispatches the same effect.
 //!
-//! A completion uses its ordinal within the step as its key, and a tool call
-//! uses the ordinal of the completion that requested it and the call id of the
-//! provider. A replayed completion contains the call ids of its tool calls, so
-//! both keys are stable across a retry. The call id reaches only the hooks of
-//! the agent, so [`Journal::call_keys`] must be added to the agent that
-//! dispatches the tool calls.
+//! Every key starts with the prefix of the journal. A completion uses its
+//! ordinal within the run of the agent as its key, and a tool call uses the
+//! ordinal of the completion that requested it and the call id of the provider.
+//! A replayed completion contains the call ids of its tool calls, so both keys
+//! are stable across a retry. The call id reaches only the hooks of the agent,
+//! so [`Journal::call_keys`] must be added to the agent that dispatches the
+//! tool calls.
 //!
 //! A reader derives the keys from the records: [`read_entries`] reads the
 //! completions in order, and the tool calls that each one requested.
@@ -46,21 +47,21 @@ pub enum JournalEntry {
     },
 }
 
-fn completion_key(ordinal: usize) -> String {
-    format!("completion/{ordinal}")
+fn completion_key(prefix: &str, ordinal: usize) -> String {
+    format!("{prefix}completion/{ordinal}")
 }
 
-fn tool_key(completion: usize, call_id: impl Display) -> String {
-    format!("tool/{completion}/{call_id}")
+fn tool_key(prefix: &str, completion: usize, call_id: impl Display) -> String {
+    format!("{prefix}tool/{completion}/{call_id}")
 }
 
-/// The records of the journal of the step of `memo`: each completion in order,
-/// followed by the tool calls that it requested. The list is empty for a step
+/// The records of the journal under `prefix` in `memo`: each completion in
+/// order, followed by the tool calls that it requested. The list is empty
 /// without a journal.
-pub(crate) async fn read_entries(memo: &Memo) -> anyhow::Result<Vec<JournalEntry>> {
+pub(crate) async fn read_entries(memo: &Memo, prefix: &str) -> anyhow::Result<Vec<JournalEntry>> {
     let mut entries = Vec::new();
     for ordinal in 0.. {
-        let key = completion_key(ordinal);
+        let key = completion_key(prefix, ordinal);
         let Some(bytes) = memo.get(&key).await.context("reading journal")? else {
             break;
         };
@@ -75,7 +76,7 @@ pub(crate) async fn read_entries(memo: &Memo) -> anyhow::Result<Vec<JournalEntry
                 continue;
             };
             let recorded = memo
-                .get(&tool_key(ordinal, &call.id))
+                .get(&tool_key(prefix, ordinal, &call.id))
                 .await
                 .context("reading journal")?
                 .is_some();
@@ -97,6 +98,7 @@ pub(crate) struct Journal {
 
 struct JournalInner {
     memo: Memo,
+    prefix: String,
     lease: LeaseHandle,
     completions: AtomicUsize,
     /// Journal keys of dispatched tool calls, by effect id.
@@ -106,10 +108,12 @@ struct JournalInner {
 }
 
 impl Journal {
-    pub(crate) fn new(memo: Memo, lease: LeaseHandle) -> Self {
+    /// A journal of the keys under `prefix` in `memo`.
+    pub(crate) fn new(memo: Memo, prefix: impl Into<String>, lease: LeaseHandle) -> Self {
         Self {
             inner: Arc::new(JournalInner {
                 memo,
+                prefix: prefix.into(),
                 lease,
                 completions: AtomicUsize::new(0),
                 calls: Mutex::new(HashMap::new()),
@@ -133,6 +137,12 @@ impl Journal {
         CallKeys(self.clone())
     }
 
+    /// The journal key of the tool call `call_id` of the latest completion.
+    pub(crate) fn tool_key(&self, call_id: impl Display) -> String {
+        let completions = self.inner.completions.load(Ordering::Relaxed);
+        tool_key(&self.inner.prefix, completions.saturating_sub(1), call_id)
+    }
+
     /// The first failure to read or write the journal, or to extend the lease.
     /// A tool handler's error reaches the model as a failed result, so the step
     /// must return this error after the agent finishes.
@@ -143,6 +153,7 @@ impl Journal {
     fn key(&self, kind: &EffectKind, id: EffectId) -> Result<String, StepError> {
         match kind {
             EffectKind::Completion { .. } => Ok(completion_key(
+                &self.inner.prefix,
                 self.inner.completions.fetch_add(1, Ordering::Relaxed),
             )),
             EffectKind::ToolCall { name, .. } => {
@@ -255,8 +266,7 @@ pub(crate) struct CallKeys(Journal);
 impl AgentHook for CallKeys {
     async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
         if let Some(call_id) = event.call_id {
-            let completions = self.0.inner.completions.load(Ordering::Relaxed);
-            let key = tool_key(completions.saturating_sub(1), call_id);
+            let key = self.0.tool_key(call_id);
             lock(&self.0.inner.calls).insert(event.id, key);
         }
         DispatchAction::Proceed
@@ -280,7 +290,7 @@ mod tests {
     async fn journal_faults_a_tool_call_without_a_call_id() {
         let memo = MemoStore::new(Arc::new(InMemory::new()), "test-memo")
             .new_memo(&RunId::new("run").unwrap(), 4);
-        let journal = Journal::new(memo, LeaseHandle::detached());
+        let journal = Journal::new(memo, "test/", LeaseHandle::detached());
         let (dispatcher, _registrar, mut driver) = Bus::channel();
         let key = rig_core::effect::tool_key("web_search");
         let search = WebSearch {

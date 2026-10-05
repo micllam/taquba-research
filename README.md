@@ -71,6 +71,7 @@ Other subcommands:
 - `list`, `status <id>`, `show <id>`, `cancel <id>`: inspect and manage the
   recorded runs. `show <id> --output <path-or-url>` writes the report to that
   location in place of stdout.
+- `reply <id> "<text>"`: reply to the question of a run that waits for one.
 - `init`: check that the configured store is reachable, with valid credentials
   and an existing bucket. Run it before the first submission against a fresh
   cloud bucket.
@@ -79,6 +80,11 @@ Other subcommands:
   `failed`, `cancelled` and `unknown`. Only `unknown` deletes a run without a
   terminal record, and it selects the entries whose run the workflow store no
   longer contains.
+
+With `--clarification-wait <SECONDS>`, the agent of the investigating step can
+ask the user a single question per run. The run then waits up to that many
+seconds for `reply`, and `status` prints the question. After the wait, the agent
+proceeds on an assumption that it states in its findings.
 
 See `taquba-research --help` for the full flag list.
 

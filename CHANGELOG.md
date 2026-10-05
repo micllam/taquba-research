@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `store::journal_entries` and `store::JournalEntry`, the ordered completions
   and tool calls of an investigating step, readable from a second process. The
   `status` command prints them as `journal` while a run investigates.
+- The investigating agent can ask the user a single question per run, and the
+  run waits for the `reply` command, or proceeds on an assumption after the
+  wait. Enable it with `--clarification-wait <SECONDS>` or
+  `ResearchConfig::clarification_wait_secs`, and deliver a reply from another
+  process through `store::ReplyBox` and `spawn_reply_watcher`, which
+  `ResearchAgentBuilder::replies` spawns, or in-process through a signal to
+  `store::clarification_signal_key`.
 
 ### Changed
 - **Breaking:** `store::derive_display_status` takes the run's `RunState` from
@@ -42,9 +49,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `Phase` gains `Investigating`, so an exhaustive match on `Phase`
   fails to compile. Add an arm for `Phase::Investigating`.
 - **Breaking:** `ResearchConfig` gains `investigation_turns`, the model-call
-  budget of the investigating step, so a struct literal without it fails to
-  compile and a state of 0.5.0 decodes with 0. Set the field, or start from
-  `ResearchConfig::new`, which sets 8.
+  budget of the investigating step, and `clarification_wait_secs`, so a struct
+  literal without them fails to compile and a state of 0.5.0 decodes with 0 and
+  `None`. Set the fields, or start from `ResearchConfig::new`, which sets 8 and
+  `None`.
+- **Breaking:** `StateSummary` gains `pending_question`, the question of a run
+  that waits for a reply, so a struct literal of it fails to compile. Build the
+  summary with `summarize_state`.
 
 <!-- vale off -->
 

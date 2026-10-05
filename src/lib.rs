@@ -94,6 +94,7 @@
 //! taquba-research show <RUN_ID>           # print the rendered report
 //! taquba-research show <RUN_ID> --output  # also accepts s3:// / gs:// / az:// / local path
 //! taquba-research cancel <RUN_ID>         # cooperatively cancel
+//! taquba-research reply <RUN_ID> "<text>" # reply to the question of a run
 //! taquba-research init                    # fail-fast store reachability check
 //! taquba-research gc --older-than-days 7  # delete old runs from the index + reports
 //! ```
@@ -101,11 +102,16 @@
 //! `run` and `resume` are foreground processes that stay alive for the duration
 //! of the work. They require `TAVILY_API_KEY` and the API key of the chosen
 //! `--provider`. The other subcommands (`list`, `status`, `show`, `cancel`,
-//! `init` and `gc`) inspect or maintain the shared store, from another shell
-//! while a run is in flight or at any later time, and they require neither key.
-//! Every subcommand reads object-store credentials (the standard `AWS_*`,
-//! `GOOGLE_*` or `AZURE_*` environment variables) when `--store` is a cloud
-//! URL.
+//! `reply`, `init` and `gc`) inspect or maintain the shared store, from another
+//! shell while a run is in flight or at any later time, and they require
+//! neither key. Every subcommand reads object-store credentials (the standard
+//! `AWS_*`, `GOOGLE_*` or `AZURE_*` environment variables) when `--store` is a
+//! cloud URL.
+//!
+//! With `--clarification-wait <SECONDS>`, the agent of the investigating step
+//! can ask the user a single question per run. The run then waits up to that
+//! many seconds for `reply`, and `status` prints the question. After the wait,
+//! the agent proceeds on an assumption that it states in its findings.
 //!
 //! See `taquba-research --help` for the full flag list.
 //!
@@ -201,6 +207,7 @@ mod state;
 /// queue, and the cancellation sentinel. The `list`, `status`, `show`, `cancel`
 /// and `gc` subcommands of the CLI use it. See [`store::RunIndexEntry`].
 pub mod store;
+mod watcher;
 
 pub use agent::{ResearchAgent, ResearchAgentBuilder};
 pub use fetch_job::{FETCH_QUEUE_NAME, spawn_fetch_runner};
@@ -208,6 +215,7 @@ pub use report::{Citation, Report, RunStats};
 pub use runner::{ResearchStepRunner, RunRecord};
 pub use state::{Phase, ResearchConfig, StateSummary, TokenUsage, summarize_state};
 pub use store::{CancelSentinel, TerminalReconciler};
+pub use watcher::{ReplyWatcher, spawn_reply_watcher};
 
 /// Re-exports of the workflow runtime types for a custom
 /// [`WorkflowRuntime`](taquba_workflow::WorkflowRuntime) around

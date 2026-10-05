@@ -42,6 +42,11 @@ pub struct ResearchConfig {
     /// step. A state persisted without the field decodes as 0.
     #[serde(default)]
     pub investigation_turns: usize,
+    /// How long a run waits for the reply of the user to a question of the
+    /// investigating agent, in seconds. With `None` the agent cannot ask. After
+    /// the wait the agent proceeds on a stated assumption.
+    #[serde(default)]
+    pub clarification_wait_secs: Option<u64>,
 }
 
 impl ResearchConfig {
@@ -56,6 +61,7 @@ impl ResearchConfig {
             max_tokens_per_call: None,
             max_page_chars: 16_000,
             investigation_turns: 8,
+            clarification_wait_secs: None,
         }
     }
 }
@@ -146,6 +152,9 @@ pub struct StateSummary {
     pub phase: Phase,
     /// Steps the runner completed so far.
     pub steps_completed: u32,
+    /// The question of the investigating agent while the run waits for the
+    /// reply of the user.
+    pub pending_question: Option<String>,
 }
 
 /// Decode the progress-relevant fields of a step-job payload. Returns `None`
@@ -155,6 +164,10 @@ pub fn summarize_state(payload: &[u8]) -> Option<StateSummary> {
     Some(StateSummary {
         phase: state.phase,
         steps_completed: state.steps_completed,
+        pending_question: state
+            .clarification
+            .filter(|c| c.reply.is_none())
+            .map(|c| c.question),
     })
 }
 
@@ -240,6 +253,34 @@ pub struct ResearchState {
     pub synthesis: Option<SynthesisOutput>,
     /// Aggregate token usage across every LLM call made by this run.
     pub token_usage: TokenUsage,
+    /// The question of the investigating agent to the user, and its reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clarification: Option<Clarification>,
+}
+
+/// The question that the investigating agent of a run asks the user, a single
+/// question per run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clarification {
+    /// The journal key of the `ask_user` call.
+    pub key: String,
+    /// The question.
+    pub question: String,
+    /// When the agent asked.
+    pub asked_at: DateTime<Utc>,
+    /// The reply, or `None` while the run waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<Reply>,
+}
+
+/// How a question of the investigating agent was resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "text", rename_all = "snake_case")]
+pub enum Reply {
+    /// The user replied with this text.
+    Given(String),
+    /// The wait ran out, and the agent proceeds on an assumption.
+    Assumed,
 }
 
 impl ResearchState {
@@ -260,6 +301,7 @@ impl ResearchState {
             summaries: BTreeMap::new(),
             synthesis: None,
             token_usage: TokenUsage::default(),
+            clarification: None,
         }
     }
 
@@ -283,6 +325,13 @@ mod tests {
         let mut s = ResearchState::new("a query", ResearchConfig::new("gpt-4o-mini"));
         s.config.max_tokens_per_call = Some(2048);
         s.config.investigation_turns = 3;
+        s.config.clarification_wait_secs = Some(600);
+        s.clarification = Some(Clarification {
+            key: "tool/0/call_1".to_string(),
+            question: "Which edition?".to_string(),
+            asked_at: Utc::now(),
+            reply: Some(Reply::Given("2024".to_string())),
+        });
         let url: Url = "https://example.com/page".parse().unwrap();
         s.fetched.insert(
             url.clone(),
@@ -337,6 +386,25 @@ mod tests {
         assert_eq!(back.token_usage, s.token_usage);
         assert_eq!(back.config.max_tokens_per_call, Some(2048));
         assert_eq!(back.config.investigation_turns, 3);
+        assert_eq!(back.config.clarification_wait_secs, Some(600));
+        assert_eq!(back.clarification, s.clarification);
+    }
+
+    #[test]
+    fn summarize_state_reports_the_question_only_while_the_run_waits() {
+        let mut s = ResearchState::new("a query", ResearchConfig::new("m"));
+        s.clarification = Some(Clarification {
+            key: "tool/0/call_1".to_string(),
+            question: "Which edition?".to_string(),
+            asked_at: Utc::now(),
+            reply: None,
+        });
+        let waiting = summarize_state(&s.to_bytes()).unwrap();
+        assert_eq!(waiting.pending_question.as_deref(), Some("Which edition?"));
+
+        s.clarification.as_mut().unwrap().reply = Some(Reply::Assumed);
+        let resolved = summarize_state(&s.to_bytes()).unwrap();
+        assert_eq!(resolved.pending_question, None);
     }
 
     #[test]

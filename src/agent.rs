@@ -23,9 +23,10 @@ use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
 use crate::store::{
-    CancelSentinel, RunIndexEntry, TerminalReconciler, WORKFLOW_MEMO_PREFIX, WORKFLOW_QUEUE_NAME,
-    count_waiting_step_jobs, run_entry_key,
+    CancelSentinel, ReplyBox, RunIndexEntry, TerminalReconciler, WORKFLOW_MEMO_PREFIX,
+    WORKFLOW_QUEUE_NAME, count_waiting_step_jobs, run_entry_key,
 };
+use crate::watcher::spawn_reply_watcher;
 
 /// How long workflow memo blobs are retained after the run reaches a terminal
 /// state. The window exceeds the longest realistic run wall-time plus an
@@ -39,6 +40,8 @@ const MEMO_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub struct ResearchAgent {
     runner: ResearchStepRunner,
     config: ResearchConfig,
+    cancel: Option<CancelSentinel>,
+    replies: Option<ReplyBox>,
 }
 
 impl ResearchAgent {
@@ -107,7 +110,7 @@ impl ResearchAgent {
         // `StepOutcome::Continue` enqueues the next step only after the current
         // one acks. One worker is enough and avoids unnecessary claim
         // transaction conflicts.
-        let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
+        let runtime = WorkflowRuntime::builder(queue.clone(), object_store, runner, hook)
             .queue_name(WORKFLOW_QUEUE_NAME)
             .memo_prefix(WORKFLOW_MEMO_PREFIX)
             .max_concurrent_steps(1)
@@ -138,6 +141,10 @@ impl ResearchAgent {
             return Err(e);
         }
 
+        // The watcher stops when this call returns.
+        let _watcher = self.replies.clone().map(|replies| {
+            spawn_reply_watcher(runtime.clone(), queue, replies, self.cancel.clone())
+        });
         let worker_runtime = runtime.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let mut worker = tokio::spawn(async move {
@@ -215,12 +222,14 @@ impl ResearchAgent {
 /// Optional:
 ///
 /// - [`Self::cancellation`]: sentinel handle for cross-process cancellation.
+/// - [`Self::replies`]: reply box for the question of the investigating step.
 #[derive(Default)]
 pub struct ResearchAgentBuilder {
     provider: Option<ProviderClient>,
     search: Option<Arc<dyn SearchBackend>>,
     config: Option<ResearchConfig>,
     cancel: Option<CancelSentinel>,
+    replies: Option<ReplyBox>,
 }
 
 impl ResearchAgentBuilder {
@@ -267,6 +276,14 @@ impl ResearchAgentBuilder {
         self
     }
 
+    /// Attach a [`ReplyBox`] so a reply written from another process reaches a
+    /// run that waits for the reply of the user. Without it, the run proceeds
+    /// on an assumption after [`ResearchConfig::clarification_wait_secs`].
+    pub fn replies(mut self, replies: ReplyBox) -> Self {
+        self.replies = Some(replies);
+        self
+    }
+
     /// Finalise the builder.
     pub fn build(self) -> Result<ResearchAgent> {
         let provider = self.provider.ok_or_else(|| {
@@ -281,10 +298,15 @@ impl ResearchAgentBuilder {
             .config
             .ok_or_else(|| anyhow!("ResearchAgent requires a ResearchConfig"))?;
         let mut runner = ResearchStepRunner::from_provider(provider, search);
-        if let Some(sentinel) = self.cancel {
-            runner = runner.with_cancellation(sentinel);
+        if let Some(sentinel) = &self.cancel {
+            runner = runner.with_cancellation(sentinel.clone());
         }
-        Ok(ResearchAgent { runner, config })
+        Ok(ResearchAgent {
+            runner,
+            config,
+            cancel: self.cancel,
+            replies: self.replies,
+        })
     }
 }
 
