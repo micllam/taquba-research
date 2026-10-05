@@ -79,8 +79,8 @@ Other subcommands:
 - `gc --older-than-days N [--status S]... [--dry-run]`: clean up recorded runs
   and their default-location reports. `--status` accepts `succeeded`, `failed`,
   `cancelled` and `unknown`. A run without a terminal record is deleted only
-  with `unknown`, which selects entries that lack a terminal record and a step
-  job.
+  with `unknown`, which selects entries that lack a terminal record and whose
+  run the workflow store no longer contains.
 
 See `taquba-research --help` for the full flag list.
 

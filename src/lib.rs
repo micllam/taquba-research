@@ -216,9 +216,10 @@ pub use store::{CancelSentinel, TerminalReconciler};
 /// [`ResearchStepRunner`].
 pub mod workflow {
     pub use taquba_workflow::{
-        Delivery, EffectsHandle, NoopTerminalHook, RunId, RunOptions, RunOutcome, RunSpec, Step,
-        StepError, StepOutcome, StepRunner, SubmitOutcome, TerminalEffects, TerminalHook,
-        TerminalStatus, WorkflowRuntime,
+        Delivery, EffectsHandle, NoopTerminalHook, RunId, RunOptions, RunOutcome, RunSpec,
+        RunState, RunStatus, RunTermination, Step, StepError, StepErrorKind, StepOutcome,
+        StepRunner, SubmitOutcome, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
+        WorkflowView,
     };
 }
 

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `store::WORKFLOW_MEMO_PREFIX`, the memo prefix of both runtimes, and
+  `store::workflow_view`, the `WorkflowView` of taquba-workflow 0.13 over a
+  `QueueReader`. The `workflow` module re-exports `RunState`, `RunStatus`,
+  `RunTermination`, `StepErrorKind` and `WorkflowView`.
+- `store::find_step_job`, the step job of a run in a job listing.
+- The `status` command prints `step`, the current step number from the workflow
+  view, and `error_kind`, the classification of the failure that ended a run.
+  Its `progress` line becomes `phase`.
+
+### Changed
+- **Breaking:** `store::derive_display_status` takes the run's `RunState` from
+  `WorkflowView::status` in place of a `StepJobState`, and `StepJobState` and
+  `store::snapshot_step_jobs` are removed. Read the state with
+  `store::workflow_view(reader, object_store).status(run_id)` and pass
+  `status.map(|s| s.state)`.
+- **Breaking:** `RunDisplayStatus::DeadLettered` folds into `Failed`, so a
+  dead-lettered run displays `failed`. Match `Failed` where `DeadLettered` was
+  matched.
+- **Breaking:** `store::count_waiting_step_jobs` takes a `&QueueView`, so the
+  count is available through a reader. Pass `queue.view()` or `reader.view()`.
+- The `list`, `status`, `cancel`, `resume` and `gc` commands read a run's state
+  through `WorkflowView` in place of a scan of every step job. A step
+  dead-lettered outside the worker displays `queued`, and `resume` of its run
+  proceeds, until the next worker terminates the run.
+
 ## [0.5.0] - 2026-10-03
 
 ### Added

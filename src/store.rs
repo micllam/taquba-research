@@ -16,14 +16,14 @@
 //!   external cancellation) it joins the terminal notification's
 //!   settlement, staged by [`TerminalReconciler`].
 //!
-//! Every in-flight status is derived at read time from
-//! [`QueueReader`](taquba::QueueReader)-visible state; see
+//! Every in-flight status is derived at read time from the run state that a
+//! [`WorkflowView`](taquba_workflow::WorkflowView) reports through a
+//! [`QueueReader`](taquba::QueueReader), see
 //! [`derive_display_status`](crate::store::derive_display_status). The
 //! cancellation sentinel remains a plain object at
 //! `<store>/runs/<run_id>.cancel`, written by the `cancel` command and
 //! polled by the runner concurrently with phase work.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 use taquba::object_store;
 use taquba::{JobRecord, JobStatus, Queue, QueueReader, QueueView};
 use taquba_workflow::{
-    HEADER_RUN_ID, HEADER_TERMINAL, RunOutcome, StepError, TerminalEffects, TerminalHook,
-    TerminalStatus,
+    HEADER_RUN_ID, HEADER_TERMINAL, MemoStore, RunOutcome, RunState, StepError, TerminalEffects,
+    TerminalHook, TerminalStatus, WorkflowView,
 };
 
 use crate::state::{ResearchState, TokenUsage};
@@ -44,6 +44,20 @@ use crate::state::{ResearchState, TokenUsage};
 /// workflow runtime. Set explicitly so the reader-side queries in this
 /// module target the same queue as the runtime.
 pub const WORKFLOW_QUEUE_NAME: &str = "research-workflow";
+
+/// Memo prefix the CLI and [`crate::ResearchAgent`] configure on the workflow
+/// runtime. Set explicitly so [`workflow_view`] reads the memo store the
+/// runtime writes to.
+pub const WORKFLOW_MEMO_PREFIX: &str = "research-workflow-memo";
+
+/// The read-only workflow queries over `reader` and the runtime's memo store in
+/// `object_store`, for a process without a runtime.
+pub fn workflow_view(reader: &QueueReader, object_store: Arc<dyn ObjectStore>) -> WorkflowView {
+    WorkflowView::new(
+        reader.view().clone(),
+        MemoStore::new(object_store, WORKFLOW_MEMO_PREFIX),
+    )
+}
 
 /// Prefix of run index entries in the queue's user KV namespace.
 pub const RUNS_KV_PREFIX: &str = "research/runs/";
@@ -155,36 +169,35 @@ pub struct RunSummary {
     pub token_usage: TokenUsage,
 }
 
-/// Display status of a run, computed at read time from the stored
-/// entry, the queue's job state and the cancellation sentinel. See
+/// Display status of a run, computed at read time from the stored entry, the
+/// run state of the workflow view and the cancellation sentinel. See
 /// [`derive_display_status`] for the precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunDisplayStatus {
-    /// Terminal record says succeeded.
+    /// The terminal record, or the view's termination, says succeeded.
     Succeeded,
-    /// Terminal record says failed and the dead-letter job is no
-    /// longer present.
+    /// The terminal record, or the view's termination, says failed. A
+    /// dead-lettered step terminates its run as failed.
     Failed,
-    /// Terminal record says cancelled.
+    /// The terminal record, or the view's termination, says cancelled.
     Cancelled,
-    /// A step job for the run is in the dead-letter set, with or
-    /// without a `Failed` terminal record.
-    DeadLettered,
-    /// The cancellation sentinel exists but no terminal record does;
-    /// the cancellation takes effect on the runner's next step.
+    /// The cancellation sentinel exists and no terminal record does, or the
+    /// view reports [`RunState::Cancelling`]. The cancellation takes effect on
+    /// the runner's next step.
     CancellationRequested,
-    /// A step job for the run is claimed by a worker. A claim
-    /// abandoned by a killed worker process also derives this state:
-    /// lease expiry is writer-process state, so the job stays claimed
+    /// The view reports [`RunState::Running`]: a worker claimed the current
+    /// step. A claim abandoned by a killed worker process also derives this
+    /// state: lease expiry is writer-process state, so the job stays claimed
     /// until the next writer open requeues it.
     Running,
-    /// A step job is pending or scheduled: either an interrupted run
-    /// awaiting `resume`, or the interval between an acknowledgement
-    /// and the next claim.
+    /// The view reports [`RunState::Pending`]: an interrupted run that awaits
+    /// `resume`, or the interval between an acknowledgement and the next claim.
+    /// A step dead-lettered outside the worker also reports pending, until the
+    /// next worker terminates its run as failed.
     Queued,
-    /// No step job and no terminal record: a dead-lettered run whose
-    /// dead job the retention sweep removed before a worker processed
-    /// its notification, store corruption or a version mismatch.
+    /// The run is absent from the view and the entry lacks a terminal record:
+    /// the memo sweep removed the run's terminal record before a worker
+    /// processed its notification, store corruption or a version mismatch.
     /// Collectable via the CLI's `gc --status unknown`.
     Unknown,
 }
@@ -196,7 +209,6 @@ impl RunDisplayStatus {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
-            Self::DeadLettered => "failed (dead-lettered)",
             Self::CancellationRequested => "cancellation requested",
             Self::Running => "running",
             Self::Queued => "queued",
@@ -211,28 +223,6 @@ impl std::fmt::Display for RunDisplayStatus {
     }
 }
 
-/// A run's step job as observed in the queue, in decreasing precedence
-/// order for status derivation.
-#[derive(Debug, Clone)]
-pub enum StepJobState {
-    /// A step job is in the dead-letter set.
-    Dead(JobRecord),
-    /// A step job is claimed by a worker.
-    Claimed(JobRecord),
-    /// A step job is pending or scheduled.
-    Waiting(JobRecord),
-}
-
-impl StepJobState {
-    /// The observed job record, regardless of state. The record does not
-    /// contain an offloaded payload, which [`job_payload`] reads.
-    pub fn job(&self) -> &JobRecord {
-        match self {
-            Self::Dead(j) | Self::Claimed(j) | Self::Waiting(j) => j,
-        }
-    }
-}
-
 /// The payload of `job`, a record of a job listing. An offloaded payload is
 /// read through `view`, and `Ok(None)` means the job no longer exists.
 pub async fn job_payload(view: &QueueView, job: &JobRecord) -> taquba::Result<Option<Vec<u8>>> {
@@ -242,32 +232,33 @@ pub async fn job_payload(view: &QueueView, job: &JobRecord) -> taquba::Result<Op
     Ok(view.get_job(&job.id).await?.map(|job| job.payload))
 }
 
-/// Compute a run's display status. Precedence: stored terminal record,
-/// then dead-lettered step job, then cancellation sentinel, then
-/// claimed step job, then pending/scheduled step job, then unknown.
-/// A `Failed` record whose dead-letter job is still present derives
-/// [`RunDisplayStatus::DeadLettered`]; once the reaper removes the
-/// job it derives [`RunDisplayStatus::Failed`].
+/// Compute a run's display status from its index entry, the run state that
+/// [`WorkflowView::status`] reports and the cancellation sentinel. Precedence:
+/// the stored terminal record, then a termination of the view, then the
+/// cancellation sentinel, then the view's cancelling, running and pending
+/// states, then unknown.
 pub fn derive_display_status(
     entry: &RunIndexEntry,
-    job: Option<&StepJobState>,
+    state: Option<&RunState>,
     cancel_requested: bool,
 ) -> RunDisplayStatus {
     if let Some(terminal) = &entry.terminal {
         return match terminal.status {
             StoredStatus::Succeeded => RunDisplayStatus::Succeeded,
-            StoredStatus::Failed => match job {
-                Some(StepJobState::Dead(_)) => RunDisplayStatus::DeadLettered,
-                _ => RunDisplayStatus::Failed,
-            },
+            StoredStatus::Failed => RunDisplayStatus::Failed,
             StoredStatus::Cancelled => RunDisplayStatus::Cancelled,
         };
     }
-    match job {
-        Some(StepJobState::Dead(_)) => RunDisplayStatus::DeadLettered,
+    match state {
+        Some(RunState::Terminated(termination)) => match termination.status {
+            TerminalStatus::Succeeded => RunDisplayStatus::Succeeded,
+            TerminalStatus::Failed => RunDisplayStatus::Failed,
+            TerminalStatus::Cancelled => RunDisplayStatus::Cancelled,
+        },
         _ if cancel_requested => RunDisplayStatus::CancellationRequested,
-        Some(StepJobState::Claimed(_)) => RunDisplayStatus::Running,
-        Some(StepJobState::Waiting(_)) => RunDisplayStatus::Queued,
+        Some(RunState::Cancelling) => RunDisplayStatus::CancellationRequested,
+        Some(RunState::Running) => RunDisplayStatus::Running,
+        Some(RunState::Pending) => RunDisplayStatus::Queued,
         None => RunDisplayStatus::Unknown,
     }
 }
@@ -308,61 +299,46 @@ pub async fn get_run(reader: &QueueReader, run_id: &str) -> anyhow::Result<Optio
     Ok(Some(entry))
 }
 
-/// Snapshot every step job of `queue` keyed by run id, for status
-/// derivation. Terminal-notification jobs (reserved
-/// `workflow.terminal` header) are excluded: they record a run's
-/// termination. When a run has jobs in several states, the
-/// highest-precedence one wins (dead, then claimed, then waiting).
-pub async fn snapshot_step_jobs(
-    reader: &QueueReader,
-    queue: &str,
-) -> taquba::Result<HashMap<String, StepJobState>> {
-    let mut map: HashMap<String, StepJobState> = HashMap::new();
-
-    let mut insert = |job: JobRecord, make: fn(JobRecord) -> StepJobState| {
-        if job.headers.contains_key(HEADER_TERMINAL) {
-            return;
+/// The step job of `run_id` among the jobs of the workflow queue in `status`,
+/// in the stored form of [`QueueView::list_jobs`]. `None` when the listing
+/// lacks a step job of the run. A terminal notification (reserved
+/// `workflow.terminal` header) is not a step job. The listing is a scan of
+/// every job in `status`, so a caller passes the status that
+/// [`WorkflowView::status`] reports for the run.
+pub async fn find_step_job(
+    view: &QueueView,
+    run_id: &str,
+    status: JobStatus,
+) -> taquba::Result<Option<JobRecord>> {
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let page = view
+            .list_jobs(WORKFLOW_QUEUE_NAME, status, cursor.as_deref(), SCAN_PAGE)
+            .await?;
+        let found = page.jobs.into_iter().find(|job| {
+            !job.headers.contains_key(HEADER_TERMINAL)
+                && job.headers.get(HEADER_RUN_ID).map(String::as_str) == Some(run_id)
+        });
+        if found.is_some() {
+            return Ok(found);
         }
-        if let Some(run_id) = job.headers.get(HEADER_RUN_ID) {
-            map.entry(run_id.clone()).or_insert_with(|| make(job));
-        }
-    };
-
-    for (status, make) in [
-        (JobStatus::Dead, StepJobState::Dead as fn(_) -> _),
-        (JobStatus::Claimed, StepJobState::Claimed),
-        (JobStatus::Pending, StepJobState::Waiting),
-        (JobStatus::Scheduled, StepJobState::Waiting),
-    ] {
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = reader
-                .view()
-                .list_jobs(queue, status, cursor.as_deref(), SCAN_PAGE)
-                .await?;
-            for job in page.jobs {
-                insert(job, make);
-            }
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(None),
         }
     }
-    Ok(map)
 }
 
-/// Number of step jobs waiting in the workflow queue (pending or
-/// scheduled; terminal notifications excluded). The workflow is
-/// sequential, so each waiting run holds exactly one step job and the
-/// count equals the number of interrupted or queued runs.
-pub async fn count_waiting_step_jobs(queue: &Queue) -> taquba::Result<usize> {
+/// Number of step jobs waiting in the workflow queue (pending or scheduled,
+/// terminal notifications excluded). The workflow is sequential, so each
+/// waiting run has exactly one step job and the count equals the number of
+/// interrupted or queued runs. `view` is the view of the writer or of a reader.
+pub async fn count_waiting_step_jobs(view: &QueueView) -> taquba::Result<usize> {
     let mut count = 0usize;
     for status in [JobStatus::Pending, JobStatus::Scheduled] {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
-            let page = queue
-                .view()
+            let page = view
                 .list_jobs(WORKFLOW_QUEUE_NAME, status, cursor.as_deref(), SCAN_PAGE)
                 .await?;
             count += page
@@ -495,33 +471,10 @@ impl<H> TerminalReconciler<H> {
     /// Final persisted state of `run_id`'s dead-lettered step, when
     /// its dead-letter job is still present and its payload decodes.
     async fn dead_job_state(&self, run_id: &str) -> Option<ResearchState> {
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = self
-                .queue
-                .view()
-                .list_jobs(
-                    WORKFLOW_QUEUE_NAME,
-                    JobStatus::Dead,
-                    cursor.as_deref(),
-                    SCAN_PAGE,
-                )
-                .await
-                .ok()?;
-            for job in page.jobs {
-                if job.headers.contains_key(HEADER_TERMINAL) {
-                    continue;
-                }
-                if job.headers.get(HEADER_RUN_ID).map(String::as_str) == Some(run_id) {
-                    let payload = job_payload(self.queue.view(), &job).await.ok()??;
-                    return ResearchState::from_bytes(&payload).ok();
-                }
-            }
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => return None,
-            }
-        }
+        let view = self.queue.view();
+        let job = find_step_job(view, run_id, JobStatus::Dead).await.ok()??;
+        let payload = job_payload(view, &job).await.ok()??;
+        ResearchState::from_bytes(&payload).ok()
     }
 }
 
@@ -644,22 +597,14 @@ mod tests {
         }
     }
 
-    fn job(headers: &[(&str, &str)]) -> JobRecord {
-        let encoded = serde_json::json!({
-            "id": "01JOB",
-            "queue": WORKFLOW_QUEUE_NAME,
-            "payload": [],
-            "status": "Pending",
-            "attempts": 0,
-            "max_attempts": 3,
-            "enqueued_at": 0,
-            "priority": 1000,
-            "headers": headers
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<HashMap<_, _>>(),
-        });
-        serde_json::from_value(encoded).expect("JobRecord fields")
+    fn terminated(status: TerminalStatus) -> RunState {
+        RunState::Terminated(taquba_workflow::RunTermination {
+            status,
+            error: None,
+            error_kind: None,
+            final_step: 0,
+            terminated_at_ms: 0,
+        })
     }
 
     #[test]
@@ -684,31 +629,50 @@ mod tests {
     }
 
     #[test]
-    fn terminal_record_wins_over_everything() {
+    fn terminal_record_wins_over_the_view_state_and_the_sentinel() {
         let e = entry(Some(terminal(StoredStatus::Succeeded, None)));
-        let dead = StepJobState::Dead(job(&[(HEADER_RUN_ID, "01TESTRUN")]));
         assert_eq!(
-            derive_display_status(&e, Some(&dead), true),
+            derive_display_status(&e, Some(&terminated(TerminalStatus::Failed)), true),
             RunDisplayStatus::Succeeded
         );
-    }
-
-    #[test]
-    fn dead_letter_wins_over_sentinel_and_live_jobs() {
-        let e = entry(None);
-        let dead = StepJobState::Dead(job(&[(HEADER_RUN_ID, "01TESTRUN")]));
+        let e = entry(Some(terminal(StoredStatus::Failed, Some("boom"))));
         assert_eq!(
-            derive_display_status(&e, Some(&dead), true),
-            RunDisplayStatus::DeadLettered
+            derive_display_status(&e, Some(&RunState::Running), true),
+            RunDisplayStatus::Failed
+        );
+        let e = entry(Some(terminal(StoredStatus::Cancelled, None)));
+        assert_eq!(
+            derive_display_status(&e, None, false),
+            RunDisplayStatus::Cancelled
         );
     }
 
     #[test]
-    fn sentinel_wins_over_claimed_and_waiting() {
+    fn a_termination_of_the_view_wins_over_the_sentinel() {
         let e = entry(None);
-        let claimed = StepJobState::Claimed(job(&[(HEADER_RUN_ID, "01TESTRUN")]));
         assert_eq!(
-            derive_display_status(&e, Some(&claimed), true),
+            derive_display_status(&e, Some(&terminated(TerminalStatus::Failed)), true),
+            RunDisplayStatus::Failed
+        );
+        assert_eq!(
+            derive_display_status(&e, Some(&terminated(TerminalStatus::Succeeded)), true),
+            RunDisplayStatus::Succeeded
+        );
+        assert_eq!(
+            derive_display_status(&e, Some(&terminated(TerminalStatus::Cancelled)), true),
+            RunDisplayStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn sentinel_wins_over_running_and_pending() {
+        let e = entry(None);
+        assert_eq!(
+            derive_display_status(&e, Some(&RunState::Running), true),
+            RunDisplayStatus::CancellationRequested
+        );
+        assert_eq!(
+            derive_display_status(&e, Some(&RunState::Pending), true),
             RunDisplayStatus::CancellationRequested
         );
         assert_eq!(
@@ -718,22 +682,24 @@ mod tests {
     }
 
     #[test]
-    fn claimed_and_waiting_derive_running_and_queued() {
+    fn the_active_states_of_the_view_derive_their_display_status() {
         let e = entry(None);
-        let claimed = StepJobState::Claimed(job(&[(HEADER_RUN_ID, "01TESTRUN")]));
-        let waiting = StepJobState::Waiting(job(&[(HEADER_RUN_ID, "01TESTRUN")]));
         assert_eq!(
-            derive_display_status(&e, Some(&claimed), false),
+            derive_display_status(&e, Some(&RunState::Cancelling), false),
+            RunDisplayStatus::CancellationRequested
+        );
+        assert_eq!(
+            derive_display_status(&e, Some(&RunState::Running), false),
             RunDisplayStatus::Running
         );
         assert_eq!(
-            derive_display_status(&e, Some(&waiting), false),
+            derive_display_status(&e, Some(&RunState::Pending), false),
             RunDisplayStatus::Queued
         );
     }
 
     #[test]
-    fn no_job_and_no_terminal_record_is_unknown() {
+    fn no_run_state_and_no_terminal_record_is_unknown() {
         let e = entry(None);
         assert_eq!(
             derive_display_status(&e, None, false),
@@ -741,51 +707,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_record_with_dead_job_derives_dead_lettered() {
-        let e = entry(Some(terminal(StoredStatus::Failed, Some("boom"))));
-        let dead = StepJobState::Dead(job(&[(HEADER_RUN_ID, "01TESTRUN")]));
-        assert_eq!(
-            derive_display_status(&e, Some(&dead), false),
-            RunDisplayStatus::DeadLettered
-        );
-    }
-
-    #[test]
-    fn failed_record_without_dead_job_derives_failed() {
-        let e = entry(Some(terminal(StoredStatus::Failed, Some("boom"))));
-        assert_eq!(
-            derive_display_status(&e, None, false),
-            RunDisplayStatus::Failed
-        );
-    }
-
     #[tokio::test]
-    async fn reader_serves_entries_and_step_job_snapshot() {
+    async fn reader_serves_entries_and_the_run_state_of_a_submitted_run() {
+        use crate::state::ResearchConfig;
         use taquba::object_store::memory::InMemory;
-        use taquba::{EnqueueOptions, Queue, ReaderMode, ReaderOptions};
+        use taquba::{Queue, ReaderMode, ReaderOptions};
+        use taquba_workflow::{NoopTerminalHook, RunId, RunSpec, WorkflowRuntime};
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let queue = Queue::open(object_store.clone(), "q").await.unwrap();
+        let queue = Arc::new(Queue::open(object_store.clone(), "q").await.unwrap());
+        // The worker is not started, so the submitted step stays pending.
+        let runtime = WorkflowRuntime::builder(
+            queue.clone(),
+            object_store.clone(),
+            AlwaysFail,
+            NoopTerminalHook,
+        )
+        .queue_name(WORKFLOW_QUEUE_NAME)
+        .memo_prefix(WORKFLOW_MEMO_PREFIX)
+        .build();
 
         let e = entry(None);
-        queue
-            .kv_put(&run_entry_key(&e.run_id), &e.to_bytes())
-            .await
-            .unwrap();
-        queue
-            .enqueue_with(
-                WORKFLOW_QUEUE_NAME,
-                Vec::new(),
-                EnqueueOptions::default().header(HEADER_RUN_ID, e.run_id.clone()),
-            )
+        let run_id = RunId::new(&e.run_id).unwrap();
+        runtime
+            .submit(RunSpec {
+                run_id: Some(run_id.clone()),
+                input: ResearchState::new("a query", ResearchConfig::new("m")).to_bytes(),
+                effects: taquba::SettlementEffects::default()
+                    .kv_put(run_entry_key(&e.run_id), e.to_bytes()),
+                ..Default::default()
+            })
             .await
             .unwrap();
 
         // Opened after the writes, so the reader's initial view holds
         // them without waiting for a manifest poll.
         let reader = QueueReader::open_with_options(
-            object_store,
+            object_store.clone(),
             "q",
             ReaderOptions::default().mode(ReaderMode::FollowLatest),
         )
@@ -796,16 +754,26 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, e.run_id);
 
-        let jobs = snapshot_step_jobs(&reader, WORKFLOW_QUEUE_NAME)
+        let status = workflow_view(&reader, object_store)
+            .status(&run_id)
             .await
-            .unwrap();
-        assert!(matches!(
-            jobs.get(&e.run_id),
-            Some(StepJobState::Waiting(_))
-        ));
+            .unwrap()
+            .expect("the view reports the submitted run");
+        assert_eq!(status.state, RunState::Pending);
         assert_eq!(
-            derive_display_status(&runs[0], jobs.get(&e.run_id), false),
+            derive_display_status(&runs[0], Some(&status.state), false),
             RunDisplayStatus::Queued
+        );
+        let job = find_step_job(reader.view(), &e.run_id, JobStatus::Pending)
+            .await
+            .unwrap()
+            .expect("the pending listing contains the step job");
+        assert_eq!(job.headers.get(HEADER_RUN_ID), Some(&e.run_id));
+        assert!(
+            find_step_job(reader.view(), &e.run_id, JobStatus::Claimed)
+                .await
+                .unwrap()
+                .is_none()
         );
 
         reader.close().await.unwrap();
@@ -868,7 +836,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(count_waiting_step_jobs(&queue).await.unwrap(), 2);
+        assert_eq!(count_waiting_step_jobs(queue.view()).await.unwrap(), 2);
     }
 
     struct AlwaysFail;

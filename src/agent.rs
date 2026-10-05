@@ -23,7 +23,7 @@ use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
 use crate::store::{
-    CancelSentinel, RunIndexEntry, TerminalReconciler, WORKFLOW_QUEUE_NAME,
+    CancelSentinel, RunIndexEntry, TerminalReconciler, WORKFLOW_MEMO_PREFIX, WORKFLOW_QUEUE_NAME,
     count_waiting_step_jobs, run_entry_key,
 };
 
@@ -80,7 +80,7 @@ impl ResearchAgent {
 
         // The worker drains the shared workflow queue, so other queued
         // runs' pending steps execute in this call too.
-        let waiting = count_waiting_step_jobs(&queue)
+        let waiting = count_waiting_step_jobs(queue.view())
             .await
             .context("counting queued runs")?;
         if waiting > 0 {
@@ -110,6 +110,7 @@ impl ResearchAgent {
         // claim transaction conflicts.
         let runtime = WorkflowRuntime::builder(queue, object_store, runner, hook)
             .queue_name(WORKFLOW_QUEUE_NAME)
+            .memo_prefix(WORKFLOW_MEMO_PREFIX)
             .max_concurrent_steps(1)
             .memo_retention(MEMO_RETENTION)
             .build();

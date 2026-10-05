@@ -36,12 +36,12 @@ use taquba::{
 };
 use taquba_research::jobs::RunnerHandle;
 use taquba_research::store::{
-    self, RunDisplayStatus, RunIndexEntry, StepJobState, StoredStatus, TerminalReconciler,
+    self, RunDisplayStatus, RunIndexEntry, StoredStatus, TerminalReconciler, WORKFLOW_MEMO_PREFIX,
     WORKFLOW_QUEUE_NAME,
 };
 use taquba_research::workflow::{
-    RunId, RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus,
-    WorkflowRuntime,
+    RunId, RunOutcome, RunSpec, RunState, RunStatus, StepError, StepErrorKind, TerminalEffects,
+    TerminalHook, TerminalStatus, WorkflowRuntime, WorkflowView,
 };
 use taquba_research::{
     CancelSentinel, FETCH_QUEUE_NAME, ResearchConfig, ResearchStepRunner, RunRecord,
@@ -214,12 +214,11 @@ enum Command {
         /// days in the past.
         #[arg(long)]
         older_than_days: Option<i64>,
-        /// Restrict deletion to specific statuses (repeatable).
-        /// Allowed: `succeeded`, `failed`, `cancelled`, `unknown`.
-        /// `unknown` (never matched by default) selects entries with
-        /// no terminal record and no step job; other runs without a
-        /// terminal record are never deleted: their state is held in
-        /// the queue.
+        /// Restrict deletion to specific statuses (repeatable). Allowed:
+        /// `succeeded`, `failed`, `cancelled`, `unknown`. `unknown` (never
+        /// matched by default) selects entries without a terminal record whose
+        /// run the workflow store no longer contains. Other runs without a
+        /// terminal record are never deleted: their state is in the queue.
         #[arg(long = "status", value_parser = parse_gc_status)]
         statuses: Vec<GcStatus>,
         /// Proceed even when claimed jobs are visible in the store.
@@ -233,9 +232,9 @@ enum Command {
     },
 }
 
-/// Status filter accepted by `gc --status`: the stored terminal
-/// statuses plus `unknown`, entries with no terminal record and no
-/// step job.
+/// Status filter accepted by `gc --status`: the stored terminal statuses plus
+/// `unknown`, entries without a terminal record whose run the workflow store no
+/// longer contains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GcStatus {
     Stored(StoredStatus),
@@ -476,6 +475,35 @@ async fn with_reader<T>(ctx: &StoreCtx, op: impl AsyncFn(&QueueReader) -> Result
     }
 }
 
+/// The workflow queries over `reader` and the runtime's memo store.
+fn workflow_view(ctx: &StoreCtx, reader: &QueueReader) -> WorkflowView {
+    store::workflow_view(reader, ctx.object_store.clone())
+}
+
+/// The status of `run_id` through `view`, or `None` for a run that the workflow
+/// store does not contain.
+async fn view_status(view: &WorkflowView, run_id: &RunId) -> Result<Option<RunStatus>> {
+    view.status(run_id)
+        .await
+        .with_context(|| format!("reading the workflow status of {run_id}"))
+}
+
+/// The job listings that can contain the step job of a run in `state`, in the
+/// order they are searched. A run in [`RunState::Pending`] whose step was
+/// dead-lettered outside the worker has its job in the dead-letter set until
+/// the next worker terminates the run.
+fn step_job_listings(state: &RunState) -> &'static [JobStatus] {
+    match state {
+        RunState::Running => &[JobStatus::Claimed],
+        RunState::Pending => &[JobStatus::Pending, JobStatus::Scheduled, JobStatus::Dead],
+        RunState::Cancelling => &[JobStatus::Claimed, JobStatus::Pending, JobStatus::Scheduled],
+        RunState::Terminated(termination) if termination.status == TerminalStatus::Failed => {
+            &[JobStatus::Dead]
+        }
+        RunState::Terminated(_) => &[],
+    }
+}
+
 /// Number of claimed jobs visible through `reader`, across both
 /// queues. Guards an exclusive writer open: opening the writer fences
 /// a live worker and requeues its claimed jobs. Best-effort in both
@@ -639,6 +667,7 @@ fn spawn_runtime(
     // context.
     let runtime = WorkflowRuntime::builder(queue, store_ctx.object_store.clone(), runner, hook)
         .queue_name(WORKFLOW_QUEUE_NAME)
+        .memo_prefix(WORKFLOW_MEMO_PREFIX)
         .max_concurrent_steps(1)
         .memo_retention(MEMO_RETENTION)
         .build();
@@ -684,7 +713,7 @@ async fn cmd_run(
     let config = build_config(cli);
     let queue = open_queue(store_ctx).await?;
 
-    let waiting = store::count_waiting_step_jobs(&queue)
+    let waiting = store::count_waiting_step_jobs(queue.view())
         .await
         .context("counting queued runs")?;
     if waiting > 0 {
@@ -743,35 +772,33 @@ async fn cmd_resume(
         if !queue_exists(store_ctx).await? {
             bail!("no run index entry for {run_id} (store contains no runs)");
         }
-        let (claimed, waiting_others, entry, job) = with_reader(store_ctx, async |reader| {
+        let (claimed, waiting, entry, status) = with_reader(store_ctx, async |reader| {
             let claimed = count_claimed_jobs(reader).await?;
+            let waiting = store::count_waiting_step_jobs(reader.view()).await?;
             let entry = store::get_run(reader, &run_id).await?;
-            let mut jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
-            let job = jobs.remove(run_id.as_str());
-            let waiting_others = jobs
-                .values()
-                .filter(|s| matches!(s, StepJobState::Waiting(_)))
-                .count();
-            Ok((claimed, waiting_others, entry, job))
+            let status = view_status(&workflow_view(store_ctx, reader), &run_id).await?;
+            Ok((claimed, waiting, entry, status))
         })
         .await?;
         let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
         if let Some(terminal) = &entry.terminal {
             bail!("run {run_id} is already terminal ({})", terminal.status);
         }
-        match job {
-            None => bail!("run {run_id} has no step job to resume"),
-            // A dead-letter job is never claimed, so a worker would
-            // wait on it indefinitely.
-            Some(StepJobState::Dead(job)) => bail!(
-                "run {run_id} is dead-lettered after {} attempts and cannot be resumed; \
-                 inspect it with `status {run_id}`",
-                job.attempts
-            ),
+        let state = status.map(|s| s.state);
+        match state {
+            None => bail!("run {run_id} has no step to resume (status: unknown)"),
+            Some(RunState::Terminated(termination)) => {
+                bail!("run {run_id} is already terminal ({})", termination.status)
+            }
             Some(_) => {}
         }
-        // Guard before taking the exclusive writer, as in `cmd_gc`;
-        // the caveats are on `count_claimed_jobs`.
+        // The waiting count includes this run's pending step.
+        let waiting_others = match state {
+            Some(RunState::Pending) => waiting.saturating_sub(1),
+            _ => waiting,
+        };
+        // Guard before taking the exclusive writer, as in `cmd_gc`. The caveats
+        // are on `count_claimed_jobs`.
         if claimed > 0 && !force {
             bail!(
                 "claimed jobs are visible in this store; a worker may be live. \
@@ -967,30 +994,43 @@ struct RunRow {
     status: RunDisplayStatus,
 }
 
-/// Read every entry, the step-job snapshot and the sentinels needed
-/// to derive display statuses. Rows are returned newest first.
+/// Read every entry, the run state of each entry without a terminal record and
+/// the sentinels, and derive the display statuses. Rows are returned newest
+/// first.
 async fn gather_rows(store_ctx: &StoreCtx, sentinel: &CancelSentinel) -> Result<Vec<RunRow>> {
-    let (entries, jobs) = with_reader(store_ctx, async |reader| {
-        let entries = store::list_runs(reader).await?;
-        let jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
-        Ok((entries, jobs))
+    let rows = with_reader(store_ctx, async |reader| {
+        let view = workflow_view(store_ctx, reader);
+        let mut rows = Vec::new();
+        for entry in store::list_runs(reader).await?.into_iter().rev() {
+            // The view is read only for runs without a terminal record.
+            let state = match &entry.terminal {
+                Some(_) => None,
+                None => {
+                    let run_id: RunId = entry
+                        .run_id
+                        .parse()
+                        .with_context(|| format!("invalid run id `{}`", entry.run_id))?;
+                    view_status(&view, &run_id).await?.map(|s| s.state)
+                }
+            };
+            rows.push((entry, state));
+        }
+        Ok(rows)
     })
     .await?;
 
-    let mut rows = Vec::with_capacity(entries.len());
-    for entry in entries.into_iter().rev() {
-        // The sentinel is checked only for runs without a terminal
-        // record.
+    let mut out = Vec::with_capacity(rows.len());
+    for (entry, state) in rows {
+        // The sentinel is checked only for runs without a terminal record.
         let cancel_requested = entry.terminal.is_none()
             && sentinel
                 .is_set(&entry.run_id)
                 .await
                 .context("checking cancellation sentinel")?;
-        let status =
-            store::derive_display_status(&entry, jobs.get(&entry.run_id), cancel_requested);
-        rows.push(RunRow { entry, status });
+        let status = store::derive_display_status(&entry, state.as_ref(), cancel_requested);
+        out.push(RunRow { entry, status });
     }
-    Ok(rows)
+    Ok(out)
 }
 
 async fn cmd_list(store_ctx: &StoreCtx, sentinel: &CancelSentinel) -> Result<()> {
@@ -1028,20 +1068,33 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
     if !queue_exists(store_ctx).await? {
         bail!("no run index entry for {run_id} (store contains no runs)");
     }
-    let (entry, job, payload, history) = with_reader(store_ctx, async |reader| {
+    let parsed: RunId = run_id
+        .parse()
+        .with_context(|| format!("invalid run id `{run_id}`"))?;
+    let (entry, status, job, payload, history) = with_reader(store_ctx, async |reader| {
         let entry = store::get_run(reader, &run_id).await?;
-        let mut jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
-        let job = jobs.remove(&run_id);
+        let status = view_status(&workflow_view(store_ctx, reader), &parsed).await?;
+        // The step job is read for its attempts, its last error and its
+        // payload. The listings searched follow from the run state.
+        let mut job = None;
+        for listing in status.iter().flat_map(|s| step_job_listings(&s.state)) {
+            job = store::find_step_job(reader.view(), &run_id, *listing).await?;
+            if job.is_some() {
+                break;
+            }
+        }
         let payload = match &job {
-            Some(state) => store::job_payload(reader.view(), state.job()).await?,
+            Some(job) => store::job_payload(reader.view(), job).await?,
             None => None,
         };
-        // The attempt history is printed for dead-lettered runs only.
+        // The attempt history is printed for dead-lettered steps only.
         let history = match &job {
-            Some(StepJobState::Dead(dead)) => reader.view().attempt_history(&dead.id).await?,
+            Some(job) if job.status == JobStatus::Dead => {
+                reader.view().attempt_history(&job.id).await?
+            }
             _ => Vec::new(),
         };
-        Ok((entry, job, payload, history))
+        Ok((entry, status, job, payload, history))
     })
     .await?;
     let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
@@ -1054,11 +1107,12 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
     } else {
         None
     };
-    let status = store::derive_display_status(&entry, job.as_ref(), cancel_requested_at.is_some());
+    let state = status.as_ref().map(|s| &s.state);
+    let display = store::derive_display_status(&entry, state, cancel_requested_at.is_some());
 
     println!("run_id:       {}", entry.run_id);
     println!("query:        {}", entry.query);
-    println!("status:       {}", status.as_str());
+    println!("status:       {}", display.as_str());
     println!("submitted_at: {}", entry.submitted_at.to_rfc3339());
     if let Some(at) = cancel_requested_at {
         println!("cancel_requested_at: {}", at.to_rfc3339());
@@ -1073,23 +1127,36 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
             t.summary.steps_completed, t.summary.wall_time_secs, t.summary.token_usage.total_tokens,
         );
     }
-    if let Some(state) = &job {
-        let job = state.job();
-        if let Some(progress) = payload.as_deref().and_then(summarize_state) {
-            println!(
-                "progress:     phase {} · {} steps completed",
-                progress.phase, progress.steps_completed
-            );
+    if let Some(RunState::Terminated(termination)) = state {
+        // The index record contains the error once the terminal notification
+        // settles.
+        if entry.terminal.is_none()
+            && let Some(err) = &termination.error
+        {
+            println!("error:        {err}");
         }
+        if let Some(kind) = termination.error_kind {
+            let kind = match kind {
+                StepErrorKind::Transient => "transient",
+                StepErrorKind::Permanent => "permanent",
+            };
+            println!("error_kind:   {kind}");
+        }
+    }
+    if let Some(status) = &status {
+        println!("step:         {}", status.current_step);
+    }
+    if let Some(progress) = payload.as_deref().and_then(summarize_state) {
+        println!("phase:        {}", progress.phase);
+    }
+    if let Some(job) = &job {
         println!("attempts:     {}/{}", job.attempts, job.max_attempts);
         if let Some(err) = &job.last_error {
             println!("last_error:   {err}");
         }
-        if matches!(state, StepJobState::Dead(_)) {
-            for attempt in &history {
-                if let Some(err) = &attempt.error {
-                    println!("attempt {:>2}:   {err}", attempt.attempt);
-                }
+        for attempt in &history {
+            if let Some(err) = &attempt.error {
+                println!("attempt {:>2}:   {err}", attempt.attempt);
             }
         }
     }
@@ -1150,23 +1217,25 @@ async fn cmd_cancel(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
     if !queue_exists(store_ctx).await? {
         bail!("no run index entry for {run_id} (store contains no runs)");
     }
-    let (entry, job) = with_reader(store_ctx, async |reader| {
+    let parsed: RunId = run_id
+        .parse()
+        .with_context(|| format!("invalid run id `{run_id}`"))?;
+    let (entry, status) = with_reader(store_ctx, async |reader| {
         let entry = store::get_run(reader, &run_id).await?;
-        let mut jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
-        Ok((entry, jobs.remove(&run_id)))
+        let status = view_status(&workflow_view(store_ctx, reader), &parsed).await?;
+        Ok((entry, status))
     })
     .await?;
     let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
     if let Some(t) = &entry.terminal {
         bail!("run {run_id} is not cancellable (status: {})", t.status);
     }
-    match &job {
-        // No step will ever run for a dead-letter job, so a sentinel
-        // would never take effect.
-        Some(StepJobState::Dead(_)) => bail!(
-            "run {run_id} is not cancellable: it is dead-lettered and no further step will run"
+    match status.map(|s| s.state) {
+        Some(RunState::Terminated(termination)) => bail!(
+            "run {run_id} is not cancellable (status: {})",
+            termination.status
         ),
-        None => bail!("run {run_id} is not cancellable: it has no step job (status: unknown)"),
+        None => bail!("run {run_id} is not cancellable: it has no step (status: unknown)"),
         Some(_) => {}
     }
     sentinel
@@ -1213,33 +1282,42 @@ async fn cmd_gc(
         println!("No runs match the gc filter.");
         return Ok(());
     }
-    // The claimed-job count is used by the guard before the writer
-    // open below; a dry run never opens the writer.
-    let (claimed, entries, jobs) = with_reader(store_ctx, async |reader| {
-        let claimed = count_claimed_jobs(reader).await?;
-        let entries = store::list_runs(reader).await?;
-        let jobs = store::snapshot_step_jobs(reader, WORKFLOW_QUEUE_NAME).await?;
-        Ok((claimed, entries, jobs))
-    })
-    .await?;
-
     let cutoff = older_than_days.map(|d| Utc::now() - chrono::Duration::days(d));
     let wants_unknown = statuses.contains(&GcStatus::Unknown);
-    let mut candidates: Vec<_> = entries
-        .into_iter()
-        .filter(|e| {
+    // The guard before the writer open uses the claimed-job count. A dry run
+    // never opens the writer.
+    let (claimed, mut candidates) = with_reader(store_ctx, async |reader| {
+        let claimed = count_claimed_jobs(reader).await?;
+        let view = workflow_view(store_ctx, reader);
+        let mut candidates = Vec::new();
+        for e in store::list_runs(reader).await? {
+            if cutoff.is_some_and(|c| e.submitted_at >= c) {
+                continue;
+            }
             let matches_status = match &e.terminal {
-                // Entries with no terminal record and no step job are
-                // collected only via an explicit `--status unknown`;
-                // other runs without a terminal record are still
-                // represented in the queue, and deleting their entries
-                // would orphan that state.
-                None => wants_unknown && !jobs.contains_key(&e.run_id),
+                // An entry without a terminal record is collected only through
+                // an explicit `--status unknown`, and only when the workflow
+                // store no longer contains its run. The run of any other such
+                // entry is still in the queue, and deleting the entry orphans
+                // that state.
+                None => {
+                    wants_unknown && {
+                        let run_id: RunId = e
+                            .run_id
+                            .parse()
+                            .with_context(|| format!("invalid run id `{}`", e.run_id))?;
+                        view_status(&view, &run_id).await?.is_none()
+                    }
+                }
                 Some(t) => statuses.is_empty() || statuses.contains(&GcStatus::Stored(t.status)),
             };
-            matches_status && cutoff.is_none_or(|c| e.submitted_at < c)
-        })
-        .collect();
+            if matches_status {
+                candidates.push(e);
+            }
+        }
+        Ok((claimed, candidates))
+    })
+    .await?;
     candidates.sort_by_key(|e| e.submitted_at);
 
     if candidates.is_empty() {
