@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dead-lettered outside the worker displays `queued`, and `resume` of its run
   proceeds, until the next worker terminates the run.
 
+<!-- vale off -->
+
 ## [0.5.0] - 2026-10-03
 
 ### Added
@@ -388,3 +390,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-05-13
 
 Initial release.
+
+<!-- vale on -->
