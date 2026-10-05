@@ -35,15 +35,15 @@ use taquba::{
 };
 use taquba_research::jobs::RunnerHandle;
 use taquba_research::store::{
-    self, RunDisplayStatus, RunIndexEntry, StoredStatus, TerminalReconciler, WORKFLOW_MEMO_PREFIX,
-    WORKFLOW_QUEUE_NAME,
+    self, JournalEntry, RunDisplayStatus, RunIndexEntry, StoredStatus, TerminalReconciler,
+    WORKFLOW_MEMO_PREFIX, WORKFLOW_QUEUE_NAME,
 };
 use taquba_research::workflow::{
     RunId, RunOutcome, RunSpec, RunState, RunStatus, StepError, StepErrorKind, TerminalEffects,
     TerminalHook, TerminalStatus, WorkflowRuntime, WorkflowView,
 };
 use taquba_research::{
-    CancelSentinel, FETCH_QUEUE_NAME, ResearchConfig, ResearchStepRunner, RunRecord,
+    CancelSentinel, FETCH_QUEUE_NAME, Phase, ResearchConfig, ResearchStepRunner, RunRecord,
     search::{SearchBackend, Tavily},
     spawn_fetch_runner, summarize_state,
 };
@@ -1132,8 +1132,33 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
     if let Some(status) = &status {
         println!("step:         {}", status.current_step);
     }
-    if let Some(progress) = payload.as_deref().and_then(summarize_state) {
-        println!("phase:        {}", progress.phase);
+    let phase = payload
+        .as_deref()
+        .and_then(summarize_state)
+        .map(|progress| progress.phase);
+    if let Some(phase) = phase {
+        println!("phase:        {phase}");
+    }
+    if let (Some(Phase::Investigating), Some(status)) = (phase, &status) {
+        let journal =
+            store::journal_entries(store_ctx.object_store.clone(), &parsed, status.current_step)
+                .await?;
+        if !journal.is_empty() {
+            println!("journal:");
+        }
+        for (n, entry) in journal.iter().enumerate() {
+            match entry {
+                JournalEntry::Completion => println!("  {:>2}. completion", n + 1),
+                JournalEntry::ToolCall {
+                    name,
+                    args,
+                    recorded,
+                } => {
+                    let pending = if *recorded { "" } else { " (no result)" };
+                    println!("  {:>2}. {name} {}{pending}", n + 1, ellipsize(args, 60));
+                }
+            }
+        }
     }
     if let Some(job) = &job {
         println!("attempts:     {}/{}", job.attempts, job.max_attempts);

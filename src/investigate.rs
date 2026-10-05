@@ -345,6 +345,9 @@ mod tests {
     use taquba::{LeaseHandle, Queue};
     use taquba_workflow::{Memo, MemoStore, RunId, StepErrorKind};
 
+    use crate::journal::{JournalEntry, read_entries};
+    use crate::store::{WORKFLOW_MEMO_PREFIX, journal_entries};
+
     const FINDINGS: &str = r#"{"findings":[{"url":"https://example.com/gap",
         "summary":"The page fills the gap.","relevance":0.8}]}"#;
 
@@ -457,6 +460,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journal_entries_list_completions_and_their_tool_calls() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let run_id = RunId::new("run").unwrap();
+        // The runtime's memo of step 4, which `store::journal_entries` reads.
+        let memo = MemoStore::new(object_store.clone(), WORKFLOW_MEMO_PREFIX).new_memo(&run_id, 4);
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("call_1", "web_search", json!({ "query": "gaps" })),
+            MockTurn::text(FINDINGS),
+        ]);
+        run(&model, Arc::new(CountingSearch::default()), &memo, 4)
+            .await
+            .unwrap();
+
+        let entries = journal_entries(object_store.clone(), &run_id, 4).await;
+        assert_eq!(
+            entries.unwrap(),
+            vec![
+                JournalEntry::Completion,
+                JournalEntry::ToolCall {
+                    name: "web_search".to_string(),
+                    args: r#"{"query":"gaps"}"#.to_string(),
+                    recorded: true,
+                },
+                JournalEntry::Completion,
+            ]
+        );
+        let other = journal_entries(object_store, &run_id, 5).await;
+        assert!(other.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn investigator_calls_the_model_again_after_a_failed_call() {
         let memo = step_memo();
         let failing = MockCompletionModel::from_turns([MockTurn::error("overloaded")]);
@@ -493,7 +527,8 @@ mod tests {
             MockTurn::tool_call("call_1", "web_search", json!({ "query": "gaps" })),
             MockTurn::text(FINDINGS),
         ]);
-        run(&model, Arc::new(StalledSearch), &step_memo(), 4)
+        let memo = step_memo();
+        run(&model, Arc::new(StalledSearch), &memo, 4)
             .await
             .unwrap();
         let follow_up = format!("{:?}", model.requests()[1]);
@@ -501,5 +536,13 @@ mod tests {
             follow_up.contains("timed out after 60s"),
             "the model must read the timeout: {follow_up}"
         );
+        let entries = read_entries(&memo).await.unwrap();
+        assert!(matches!(
+            entries[1],
+            JournalEntry::ToolCall {
+                recorded: false,
+                ..
+            }
+        ));
     }
 }

@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent with the `web_search` and `fetch_page` tools adds sources for the gaps
   of the summaries, at up to 8 more model calls per run. The CLI flag
   `--investigation-turns` sets the budget, and 0 skips the step.
+- `store::journal_entries` and `store::JournalEntry`, the ordered completions
+  and tool calls of an investigating step, readable from a second process. The
+  `status` command prints them as `journal` while a run investigates.
 
 ### Changed
 - **Breaking:** `store::derive_display_status` takes the run's `RunState` from

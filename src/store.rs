@@ -32,10 +32,11 @@ use serde::{Deserialize, Serialize};
 use taquba::object_store;
 use taquba::{JobRecord, JobStatus, Queue, QueueReader, QueueView};
 use taquba_workflow::{
-    HEADER_RUN_ID, HEADER_TERMINAL, MemoStore, RunOutcome, RunState, StepError, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowView,
+    HEADER_RUN_ID, HEADER_TERMINAL, MemoStore, RunId, RunOutcome, RunState, StepError,
+    TerminalEffects, TerminalHook, TerminalStatus, WorkflowView,
 };
 
+pub use crate::journal::JournalEntry;
 use crate::state::{ResearchState, TokenUsage};
 
 /// Name of the workflow queue. The CLI and [`crate::ResearchAgent`] configure
@@ -55,6 +56,19 @@ pub fn workflow_view(reader: &QueueReader, object_store: Arc<dyn ObjectStore>) -
         reader.view().clone(),
         MemoStore::new(object_store, WORKFLOW_MEMO_PREFIX),
     )
+}
+
+/// The records of the journal of step `step_number` of `run_id`, from the
+/// runtime's memo store in `object_store`: each completion in order, followed
+/// by the tool calls that it requested. The investigating step keeps a journal,
+/// and the list is empty for any other step.
+pub async fn journal_entries(
+    object_store: Arc<dyn ObjectStore>,
+    run_id: &RunId,
+    step_number: u32,
+) -> anyhow::Result<Vec<JournalEntry>> {
+    let memo = MemoStore::new(object_store, WORKFLOW_MEMO_PREFIX).new_memo(run_id, step_number);
+    crate::journal::read_entries(&memo).await
 }
 
 /// Prefix of run index entries in the queue's user KV namespace.
