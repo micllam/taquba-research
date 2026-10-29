@@ -12,10 +12,9 @@ use rig_agent::completion::{PromptError, StructuredOutputError};
 use rig_core::DynModel;
 use rig_core::completion::{
     FinishReason, Usage,
-    message::{self, AssistantContent, UserContent},
+    message::{self, AssistantContent, UserContent, citation},
 };
 use rig_core::operation::Completion;
-use rig_core::providers::anthropic::completion as anthropic_completion;
 use rig_core::providers::{anthropic, ollama, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -103,7 +102,7 @@ impl ProviderClient {
         match self {
             Self::OpenAi(client) => client.completion(model).into(),
             Self::Anthropic(client) => client.completion(model).into(),
-            Self::Ollama(client) => client.completion(model).into(),
+            Self::Ollama(client) => client.native_completion(model).into(),
         }
     }
 }
@@ -950,7 +949,7 @@ impl ResearchStepRunner {
         record_usage(&mut state.token_usage, &response.usage);
         Ok(PromptOutput {
             truncated: length_truncated(&response.completion_calls),
-            text: response.output,
+            text: response.output(),
         })
     }
 
@@ -973,9 +972,8 @@ impl ResearchStepRunner {
                 )
                 .await?;
                 record_usage(&mut state.token_usage, &response.usage);
-                let evidence =
-                    extract_anthropic_source_quotes(&response.content, source_documents)?;
-                Ok((response.output, evidence))
+                let evidence = extract_anthropic_source_quotes(&response.content, source_documents);
+                Ok((response.output(), evidence))
             }
             _ => Ok((
                 self.llm_prompt(lease, prompt, state).await?.text,
@@ -1130,8 +1128,8 @@ fn classify_rig_err(err: PromptError) -> StepError {
     let msg = err.to_string();
     match err {
         // Configuration / runner-policy issues.
-        PromptError::MaxTurnsError { .. }
-        | PromptError::PromptCancelled { .. }
+        PromptError::MaxTurns { .. }
+        | PromptError::Cancelled { .. }
         | PromptError::UnknownToolCall { .. } => {
             StepError::permanent(format!("LLM permanent failure: {msg}"))
         }
@@ -1227,20 +1225,16 @@ fn anthropic_document_message(
 
     for document in source_documents {
         content.push(UserContent::Document(message::Document {
-            data: message::DocumentSourceKind::String(document.text.clone()),
+            data: message::DocumentData::Text(document.text.clone()),
             media_type: Some(message::DocumentMediaType::TXT),
-            additional_params: message::AdditionalParams::from_entries([
-                (
-                    "title",
-                    format!(
-                        "Source {}: {}",
-                        document.citation.index, document.citation.title
-                    )
-                    .into(),
+            additional_params: Some(serde_json::json!({
+                "title": format!(
+                    "Source {}: {}",
+                    document.citation.index, document.citation.title
                 ),
-                ("context", format!("URL: {}", document.citation.url).into()),
-                ("citations", serde_json::json!({ "enabled": true })),
-            ]),
+                "context": format!("URL: {}", document.citation.url),
+                "citations": { "enabled": true },
+            })),
         }));
     }
 
@@ -1250,7 +1244,7 @@ fn anthropic_document_message(
 fn extract_anthropic_source_quotes(
     content: &[AssistantContent],
     source_documents: &[SynthesisDocument],
-) -> Result<Vec<SourceQuote>, StepError> {
+) -> Vec<SourceQuote> {
     let mut evidence = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1258,11 +1252,8 @@ fn extract_anthropic_source_quotes(
         let AssistantContent::Text(text) = block else {
             continue;
         };
-        let citations = anthropic_completion::anthropic_citations(text)
-            .map_err(|e| StepError::permanent(format!("anthropic citation decode: {e}")))?;
-        for citation in citations {
-            let Some((document_index, cited_text)) = anthropic_citation_document_span(&citation)
-            else {
+        for source in text.citations().iter().flat_map(|c| &c.sources) {
+            let Some((document_index, cited_text)) = cited_document_span(source) else {
                 continue;
             };
             let Some(document) = source_documents.get(document_index) else {
@@ -1278,26 +1269,19 @@ fn extract_anthropic_source_quotes(
         }
     }
 
-    Ok(evidence)
+    evidence
 }
 
-fn anthropic_citation_document_span(
-    citation: &anthropic_completion::Citation,
-) -> Option<(usize, &str)> {
-    match citation {
-        anthropic_completion::Citation::CharLocation(c) => {
-            Some((c.document_index, c.cited_text.as_str()))
-        }
-        anthropic_completion::Citation::PageLocation(c) => {
-            Some((c.document_index, c.cited_text.as_str()))
-        }
-        anthropic_completion::Citation::ContentBlockLocation(c) => {
-            Some((c.document_index, c.cited_text.as_str()))
-        }
-        anthropic_completion::Citation::SearchResultLocation(_)
-        | anthropic_completion::Citation::WebSearchResultLocation(_)
-        | anthropic_completion::Citation::Unknown(_) => None,
-    }
+/// The request position of the document that `source` cites, and the passage it
+/// quotes.
+fn cited_document_span(source: &citation::Source) -> Option<(usize, &str)> {
+    let citation::SourceLocation::Document {
+        index: Some(index), ..
+    } = &source.location
+    else {
+        return None;
+    };
+    Some((usize::try_from(*index).ok()?, source.cited_text.as_deref()?))
 }
 
 /// Classify a typed-prompt error. Delegates the wrapped `PromptError` case to
@@ -1305,9 +1289,9 @@ fn anthropic_citation_document_span(
 /// response is transient.
 pub(crate) fn classify_structured_err(err: StructuredOutputError) -> StepError {
     match err {
-        StructuredOutputError::PromptError(inner) => classify_rig_err(inner),
-        StructuredOutputError::DeserializationError(e) => {
-            StepError::permanent(format!("typed prompt: schema deserialize failed: {e}"))
+        StructuredOutputError::Prompt(inner) => classify_rig_err(inner),
+        StructuredOutputError::Deserialization { error, .. } => {
+            StepError::permanent(format!("typed prompt: schema deserialize failed: {error}"))
         }
         // An empty response is typically a one-off provider failure.
         StructuredOutputError::EmptyResponse => {
@@ -1500,25 +1484,28 @@ mod tests {
     fn classify_structured_err_deserialize_failure_is_permanent() {
         let json_err: serde_json::Error = serde_json::from_str::<i32>("nope").unwrap_err();
         assert_permanent(&classify_structured_err(
-            StructuredOutputError::DeserializationError(json_err),
+            StructuredOutputError::Deserialization {
+                output: "nope".to_string(),
+                error: json_err,
+            },
         ));
     }
 
     #[test]
     fn classify_rig_err_http_401_is_permanent() {
-        let err = PromptError::CompletionError(http_status(401));
+        let err = PromptError::Provider(http_status(401));
         assert_permanent(&classify_rig_err(err));
     }
 
     #[test]
     fn classify_rig_err_http_429_is_transient() {
-        let err = PromptError::CompletionError(http_status(429));
+        let err = PromptError::Provider(http_status(429));
         assert_transient(&classify_rig_err(err));
     }
 
     #[test]
     fn classify_rig_err_provider_response_4xx_is_permanent() {
-        let err = PromptError::CompletionError(ProviderError::ProviderResponse(
+        let err = PromptError::Provider(ProviderError::ProviderResponse(
             ProviderResponseError::new(StatusCode::BAD_REQUEST, "invalid request"),
         ));
         assert_permanent(&classify_rig_err(err));
@@ -1526,7 +1513,7 @@ mod tests {
 
     #[test]
     fn classify_rig_err_provider_response_2xx_envelope_is_transient() {
-        let err = PromptError::CompletionError(ProviderError::ProviderResponse(
+        let err = PromptError::Provider(ProviderError::ProviderResponse(
             ProviderResponseError::new(StatusCode::OK, "{\"error\":{\"message\":\"overloaded\"}}"),
         ));
         assert_transient(&classify_rig_err(err));
@@ -1603,22 +1590,12 @@ mod tests {
                 text: "second source text".to_string(),
             },
         ];
-        let citations = serde_json::to_value(vec![anthropic_completion::Citation::CharLocation(
-            anthropic_completion::CharLocationCitation {
-                cited_text: "second source text".to_string(),
-                document_index: 1,
-                document_title: Some("Source 2: Two".to_string()),
-                start_char_index: 0,
-                end_char_index: 18,
-            },
-        )])
-        .unwrap();
-        let content = vec![AssistantContent::Text(message::Text {
-            text: "summary".to_string(),
-            additional_params: message::AdditionalParams::from_entries([("citations", citations)]),
-        })];
+        let content = vec![AssistantContent::Text(
+            message::Text::new("summary")
+                .with_citations([document_citation(1, "second source text")]),
+        )];
 
-        let evidence = extract_anthropic_source_quotes(&content, &documents).unwrap();
+        let evidence = extract_anthropic_source_quotes(&content, &documents);
 
         assert_eq!(
             evidence,
@@ -1639,24 +1616,24 @@ mod tests {
             },
             text: "first source text".to_string(),
         }];
-        let citation = anthropic_completion::Citation::CharLocation(
-            anthropic_completion::CharLocationCitation {
-                cited_text: "first source text".to_string(),
-                document_index: 0,
-                document_title: Some("Source 1: One".to_string()),
-                start_char_index: 0,
-                end_char_index: 17,
-            },
-        );
-        let citations = serde_json::to_value(vec![citation.clone(), citation]).unwrap();
-        let content = vec![AssistantContent::Text(message::Text {
-            text: "summary".to_string(),
-            additional_params: message::AdditionalParams::from_entries([("citations", citations)]),
-        })];
+        let citation = document_citation(0, "first source text");
+        let content = vec![AssistantContent::Text(
+            message::Text::new("summary").with_citations([citation.clone(), citation]),
+        )];
 
-        let evidence = extract_anthropic_source_quotes(&content, &documents).unwrap();
+        let evidence = extract_anthropic_source_quotes(&content, &documents);
 
         assert_eq!(evidence.len(), 1);
+    }
+
+    /// A citation of the request document at `index` that quotes `cited_text`.
+    fn document_citation(index: u32, cited_text: &str) -> citation::Citation {
+        citation::Citation::new([citation::Source::new(citation::SourceLocation::Document {
+            index: Some(index),
+            id: None,
+            within: None,
+        })
+        .cited_text(cited_text)])
     }
 
     struct NoSearch;

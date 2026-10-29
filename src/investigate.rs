@@ -10,16 +10,16 @@ use rig_agent::agent::{
     AgentBuilder, AgentHook, DispatchAction, DispatchEvent, HookContext, OutcomeAction,
     OutcomeEvent,
 };
-use rig_agent::bus::Bus;
 use rig_agent::completion::{PromptError, StructuredOutputError};
+use rig_agent::handlers::Handlers;
 use rig_agent::tool::RegisteredTool;
 use rig_agent::tool::server::ToolServer;
 use rig_core::DynModel;
-use rig_core::effect::{EffectKind, Outcome, model_key};
+use rig_core::effect::{Answered, EffectKind, model_key};
 use rig_core::error::{ErrorKind, ErrorReport};
 use rig_core::operation::Completion;
 use rig_core::serve::adapters::{ModelAdapter, ToolAdapter};
-use rig_core::tool::PortableTool;
+use rig_core::tool::{Tool, ToolContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -43,7 +43,7 @@ const SEARCH_LIMIT: usize = 5;
 /// Prefix of the keys of the journal of the investigating step in the run memo.
 pub(crate) const JOURNAL_PREFIX: &str = "investigating/";
 
-/// Owner of the bus keys of the investigating agent, and the label of its
+/// Owner of the handler keys of the investigating agent, and the label of its
 /// model.
 const INVESTIGATOR: &str = "investigator";
 
@@ -95,11 +95,11 @@ pub(crate) enum Investigated {
 }
 
 impl Investigator {
-    /// Run the agent over a bus whose model and tools are under `journal`, for
-    /// at most `turns` model calls, adding the usage of each completion to
-    /// `usage`. An agent that reaches `turns` returns an empty list of
-    /// findings. An agent that asks a question stops at the call, and a later
-    /// run over the same journal replays the agent up to the call.
+    /// Run the agent over a handler table whose model and tools are under
+    /// `journal`, for at most `turns` model calls, adding the usage of each
+    /// completion to `usage`. An agent that reaches `turns` returns an empty
+    /// list of findings. An agent that asks a question stops at the call, and a
+    /// later run over the same journal replays the agent up to the call.
     pub(crate) async fn run(
         self,
         journal: &Journal,
@@ -107,12 +107,12 @@ impl Investigator {
         turns: usize,
         usage: TokenUsage,
     ) -> Result<Investigated, StepError> {
-        let (dispatcher, registrar, mut driver) = Bus::channel();
+        let handlers = Handlers::default();
         let model_key = model_key(INVESTIGATOR);
         let model = ModelAdapter::new(INVESTIGATOR, self.model);
-        driver
+        handlers
             .register(model_key.clone(), journal.wrap(model, LLM_CALL_TIMEOUT))
-            .map_err(bus_step_err)?;
+            .map_err(registration_step_err)?;
         let search = WebSearch {
             search: self.search,
         };
@@ -121,13 +121,13 @@ impl Investigator {
                 RegisteredTool::from_handler(
                     journal.wrap(ToolAdapter::new(search), SEARCH_CALL_TIMEOUT),
                 )
-                .map_err(bus_step_err)?,
+                .map_err(registration_step_err)?,
             )
             .registered_tool(
                 RegisteredTool::from_handler(
                     journal.wrap(ToolAdapter::new(self.fetch), FETCH_JOIN_LEASE),
                 )
-                .map_err(bus_step_err)?,
+                .map_err(registration_step_err)?,
             );
         let (gate, ask) = match self.asking {
             Asking::Off => (None, None),
@@ -145,11 +145,11 @@ impl Investigator {
         if let Some(ask) = ask {
             tools = tools.registered_tool(
                 RegisteredTool::from_handler(journal.wrap(ToolAdapter::new(ask), ASK_TIMEOUT))
-                    .map_err(bus_step_err)?,
+                    .map_err(registration_step_err)?,
             );
         }
         let observed = Observed::new(usage);
-        let mut builder = AgentBuilder::over_bus(dispatcher, registrar, INVESTIGATOR, model_key)
+        let mut builder = AgentBuilder::over_handlers(handlers, INVESTIGATOR, model_key)
             .preamble(AGENT_PREAMBLE)
             .add_hook(journal.call_keys())
             .add_hook(observed.clone());
@@ -162,15 +162,10 @@ impl Investigator {
         }
         let agent = builder.tool_server_handle(tools.run()).build();
 
-        let run = agent
+        let result = agent
             .prompt_typed::<Investigation>(prompt)
             .max_turns(turns)
-            .into_future();
-        // The driver ends only after the agent drops its dispatcher.
-        let result = tokio::select! {
-            result = run => result,
-            () = driver => return Err(StepError::transient("investigating: the bus closed")),
-        };
+            .await;
         if let Some(fault) = journal.take_fault() {
             return Err(fault);
         }
@@ -180,10 +175,7 @@ impl Investigator {
         }
         let findings = match result {
             Ok(response) => response.output.findings,
-            Err(StructuredOutputError::PromptError(PromptError::MaxTurnsError {
-                max_turns,
-                ..
-            })) => {
+            Err(StructuredOutputError::Prompt(PromptError::MaxTurns { max_turns, .. })) => {
                 tracing::warn!(max_turns, "investigation ran out of model calls");
                 Vec::new()
             }
@@ -267,7 +259,7 @@ pub(crate) struct AskUserArgs {
 #[error("the reply of the user is missing")]
 pub(crate) struct ReplyMissing;
 
-impl PortableTool for AskUser {
+impl Tool for AskUser {
     const NAME: &'static str = "ask_user";
     type Args = AskUserArgs;
     type Output = String;
@@ -290,7 +282,11 @@ impl PortableTool for AskUser {
         })
     }
 
-    async fn call(&self, _args: AskUserArgs) -> Result<String, ReplyMissing> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        _args: AskUserArgs,
+    ) -> Result<String, ReplyMissing> {
         match &self.reply {
             Some(Reply::Given(text)) => Ok(text.clone()),
             Some(Reply::Assumed) => Ok(ASSUMED.to_string()),
@@ -299,9 +295,9 @@ impl PortableTool for AskUser {
     }
 }
 
-/// Map a refused handler registration on a Rig bus to a permanent step error.
-fn bus_step_err(report: ErrorReport) -> StepError {
-    StepError::permanent(format!("bus registration refused: {}", report.message))
+/// Map a refused registration in a Rig handler table to a permanent step error.
+fn registration_step_err(report: ErrorReport) -> StepError {
+    StepError::permanent(format!("handler registration refused: {}", report.message))
 }
 
 /// The `web_search` tool over the search backend of the run.
@@ -314,7 +310,7 @@ pub(crate) struct WebSearchArgs {
     query: String,
 }
 
-impl PortableTool for WebSearch {
+impl Tool for WebSearch {
     const NAME: &'static str = "web_search";
     type Args = WebSearchArgs;
     type Output = Vec<SearchResult>;
@@ -334,7 +330,11 @@ impl PortableTool for WebSearch {
         })
     }
 
-    async fn call(&self, args: WebSearchArgs) -> Result<Vec<SearchResult>, SearchError> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: WebSearchArgs,
+    ) -> Result<Vec<SearchResult>, SearchError> {
         self.search.search(&args.query, SEARCH_LIMIT).await
     }
 }
@@ -357,7 +357,7 @@ pub(crate) struct FetchPageArgs {
 #[error("{0}")]
 pub(crate) struct FetchPageError(String);
 
-impl PortableTool for FetchPageTool {
+impl Tool for FetchPageTool {
     const NAME: &'static str = "fetch_page";
     type Args = FetchPageArgs;
     type Output = FetchedPage;
@@ -377,7 +377,11 @@ impl PortableTool for FetchPageTool {
         })
     }
 
-    async fn call(&self, args: FetchPageArgs) -> Result<FetchedPage, FetchPageError> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: FetchPageArgs,
+    ) -> Result<FetchedPage, FetchPageError> {
         fetch_page(&self.jobs, &self.run_id, args.url, self.max_chars)
             .await
             .map_err(FetchPageError)
@@ -434,10 +438,10 @@ impl AgentHook for Observed {
     async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
         let mut observations = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         match (event.kind, event.outcome) {
-            (_, Ok(Outcome::Completion(response))) => {
+            (_, Ok(Answered::Completion(response))) => {
                 crate::runner::record_usage(&mut observations.usage, &response.usage);
             }
-            (EffectKind::ToolCall { name, args }, Ok(Outcome::ToolResult { result }))
+            (EffectKind::ToolCall { name, args }, Ok(Answered::ToolResult { result }))
                 if name == FetchPageTool::NAME && result.is_success() =>
             {
                 if let Ok(args) = serde_json::from_str::<FetchPageArgs>(args) {
@@ -623,10 +627,7 @@ mod tests {
     }
 
     fn usage(input_tokens: u64) -> Usage {
-        Usage {
-            input_tokens: Some(input_tokens),
-            ..Usage::default()
-        }
+        Usage::new().input_tokens(input_tokens)
     }
 
     #[tokio::test]

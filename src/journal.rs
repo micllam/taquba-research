@@ -1,6 +1,7 @@
-//! The effect journal: handlers on a rig bus that record each completion and
-//! tool-call outcome in a [`Memo`], and return the recorded outcome when a
-//! later run of the agent over the same memo dispatches the same effect.
+//! The effect journal: handlers in a rig handler table that record each
+//! completion and tool-call outcome in a [`Memo`], and return the recorded
+//! outcome when a later run of the agent over the same memo dispatches the same
+//! effect.
 //!
 //! Every key starts with the prefix of the journal. A completion uses its
 //! ordinal within the run of the agent as its key, and a tool call uses the
@@ -22,7 +23,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use rig_agent::agent::{AgentHook, DispatchAction, DispatchEvent, HookContext};
 use rig_core::completion::message::AssistantContent;
-use rig_core::effect::{EffectId, EffectKind, HandlerDescriptor, Outcome};
+use rig_core::effect::{Answered, EffectId, EffectKind, HandlerDescriptor};
 use rig_core::error::{ErrorKind, ErrorReport};
 use rig_core::serve::{Dispatch, Reply, Serve};
 use serde::{Deserialize, Serialize};
@@ -65,7 +66,7 @@ pub(crate) async fn read_entries(memo: &Memo, prefix: &str) -> anyhow::Result<Ve
         let Some(bytes) = memo.get(&key).await.context("reading journal")? else {
             break;
         };
-        let Outcome::Completion(response) =
+        let Answered::Completion(response) =
             serde_json::from_slice(&bytes).with_context(|| format!("decoding journal[{key}]"))?
         else {
             bail!("journal[{key}] is not a completion");
@@ -82,7 +83,9 @@ pub(crate) async fn read_entries(memo: &Memo, prefix: &str) -> anyhow::Result<Ve
                 .is_some();
             entries.push(JournalEntry::ToolCall {
                 name: call.function.name.to_string(),
-                args: call.function.arguments.to_string(),
+                args: call.function.invalid_arguments.clone().unwrap_or_else(|| {
+                    serde_json::Value::Object(call.function.arguments.clone()).to_string()
+                }),
                 recorded,
             });
         }
@@ -278,7 +281,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use rig_agent::bus::Bus;
+    use rig_agent::handlers::Handlers;
     use rig_core::serve::adapters::ToolAdapter;
     use taquba::object_store::memory::InMemory;
     use taquba_workflow::{MemoStore, RunId, StepErrorKind};
@@ -291,22 +294,21 @@ mod tests {
         let memo = MemoStore::new(Arc::new(InMemory::new()), "test-memo")
             .new_memo(&RunId::new("run").unwrap(), 4);
         let journal = Journal::new(memo, "test/", LeaseHandle::detached());
-        let (dispatcher, _registrar, mut driver) = Bus::channel();
+        let handlers = Handlers::default();
         let key = rig_core::effect::tool_key("web_search");
         let search = WebSearch {
             search: Arc::new(Tavily::new("unused")),
         };
-        driver
+        handlers
             .register(
                 key.clone(),
                 journal.wrap(ToolAdapter::new(search), Duration::from_secs(5)),
             )
             .unwrap();
-        tokio::spawn(driver);
 
         // Without the `CallKeys` hook, the journal does not have a key for the
         // call.
-        let outcome = dispatcher
+        let outcome = handlers
             .dispatch(
                 &key,
                 EffectKind::ToolCall {

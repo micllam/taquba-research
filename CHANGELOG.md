@@ -56,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `StateSummary` gains `pending_question`, the question of a run
   that waits for a reply, so a struct literal of it fails to compile. Build the
   summary with `summarize_state`.
+- **Breaking:** The crate depends on rig-core 0.45 and rig-agent 0.45, so the
+  constructors of `ResearchStepRunner` take the provider clients of rig 0.45.
+  Upgrade rig to 0.45 in the crate that builds the clients.
 
 ### Fixed
 - The CLI keeps the workflow memos and the fetch job records of a `--store` URL
