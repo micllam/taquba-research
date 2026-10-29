@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::host::{AgentState, Record};
 use crate::report::Citation;
 use crate::search::SearchResult;
 
@@ -156,6 +157,8 @@ pub struct StateSummary {
     /// The question of the investigating agent while the run waits for the
     /// reply of the user.
     pub pending_question: Option<String>,
+    /// The transcript of the investigating agent while the run investigates.
+    pub transcript: Vec<Record>,
 }
 
 /// Decode the progress-relevant fields of a step-job payload. Returns `None`
@@ -169,6 +172,10 @@ pub fn summarize_state(payload: &[u8]) -> Option<StateSummary> {
             .clarification
             .filter(|c| c.reply.is_none())
             .map(|c| c.question),
+        transcript: state
+            .investigation
+            .map(|agent| agent.transcript)
+            .unwrap_or_default(),
     })
 }
 
@@ -307,14 +314,15 @@ pub struct ResearchState {
     /// The question of the investigating agent to the user, and its reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clarification: Option<Clarification>,
+    /// The agent run of the investigating phase while the phase lasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation: Option<AgentState>,
 }
 
 /// The question that the investigating agent of a run asks the user, a single
 /// question per run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Clarification {
-    /// The journal key of the `ask_user` call.
-    pub key: String,
     /// The question.
     pub question: String,
     /// When the agent asked.
@@ -353,6 +361,7 @@ impl ResearchState {
             synthesis: None,
             token_usage: TokenUsage::default(),
             clarification: None,
+            investigation: None,
         }
     }
 
@@ -370,6 +379,24 @@ impl ResearchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::RecordedCall;
+
+    /// A transcript that waits for the reply to a question.
+    fn transcript() -> Vec<Record> {
+        vec![
+            Record::User {
+                text: "a query".to_string(),
+            },
+            Record::Assistant {
+                text: String::new(),
+                calls: vec![RecordedCall {
+                    id: "call_1".to_string(),
+                    name: "ask_user".to_string(),
+                    arguments: serde_json::json!({ "question": "Which edition?" }),
+                }],
+            },
+        ]
+    }
 
     #[test]
     fn round_trip_serde() {
@@ -378,11 +405,13 @@ mod tests {
         s.config.investigation_turns = 3;
         s.config.clarification_wait_secs = Some(600);
         s.clarification = Some(Clarification {
-            key: "tool/0/call_1".to_string(),
             question: "Which edition?".to_string(),
             asked_at: Utc::now(),
             reply: Some(Reply::Given("2024".to_string())),
         });
+        let mut agent = AgentState::default();
+        agent.transcript = transcript();
+        s.investigation = Some(agent);
         let url: Url = "https://example.com/page".parse().unwrap();
         s.fetched.insert(
             url.clone(),
@@ -439,19 +468,23 @@ mod tests {
         assert_eq!(back.config.investigation_turns, 3);
         assert_eq!(back.config.clarification_wait_secs, Some(600));
         assert_eq!(back.clarification, s.clarification);
+        assert_eq!(back.investigation, s.investigation);
     }
 
     #[test]
-    fn summarize_state_reports_the_question_only_while_the_run_waits() {
+    fn summarize_state_reports_the_transcript_and_the_question_while_the_run_waits() {
         let mut s = ResearchState::new("a query", ResearchConfig::new("m"));
         s.clarification = Some(Clarification {
-            key: "tool/0/call_1".to_string(),
             question: "Which edition?".to_string(),
             asked_at: Utc::now(),
             reply: None,
         });
+        let mut agent = AgentState::default();
+        agent.transcript = transcript();
+        s.investigation = Some(agent);
         let waiting = summarize_state(&s.to_bytes()).unwrap();
         assert_eq!(waiting.pending_question.as_deref(), Some("Which edition?"));
+        assert_eq!(waiting.transcript, transcript());
 
         s.clarification.as_mut().unwrap().reply = Some(Reply::Assumed);
         let resolved = summarize_state(&s.to_bytes()).unwrap();

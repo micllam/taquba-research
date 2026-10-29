@@ -154,10 +154,11 @@
 //!   memoizes its output in its per-step [`Memo`](taquba_workflow::Memo). An
 //!   at-least-once redelivery short-circuits to the stored value and does not
 //!   call or bill the model again.
-//! - **A retried investigation replays its agent.** The investigating step
-//!   records each completion and tool result of its Rig agent in the per-step
-//!   memo, and a redelivery replays the recorded results. A failed call is not
-//!   recorded, so a retry calls it again.
+//! - **An investigation makes one model call per step.** Each step of the
+//!   investigating phase makes one model call of its Rig agent and runs the
+//!   tool calls of the reply. The per-step memo records the reply and each tool
+//!   result, and a redelivery reuses both. A failed model call stays out of the
+//!   memo, so a retry calls the model again.
 //! - **The delivery lease covers every slow call.** Every LLM and search call
 //!   runs under a timeout, and the step extends its lease
 //!   ([`taquba::LeaseHandle::ensure_at_least`]) by that bound before the call.
@@ -205,8 +206,8 @@
 
 mod agent;
 mod fetch_job;
+mod host;
 mod investigate;
-mod journal;
 mod report;
 mod runner;
 /// Web-search backends of the searching phase. An implementation of the
@@ -220,6 +221,7 @@ pub mod store;
 
 pub use agent::{ResearchAgent, ResearchAgentBuilder};
 pub use fetch_job::{FETCH_QUEUE_NAME, spawn_fetch_runner};
+pub use host::{Record, RecordedCall, RecordedResult};
 pub use report::{Citation, Report, RunStats};
 pub use runner::{ResearchStepRunner, RunRecord};
 pub use state::{Phase, ResearchConfig, StateSummary, TokenUsage, summarize_state};

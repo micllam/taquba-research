@@ -27,8 +27,8 @@ use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
 use url::Url;
 
 use crate::fetch_job::FetchPage;
-use crate::investigate::{self, Asking, FetchPageTool, Investigated, Investigator};
-use crate::journal::Journal;
+use crate::host::{Ask, Host, TurnEnd};
+use crate::investigate::{self, FetchPageTool, Investigation};
 use crate::report::{Citation, Report, RunStats, render_markdown};
 use crate::search::{SearchBackend, SearchError};
 use crate::state::{
@@ -576,51 +576,55 @@ impl ResearchStepRunner {
         let run_id = step.run_id.to_string();
         let max_chars = state.config.max_page_chars;
 
-        let asking = match (
+        let ask = match (
             state.config.clarification_wait_secs,
             &mut state.clarification,
         ) {
-            (None, _) => Asking::Off,
-            (Some(_), None) => Asking::Open,
+            (None, _) => Ask::Off,
+            (Some(_), None) => Ask::Open,
             (Some(_), Some(clarification)) => {
-                if clarification.reply.is_none() {
-                    clarification.reply = Some(resolve_reply(step.signal.as_deref()));
-                }
-                Asking::Replied(clarification.clone())
+                let reply = clarification
+                    .reply
+                    .get_or_insert_with(|| resolve_reply(step.signal.as_deref()));
+                Ask::Replied(investigate::reply_text(reply))
             }
         };
         tracing::info!("investigating gaps in {} sources", state.summaries.len());
 
-        let can_ask = !matches!(asking, Asking::Off);
-        let investigator = Investigator {
-            model: (self.models)(&state.config.model),
-            search: self.search.clone(),
-            fetch: FetchPageTool {
+        let can_ask = !matches!(ask, Ask::Off);
+        let tools = investigate::tools(
+            self.search.clone(),
+            FetchPageTool {
                 jobs: jobs.clone(),
                 run_id: run_id.clone(),
                 chunk_chars: max_chars,
             },
-            asking,
-            max_tokens: state.config.max_tokens_per_call,
-        };
-        // The run memo keeps the journal across the steps of a wait.
-        let journal = Journal::new(
-            step.run_memo.clone(),
-            investigate::JOURNAL_PREFIX,
-            step.lease.clone(),
         );
+        let mut definitions = tools.tool_definitions();
+        if can_ask {
+            definitions.push(Arc::new(investigate::ask_user()));
+        }
+        let spec = investigate::spec(turns, state.config.max_tokens_per_call);
+        let host = Host {
+            model: (self.models)(&state.config.model),
+            spec: &spec,
+            tools: &tools,
+            definitions,
+            bound: investigate::bound,
+            ask,
+            memo: &step.memo,
+            lease: &step.lease,
+        };
         let prompt = investigate::prompt(&state.query, &state.summaries, turns, can_ask);
-        let (findings, fetched) = match investigator
-            .run(&journal, prompt, turns, state.token_usage)
-            .await?
-        {
-            Investigated::Asked { key, question } => {
+        let agent = state.investigation.get_or_insert_default();
+        let findings = match host.step(agent, &prompt, &mut state.token_usage).await? {
+            TurnEnd::Continue => return Ok(None),
+            TurnEnd::Wait { question } => {
                 tracing::info!(
                     %question,
                     "waiting for a reply: taquba-research reply {run_id} \"<text>\""
                 );
                 state.clarification = Some(Clarification {
-                    key,
                     question,
                     asked_at: Utc::now(),
                     reply: None,
@@ -628,15 +632,18 @@ impl ResearchStepRunner {
                 let wait = state.config.clarification_wait_secs.unwrap_or_default();
                 return Ok(Some(Duration::from_secs(wait)));
             }
-            Investigated::Finished {
-                findings,
-                fetched,
-                usage,
-            } => {
-                state.token_usage = usage;
-                (findings, fetched)
+            TurnEnd::Done { output } => {
+                serde_json::from_str::<Investigation>(&output)
+                    .map_err(|e| StepError::permanent(format!("investigation output: {e}")))?
+                    .findings
+            }
+            TurnEnd::OutOfTurns => {
+                tracing::warn!(turns, "investigation ran out of model calls");
+                Vec::new()
             }
         };
+        let fetched = investigate::fetched(&agent.transcript);
+        state.investigation = None;
 
         // A finding enters the run only for a page that `fetch_page` returned.
         // The page text comes from the recorded result of its `FetchPage` job.
@@ -972,14 +979,14 @@ where
 /// only when the claim was lost or the job's cancellation was requested. In
 /// both cases this delivery's settlement is rejected or its run terminated, so
 /// a retry is safe.
-fn lease_step_err(e: taquba::Error) -> StepError {
+pub(crate) fn lease_step_err(e: taquba::Error) -> StepError {
     StepError::transient(format!("lease extension failed: {e}"))
 }
 /// Returns the JSON-decoded value previously written to `memo` under `key`. If
 /// none exists, awaits `compute`, JSON-encodes its result into the memo, and
 /// returns it. An at-least-once retry of the surrounding step then finds the
 /// cached value and skips the compute call entirely.
-async fn memoized<T, F>(memo: &Memo, key: &str, compute: F) -> Result<T, StepError>
+pub(crate) async fn memoized<T, F>(memo: &Memo, key: &str, compute: F) -> Result<T, StepError>
 where
     T: Serialize + DeserializeOwned,
     F: Future<Output = Result<T, StepError>>,
@@ -996,7 +1003,7 @@ where
 }
 
 /// Classify a Rig prompt error as transient or permanent.
-fn classify_rig_err(err: PromptError) -> StepError {
+pub(crate) fn classify_rig_err(err: PromptError) -> StepError {
     let msg = err.to_string();
     match err {
         // Configuration / runner-policy issues.

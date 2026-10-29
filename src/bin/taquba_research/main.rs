@@ -20,7 +20,7 @@
 //! writer applies. `resume` needs the exclusive writer and refuses while
 //! claimed jobs are visible unless `--force` is passed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,15 +41,15 @@ use taquba::{
 };
 use taquba_research::jobs::RunnerHandle;
 use taquba_research::store::{
-    self, JournalEntry, QUERY_HEADER, RunDisplayStatus, WORKFLOW_CONTROL_QUEUE_NAME,
-    WORKFLOW_MEMO_PREFIX, WORKFLOW_QUEUE_NAME,
+    self, QUERY_HEADER, RunDisplayStatus, WORKFLOW_CONTROL_QUEUE_NAME, WORKFLOW_MEMO_PREFIX,
+    WORKFLOW_QUEUE_NAME,
 };
 use taquba_research::workflow::{
     ListedRun, RunId, RunOptions, RunOutcome, RunSpec, RunState, RunStatus, StepError,
     StepErrorKind, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime, WorkflowView,
 };
 use taquba_research::{
-    FETCH_QUEUE_NAME, Phase, ResearchConfig, ResearchStepRunner, RunRecord,
+    FETCH_QUEUE_NAME, Record, ResearchConfig, ResearchStepRunner, RunRecord,
     search::{SearchBackend, Tavily},
     spawn_fetch_runner, summarize_state,
 };
@@ -1076,6 +1076,39 @@ fn ellipsize(s: &str, max: usize) -> String {
     format!("{}...", &s[..cut])
 }
 
+/// The `status` lines of a transcript: each model reply, followed by its tool
+/// calls, with `(no result)` on a call without a result.
+fn transcript_lines(transcript: &[Record]) -> Vec<String> {
+    let answered: HashSet<&str> = transcript
+        .iter()
+        .flat_map(|record| match record {
+            Record::Results { results } => results.iter().map(|r| r.id.as_str()).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let mut lines = Vec::new();
+    for record in transcript {
+        let Record::Assistant { calls, .. } = record else {
+            continue;
+        };
+        lines.push(format!("{:>2}. model", lines.len() + 1));
+        for call in calls {
+            let pending = if answered.contains(call.id.as_str()) {
+                ""
+            } else {
+                " (no result)"
+            };
+            let arguments = ellipsize(&call.arguments.to_string(), 60);
+            lines.push(format!(
+                "{:>2}. {} {arguments}{pending}",
+                lines.len() + 1,
+                call.name
+            ));
+        }
+    }
+    lines
+}
+
 /// The query of `run`, or an empty string for a run submitted without
 /// [`QUERY_HEADER`].
 fn query_of(run: &ListedRun) -> &str {
@@ -1229,24 +1262,12 @@ async fn cmd_status(store_ctx: &StoreCtx, run_id: String) -> Result<()> {
         println!("question:     {question}");
         println!("              reply with: taquba-research reply {run_id} \"<text>\"");
     }
-    if progress.is_some_and(|p| p.phase == Phase::Investigating) {
-        let journal = store::journal_entries(store_ctx.object_store.clone(), &parsed).await?;
-        if !journal.is_empty() {
-            println!("journal:");
-        }
-        for (n, entry) in journal.iter().enumerate() {
-            match entry {
-                JournalEntry::Completion => println!("  {:>2}. completion", n + 1),
-                JournalEntry::ToolCall {
-                    name,
-                    args,
-                    recorded,
-                } => {
-                    let pending = if *recorded { "" } else { " (no result)" };
-                    println!("  {:>2}. {name} {}{pending}", n + 1, ellipsize(args, 60));
-                }
-            }
-        }
+    let transcript = progress.map(|p| p.transcript).unwrap_or_default();
+    if !transcript.is_empty() {
+        println!("transcript:");
+    }
+    for line in transcript_lines(&transcript) {
+        println!("  {line}");
     }
     if let Some(job) = &job {
         println!("attempts:     {}/{}", job.attempts, job.max_attempts);

@@ -17,13 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Its `progress` line becomes `phase`.
 - The investigating step, between summarising and synthesis, in which a Rig
   agent with the `web_search` and `fetch_page` tools adds sources for the gaps
-  of the summaries, at up to 8 more model calls per run. `fetch_page` returns a
-  chunk of `ResearchConfig::max_page_chars` characters of the text of a page,
-  and the agent can request a later chunk. The CLI flag `--investigation-turns`
-  sets that limit, and 0 skips the step.
-- `store::journal_entries` and `store::JournalEntry`, the ordered completions
-  and tool calls of an investigating step, readable from a second process. The
-  `status` command prints them as `journal` while a run investigates.
+  of the summaries, at up to 8 more model calls per run and one model call per
+  workflow step. `fetch_page` returns a chunk of
+  `ResearchConfig::max_page_chars` characters of the text of a page, and the
+  agent can request a later chunk. The CLI flag `--investigation-turns` sets
+  that limit, and 0 skips the step.
+- `Record`, `RecordedCall` and `RecordedResult`, the transcript of the
+  investigating agent in `StateSummary::transcript`, readable from a second
+  process. The `status` command prints it as `transcript` while a run
+  investigates.
 - The investigating agent can ask the user a single question per run, and the
   run waits for the `reply` command, or proceeds on an assumption after the
   wait. Enable it with `--clarification-wait <SECONDS>` or
@@ -58,8 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `None`. Set the fields, or start from `ResearchConfig::new`, which sets 8 and
   `None`.
 - **Breaking:** `StateSummary` gains `pending_question`, the question of a run
-  that waits for a reply, so a struct literal of it fails to compile. Build the
-  summary with `summarize_state`.
+  that waits for a reply, and `transcript`, so a struct literal of it fails to
+  compile. Build the summary with `summarize_state`.
 - **Breaking:** The crate depends on rig-core 0.45 and rig-agent 0.45, so the
   constructors of `ResearchStepRunner` take the provider clients of rig 0.45.
   Upgrade rig to 0.45 in the crate that builds the clients.

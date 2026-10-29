@@ -171,10 +171,11 @@ async fn main() -> anyhow::Result<()> {
 - **A retry does not pay for a model call again.** Each LLM-backed phase
   memoizes its output in its per-step `Memo`. An at-least-once redelivery
   short-circuits to the stored value and does not call or bill the model again.
-- **A retried investigation replays its agent.** The investigating step records
-  each completion and tool result of its Rig agent in the per-step memo, and a
-  redelivery replays the recorded results. A failed call is not recorded, so a
-  retry calls it again.
+- **An investigation makes one model call per step.** Each step of the
+  investigating phase makes one model call of its Rig agent and runs the tool
+  calls of the reply. The per-step memo records the reply and each tool result,
+  and a redelivery reuses both. A failed model call stays out of the memo, so a
+  retry calls the model again.
 - **The delivery lease covers every slow call.** Every LLM and search call runs
   under a timeout, and the step extends its lease
   (`LeaseHandle::ensure_at_least`) by that bound before the call. The fetching

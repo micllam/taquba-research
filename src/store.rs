@@ -21,7 +21,6 @@ use taquba_workflow::{
     HEADER_TERMINAL, ListedRun, MemoStore, RunFilter, RunId, RunState, TerminalStatus, WorkflowView,
 };
 
-pub use crate::journal::JournalEntry;
 use crate::state::TokenUsage;
 
 /// Name of the workflow queue. The CLI and [`crate::ResearchAgent`] configure
@@ -54,18 +53,6 @@ pub fn workflow_view(reader: &QueueReader, object_store: Arc<dyn ObjectStore>) -
         reader.view().clone(),
         MemoStore::new(object_store, WORKFLOW_MEMO_PREFIX),
     )
-}
-
-/// The records of the journal of the investigating step of `run_id`, from the
-/// run memo in the runtime's memo store in `object_store`: each completion in
-/// order, followed by the tool calls that it requested. The list is empty
-/// before the investigating step starts.
-pub async fn journal_entries(
-    object_store: Arc<dyn ObjectStore>,
-    run_id: &RunId,
-) -> anyhow::Result<Vec<JournalEntry>> {
-    let memo = MemoStore::new(object_store, WORKFLOW_MEMO_PREFIX).new_run_memo(run_id);
-    crate::journal::read_entries(&memo, crate::investigate::JOURNAL_PREFIX).await
 }
 
 /// Key of the [`RunProgress`] in the run KV space of a run, which the memo

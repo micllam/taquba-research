@@ -7,16 +7,17 @@ use rig_core::test_utils::{MockCompletionModel, MockTurn};
 use serde_json::json;
 use taquba::EnqueueEntry;
 use taquba::object_store::memory::InMemory;
-use taquba_research::ResearchStepRunner;
 use taquba_research::search::{SearchBackend, SearchError, SearchResult};
 use taquba_research::store::RunDisplayStatus;
+use taquba_research::{Record, RecordedCall, RecordedResult, ResearchStepRunner};
 use taquba_workflow::{CancelCommand, Command, MemoStore, RunId};
 use tokio::sync::oneshot;
 
 use super::{
     Cli, ReplyOutcome, StoreCtx, WORKFLOW_CONTROL_QUEUE_NAME, WORKFLOW_MEMO_PREFIX, cmd_reply,
     cmd_resume, cmd_run, ellipsize, gather_rows, inbox_sender, open_queue, open_reader,
-    pending_cancellations, resolve_store, store_options, with_reader, writer_is_live,
+    pending_cancellations, resolve_store, store_options, transcript_lines, with_reader,
+    writer_is_live,
 };
 
 const QUERY: &str = "test query";
@@ -268,4 +269,38 @@ fn ellipsize_truncates_on_char_boundaries() {
     assert_eq!(ellipsize(&ascii, 50), format!("{}...", "a".repeat(47)));
     let multibyte = "é".repeat(30);
     assert_eq!(ellipsize(&multibyte, 25), format!("{}...", "é".repeat(22)));
+}
+
+#[test]
+fn transcript_lines_list_each_reply_and_its_calls_with_the_missing_results() {
+    let call = |id: &str, name: &str| RecordedCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments: json!({ "query": "gaps" }),
+    };
+    let transcript = [
+        Record::User {
+            text: QUERY.to_string(),
+        },
+        Record::Assistant {
+            text: String::new(),
+            calls: vec![call("call_1", "web_search"), call("call_2", "ask_user")],
+        },
+        Record::Results {
+            results: vec![RecordedResult {
+                id: "call_1".to_string(),
+                name: "web_search".to_string(),
+                text: "no results".to_string(),
+                is_error: false,
+            }],
+        },
+    ];
+    assert_eq!(
+        transcript_lines(&transcript),
+        [
+            " 1. model",
+            r#" 2. web_search {"query":"gaps"}"#,
+            r#" 3. ask_user {"query":"gaps"} (no result)"#,
+        ]
+    );
 }
