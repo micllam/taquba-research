@@ -86,6 +86,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (on-disk):** The crate depends on taquba 0.16 and taquba-workflow
   0.15, whose job and run records differ from those of taquba 0.14 and
   taquba-workflow 0.13. Start from a fresh store.
+- **Breaking:** The crate depends on reqwest 0.13, so `SearchError::Transport`
+  contains a `reqwest::Error` of reqwest 0.13. Upgrade reqwest to 0.13 in a
+  crate that matches the error.
+- The `FetchPage` job and the Tavily backend verify TLS certificates against the
+  certificate store of the platform, in place of a bundled set of root
+  certificates. Install the CA certificates of the platform on a host without
+  them.
 
 ### Fixed
 - The CLI keeps the workflow memos and the fetch job records of a `--store` URL
