@@ -2,17 +2,17 @@
 //! [`taquba_workflow::WorkflowRuntime`] and a one-shot terminal hook, exposed
 //! through a single `run(queue, query)` call.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
 use rig_core::providers::{anthropic, ollama, openai};
+use taquba::Queue;
 use taquba::object_store::ObjectStore;
-use taquba::{Queue, SettlementEffects};
 use taquba_workflow::{
-    RunId, RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook, TerminalStatus,
-    WorkflowRuntime,
+    RunId, RunOptions, RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook,
+    TerminalStatus, WorkflowRuntime,
 };
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
@@ -23,10 +23,9 @@ use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
 use crate::store::{
-    CancelSentinel, ReplyBox, RunIndexEntry, TerminalReconciler, WORKFLOW_MEMO_PREFIX,
-    WORKFLOW_QUEUE_NAME, count_waiting_step_jobs, run_entry_key,
+    QUERY_HEADER, WORKFLOW_CONTROL_QUEUE_NAME, WORKFLOW_MEMO_PREFIX, WORKFLOW_QUEUE_NAME,
+    count_waiting_step_jobs,
 };
-use crate::watcher::spawn_reply_watcher;
 
 /// How long workflow memo blobs are retained after the run reaches a terminal
 /// state. The window exceeds the longest realistic run wall-time plus an
@@ -40,8 +39,7 @@ const MEMO_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub struct ResearchAgent {
     runner: ResearchStepRunner,
     config: ResearchConfig,
-    cancel: Option<CancelSentinel>,
-    replies: Option<ReplyBox>,
+    inbox: bool,
 }
 
 impl ResearchAgent {
@@ -67,18 +65,14 @@ impl ResearchAgent {
         query: impl Into<String>,
     ) -> Result<Report> {
         let query = query.into();
-        // The run id is generated before submit so the index entry's KV key can
-        // join the submit transaction and the terminal hook can filter
+        // The run id is generated before submit so the terminal hook can filter
         // notifications to this run.
         let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
         let (tx, rx) = oneshot::channel::<RunOutcome>();
-        let hook = TerminalReconciler::new(
-            queue.clone(),
-            CaptureOutcome {
-                run_id: run_id.clone(),
-                tx: Mutex::new(Some(tx)),
-            },
-        );
+        let hook = CaptureOutcome {
+            run_id: run_id.clone(),
+            tx: Mutex::new(Some(tx)),
+        };
 
         // The worker drains the shared workflow queue, so other queued runs'
         // pending steps execute in this call too.
@@ -110,19 +104,22 @@ impl ResearchAgent {
         // `StepOutcome::Continue` enqueues the next step only after the current
         // one acks. One worker is enough and avoids unnecessary claim
         // transaction conflicts.
-        let runtime = WorkflowRuntime::builder(queue.clone(), object_store, runner, hook)
+        let mut builder = WorkflowRuntime::builder(queue.clone(), object_store, runner, hook)
             .queue_name(WORKFLOW_QUEUE_NAME)
             .memo_prefix(WORKFLOW_MEMO_PREFIX)
             .max_concurrent_steps(1)
-            .memo_retention(MEMO_RETENTION)
-            .build();
-
-        let entry = RunIndexEntry {
-            run_id: run_id.to_string(),
-            query: query.clone(),
-            submitted_at: Utc::now(),
-            terminal: None,
+            .memo_retention(MEMO_RETENTION);
+        if self.inbox {
+            builder = builder.control_queue(WORKFLOW_CONTROL_QUEUE_NAME);
+        }
+        let runtime = match builder.build().context("building the workflow runtime") {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                let _ = job_handle.shutdown().await;
+                return Err(e);
+            }
         };
+
         let input = ResearchStepRunner::initial_state(query.clone(), self.config.clone());
         // Submit before spawning the worker, so a submit failure has only the
         // fetch runner to shut down.
@@ -130,8 +127,10 @@ impl ResearchAgent {
             .submit(RunSpec {
                 run_id: Some(run_id.clone()),
                 input,
-                effects: SettlementEffects::default()
-                    .kv_put(run_entry_key(&run_id), entry.to_bytes()),
+                options: RunOptions {
+                    headers: HashMap::from([(QUERY_HEADER.to_string(), query.clone())]),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .await
@@ -141,10 +140,6 @@ impl ResearchAgent {
             return Err(e);
         }
 
-        // The watcher stops when this call returns.
-        let _watcher = self.replies.clone().map(|replies| {
-            spawn_reply_watcher(runtime.clone(), queue, replies, self.cancel.clone())
-        });
         let worker_runtime = runtime.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let mut worker = tokio::spawn(async move {
@@ -219,17 +214,14 @@ impl ResearchAgent {
 /// - [`Self::config`]: a [`ResearchConfig`] built via [`ResearchConfig::new`]
 ///   with the model identifier of the run.
 ///
-/// Optional:
-///
-/// - [`Self::cancellation`]: sentinel handle for cross-process cancellation.
-/// - [`Self::replies`]: reply box for the question of the investigating step.
+/// Optional: [`Self::inbox`], for the cancellation of a run from another
+/// process.
 #[derive(Default)]
 pub struct ResearchAgentBuilder {
     provider: Option<ProviderClient>,
     search: Option<Arc<dyn SearchBackend>>,
     config: Option<ResearchConfig>,
-    cancel: Option<CancelSentinel>,
-    replies: Option<ReplyBox>,
+    inbox: bool,
 }
 
 impl ResearchAgentBuilder {
@@ -269,18 +261,13 @@ impl ResearchAgentBuilder {
         self
     }
 
-    /// Attach a [`CancelSentinel`] so a `cancel` issued from another process
-    /// terminates the run.
-    pub fn cancellation(mut self, sentinel: CancelSentinel) -> Self {
-        self.cancel = Some(sentinel);
-        self
-    }
-
-    /// Attach a [`ReplyBox`] so a reply written from another process reaches a
-    /// run that waits for the reply of the user. Without it, the run proceeds
-    /// on an assumption after [`ResearchConfig::clarification_wait_secs`].
-    pub fn replies(mut self, replies: ReplyBox) -> Self {
-        self.replies = Some(replies);
+    /// Set the control queue of the workflow runtime, so a `cancel` sent from
+    /// another process through the inbox terminates the run.
+    /// [`ResearchAgent::run`] then requires a queue opened as
+    /// [`WORKFLOW_CONTROL_QUEUE_NAME`] describes. A reply reaches a waiting run
+    /// without the control queue, through the inbox of [`WORKFLOW_QUEUE_NAME`].
+    pub fn inbox(mut self) -> Self {
+        self.inbox = true;
         self
     }
 
@@ -297,15 +284,10 @@ impl ResearchAgentBuilder {
         let config = self
             .config
             .ok_or_else(|| anyhow!("ResearchAgent requires a ResearchConfig"))?;
-        let mut runner = ResearchStepRunner::from_provider(provider, search);
-        if let Some(sentinel) = &self.cancel {
-            runner = runner.with_cancellation(sentinel.clone());
-        }
         Ok(ResearchAgent {
-            runner,
+            runner: ResearchStepRunner::from_provider(provider, search),
             config,
-            cancel: self.cancel,
-            replies: self.replies,
+            inbox: self.inbox,
         })
     }
 }
@@ -336,8 +318,7 @@ impl TerminalHook for CaptureOutcome {
         // Terminal notifications are durable jobs: a notification left
         // unclaimed by a terminated process is delivered to the next worker on
         // the queue. A foreign notification is acked and logged without
-        // forwarding its outcome. The step settlement or the wrapping
-        // `TerminalReconciler` stages its run's terminal index entry.
+        // forwarding its outcome.
         if outcome.run_id != self.run_id {
             tracing::warn!(
                 run_id = %outcome.run_id,

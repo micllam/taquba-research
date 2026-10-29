@@ -9,10 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `store::WORKFLOW_MEMO_PREFIX`, the memo prefix of both runtimes, and
-  `store::workflow_view`, the `WorkflowView` of taquba-workflow 0.13 over a
+  `store::workflow_view`, the `WorkflowView` of taquba-workflow 0.15 over a
   `QueueReader`. The `workflow` module re-exports `RunState`, `RunStatus`,
   `RunTermination`, `StepErrorKind` and `WorkflowView`.
-- `store::find_step_job`, the step job of a run in a job listing.
 - The `status` command prints `step`, the current step number from the workflow
   view, and `error_kind`, the classification of the failure that ended a run.
   Its `progress` line becomes `phase`.
@@ -28,26 +27,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The investigating agent can ask the user a single question per run, and the
   run waits for the `reply` command, or proceeds on an assumption after the
   wait. Enable it with `--clarification-wait <SECONDS>` or
-  `ResearchConfig::clarification_wait_secs`, and deliver a reply from another
-  process through `store::ReplyBox` and `spawn_reply_watcher`, which
-  `ResearchAgentBuilder::replies` spawns, or in-process through a signal to
-  `store::clarification_signal_key`.
+  `ResearchConfig::clarification_wait_secs`. The `reply` command sends a
+  `taquba::SignalEntry` to the job id of the waiting step through the inbox of
+  the queue, and `list` and `status` display the run as `waiting for reply`.
 
 ### Changed
 - **Breaking:** `store::derive_display_status` takes the run's `RunState` from
-  `WorkflowView::status` in place of a `StepJobState`, and `StepJobState` and
-  `store::snapshot_step_jobs` are removed. Read the state with
-  `store::workflow_view(reader, object_store).status(run_id)` and pass
-  `status.map(|s| s.state)`.
+  `WorkflowView::status` in place of the index entry and a `StepJobState`, and
+  `StepJobState` and `store::snapshot_step_jobs` are removed. Read the state
+  with `store::workflow_view(reader, object_store).status(run_id)` and pass
+  `&status.state`.
 - **Breaking:** `RunDisplayStatus::DeadLettered` folds into `Failed`, so a
-  dead-lettered run displays `failed`. Match `Failed` where `DeadLettered` was
-  matched.
+  dead-lettered run displays `failed`, `RunDisplayStatus::Unknown` is removed,
+  and `RunDisplayStatus` gains `Waiting` for a run that waits for a reply. Match
+  `Failed` where `DeadLettered` was matched, remove the arm for `Unknown`, and
+  add an arm for `Waiting`.
 - **Breaking:** `store::count_waiting_step_jobs` takes a `&QueueView`, so the
   count is available through a reader. Pass `queue.view()` or `reader.view()`.
-- The `list`, `status`, `cancel`, `resume` and `gc` commands read a run's state
-  through `WorkflowView` in place of a scan of every step job. A step
-  dead-lettered outside the worker displays `queued`, and `resume` of its run
-  proceeds, until the next worker terminates the run.
+- The `list`, `status`, `cancel` and `resume` commands read a run's state
+  through `WorkflowView` in place of a scan of every step job, and `status`
+  reads the step job by the job id that the view reports.
 - **Breaking:** `Phase` gains `Investigating`, so an exhaustive match on `Phase`
   fails to compile. Add an arm for `Phase::Investigating`.
 - **Breaking:** `ResearchConfig` gains `investigation_turns`, the model-call
@@ -61,6 +60,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** The crate depends on rig-core 0.45 and rig-agent 0.45, so the
   constructors of `ResearchStepRunner` take the provider clients of rig 0.45.
   Upgrade rig to 0.45 in the crate that builds the clients.
+- **Breaking:** The `cancel` command sends a `taquba_workflow::CancelCommand`
+  through the inbox to the control queue `store::WORKFLOW_CONTROL_QUEUE_NAME` in
+  place of a sentinel object, which the `run` or `resume` process applies within
+  2 seconds, and `CancelSentinel`, `ResearchStepRunner::with_cancellation` and
+  `ResearchAgentBuilder::cancellation` are removed. Open the queue with
+  `OpenOptions::inbox`, with `WORKFLOW_QUEUE_NAME` and
+  `WORKFLOW_CONTROL_QUEUE_NAME` in the queues of `InboxOptions::new`, and keep
+  the done jobs of the control queue for the record retention of the inbox.
+  Build the runtime with `control_queue` of `WORKFLOW_CONTROL_QUEUE_NAME`, or
+  call `ResearchAgentBuilder::inbox`, and delete the `runs/` objects of the
+  store.
+- **Breaking:** The run index is removed, so `list` and `status` read the runs
+  from `WorkflowView::runs` and show a run until 7 days after it terminates.
+  Submit each run with its query in the `store::QUERY_HEADER` header, and read
+  runs with `store::list_runs` and `WorkflowView::run`, which return
+  `ListedRun`.
+- **Breaking:** `TerminalReconciler`, `RunIndexEntry`, `TerminalRecord`,
+  `StoredStatus`, `RunSummary`, `store::get_run` and `store::run_entry_key` are
+  removed, and each step settlement writes a `store::RunProgress` in their
+  place. Read the progress of a run with `store::run_progress`.
+- **Breaking:** The `gc` command deletes the reports at the default location by
+  their age through the object store alone, and its `--status` and `--force`
+  flags are removed. Pass `--older-than-days` and `--dry-run` alone.
+- **Breaking (on-disk):** The crate depends on taquba 0.16 and taquba-workflow
+  0.15, whose job and run records differ from those of taquba 0.14 and
+  taquba-workflow 0.13. Start from a fresh store.
 
 ### Fixed
 - The CLI keeps the workflow memos and the fetch job records of a `--store` URL

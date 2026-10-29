@@ -96,8 +96,11 @@
 //! taquba-research cancel <RUN_ID>         # cooperatively cancel
 //! taquba-research reply <RUN_ID> "<text>" # reply to the question of a run
 //! taquba-research init                    # fail-fast store reachability check
-//! taquba-research gc --older-than-days 7  # delete old runs from the index + reports
+//! taquba-research gc --older-than-days 7  # delete reports older than 7 days
 //! ```
+//!
+//! A run stays listed until 7 days after it terminates, and its report stays
+//! until `gc` deletes it.
 //!
 //! `run` and `resume` are foreground processes that stay alive for the duration
 //! of the work. They require `TAVILY_API_KEY` and the API key of the chosen
@@ -113,13 +116,18 @@
 //! many seconds for `reply`, and `status` prints the question. After the wait,
 //! the agent proceeds on an assumption that it states in its findings.
 //!
+//! `reply` and `cancel` write an entry to the inbox of the queue (a prefix of
+//! request objects separate from the queue), and the `run` or `resume` process
+//! applies it within 2 seconds. Without such a process, the entry takes effect
+//! at the next `resume`.
+//!
 //! See `taquba-research --help` for the full flag list.
 //!
 //! # Storage
 //!
 //! `--store` (or `TAQUBA_RESEARCH_STORE`) sets the location of the SlateDB
-//! queue, the [run index](store::RunIndexEntry) and, by default, the rendered
-//! report. It accepts either of these forms:
+//! queue and, by default, the rendered report. It accepts either of these
+//! forms:
 //!
 //! - A local path, `~/.taquba-research/` by default.
 //! - An object-storage URL, such as `s3://bucket/prefix`, `gs://bucket/prefix`,
@@ -134,9 +142,9 @@
 //! ```
 //!
 //! The CLI always saves the report to `<store>/reports/<run_id>.md` in the
-//! store of the queue, so an S3-backed deployment keeps the report, the queue
-//! and the index in one bucket. `--output` accepts the same path-or-URL form
-//! and writes an additional copy there.
+//! store of the queue, so an S3-backed deployment keeps the report and the
+//! queue in one bucket. `--output` accepts the same path-or-URL form and writes
+//! an additional copy there.
 //!
 //! # Durability model
 //!
@@ -203,29 +211,26 @@ mod runner;
 /// [`SearchBackend`](search::SearchBackend) trait adds another backend.
 pub mod search;
 mod state;
-/// Run-level index of submitted runs, stored in the user KV namespace of the
-/// queue, and the cancellation sentinel. The `list`, `status`, `show`, `cancel`
-/// and `gc` subcommands of the CLI use it. See [`store::RunIndexEntry`].
+/// The runs of the research workflow: their listing, their progress and their
+/// display status. The `list`, `status`, `show` and `cancel` subcommands of the
+/// CLI use it.
 pub mod store;
-mod watcher;
 
 pub use agent::{ResearchAgent, ResearchAgentBuilder};
 pub use fetch_job::{FETCH_QUEUE_NAME, spawn_fetch_runner};
 pub use report::{Citation, Report, RunStats};
 pub use runner::{ResearchStepRunner, RunRecord};
 pub use state::{Phase, ResearchConfig, StateSummary, TokenUsage, summarize_state};
-pub use store::{CancelSentinel, TerminalReconciler};
-pub use watcher::{ReplyWatcher, spawn_reply_watcher};
 
 /// Re-exports of the workflow runtime types for a custom
 /// [`WorkflowRuntime`](taquba_workflow::WorkflowRuntime) around
 /// [`ResearchStepRunner`].
 pub mod workflow {
     pub use taquba_workflow::{
-        Delivery, EffectsHandle, NoopTerminalHook, RunId, RunOptions, RunOutcome, RunSpec,
-        RunState, RunStatus, RunTermination, Step, StepError, StepErrorKind, StepOutcome,
-        StepRunner, SubmitOutcome, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime,
-        WorkflowView,
+        Delivery, EffectsHandle, ListedRun, NoopTerminalHook, RunId, RunOptions, RunOutcome,
+        RunSpec, RunState, RunStatus, RunTermination, Step, StepError, StepErrorKind, StepOutcome,
+        StepRef, StepRunner, SubmitOutcome, TerminalEffects, TerminalHook, TerminalStatus,
+        WorkflowRuntime, WorkflowView,
     };
 }
 

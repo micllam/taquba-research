@@ -8,19 +8,22 @@
 //! - `status <RUN_ID>`: print a run's derived status and progress.
 //! - `show <RUN_ID> [--output ...]`: print or write the stored report.
 //! - `cancel <RUN_ID>`: cooperatively cancel an in-flight run.
+//! - `reply <RUN_ID> <TEXT>`: reply to the question of a waiting run.
 //! - `init`: verify the configured store is reachable (a check of the
 //!   credentials and the bucket before a run submits model calls).
-//! - `gc [--older-than-days N] [--status S]... [--force]`: delete terminal
-//!   runs' index entries, sentinels and default-location reports.
+//! - `gc [--older-than-days N] [--dry-run]`: delete the reports at the default
+//!   location.
 //!
-//! `list`, `status`, `show` and `cancel` read through a [`QueueReader`] and
-//! work from a second process against a live store. `resume` and `gc` need the
-//! exclusive writer and refuse while claimed jobs are visible unless `--force`
-//! is passed.
+//! `list`, `status`, `show`, `cancel` and `reply` read through a
+//! [`QueueReader`] and work from a second process against a live store.
+//! `cancel` and `reply` write an entry to the inbox of the queue, which the
+//! writer applies. `resume` needs the exclusive writer and refuses while
+//! claimed jobs are visible unless `--force` is passed.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -29,31 +32,39 @@ use rig_core::providers::{anthropic, ollama, openai};
 use taquba::object_store::local::LocalFileSystem;
 use taquba::object_store::path::Path as ObjectPath;
 use taquba::object_store::prefix::PrefixStore;
-use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload, parse_url_opts};
+use taquba::object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutPayload, parse_url_opts};
 use taquba::{
-    JobRecord, JobStatus, OpenOptions, Queue, QueueConfig, QueueReader, ReaderMode, ReaderOptions,
-    SettlementEffects,
+    DEFAULT_INBOX_RECORD_RETENTION, DEFAULT_INBOX_TOUCH_POLL_INTERVAL, EnqueueEntry, EntryKind,
+    EntryRead, InboxEntry, InboxOptions, InboxOutcome, InboxSender, JobRecord, JobStatus,
+    OpenOptions, Queue, QueueConfig, QueueReader, ReaderMode, ReaderOptions, SignalEntry,
+    SignalOutcome, default_inbox_path,
 };
 use taquba_research::jobs::RunnerHandle;
 use taquba_research::store::{
-    self, JournalEntry, ReplyBox, RunDisplayStatus, RunIndexEntry, StoredStatus,
-    TerminalReconciler, WORKFLOW_MEMO_PREFIX, WORKFLOW_QUEUE_NAME,
+    self, JournalEntry, QUERY_HEADER, RunDisplayStatus, WORKFLOW_CONTROL_QUEUE_NAME,
+    WORKFLOW_MEMO_PREFIX, WORKFLOW_QUEUE_NAME,
 };
 use taquba_research::workflow::{
-    RunId, RunOutcome, RunSpec, RunState, RunStatus, StepError, StepErrorKind, TerminalEffects,
-    TerminalHook, TerminalStatus, WorkflowRuntime, WorkflowView,
+    ListedRun, RunId, RunOptions, RunOutcome, RunSpec, RunState, RunStatus, StepError,
+    StepErrorKind, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime, WorkflowView,
 };
 use taquba_research::{
-    CancelSentinel, FETCH_QUEUE_NAME, Phase, ReplyWatcher, ResearchConfig, ResearchStepRunner,
-    RunRecord,
+    FETCH_QUEUE_NAME, Phase, ResearchConfig, ResearchStepRunner, RunRecord,
     search::{SearchBackend, Tavily},
-    spawn_fetch_runner, spawn_reply_watcher, summarize_state,
+    spawn_fetch_runner, summarize_state,
 };
+use taquba_workflow::{CancelCommand, CommandState};
 use tokio::sync::{Mutex, oneshot};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
 const QUEUE_DB_NAME: &str = "queue";
+/// Interval of the liveness beats of the writer, by which `reply` and `cancel`
+/// judge whether a worker applies their inbox entry.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// How long `reply` and `cancel` wait for a live writer to apply their entry:
+/// the touch poll of the writer and two manifest polls of the reader.
+const INBOX_WAIT: Duration = Duration::from_secs(DEFAULT_INBOX_TOUCH_POLL_INTERVAL.as_secs() + 4);
 /// How long workflow memo blobs are retained after the run reaches a terminal
 /// state. It must equal the value of the library's `ResearchAgent::run`.
 const MEMO_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -221,50 +232,15 @@ enum Command {
     /// Verify the configured store is reachable. Run it before a query to catch
     /// typos, missing credentials or unreachable buckets.
     Init,
-    /// Delete terminal runs' index entries, cancellation sentinels, replies and
-    /// default-location reports. Use `--dry-run` to preview.
+    /// Delete the reports at the default location. Use `--dry-run` to preview.
     Gc {
-        /// Delete only runs whose `submitted_at` is at least this many days in
-        /// the past.
+        /// Delete only the reports written at least this many days ago.
         #[arg(long)]
         older_than_days: Option<i64>,
-        /// Restrict deletion to specific statuses (repeatable). Allowed:
-        /// `succeeded`, `failed`, `cancelled`, `unknown`. `unknown` (never
-        /// matched by default) selects entries without a terminal record whose
-        /// run the workflow store no longer contains. Other runs without a
-        /// terminal record are never deleted: their state is in the queue.
-        #[arg(long = "status", value_parser = parse_gc_status)]
-        statuses: Vec<GcStatus>,
-        /// Proceed even when claimed jobs are visible in the store. Opening the
-        /// writer fences a live worker and requeues its claimed jobs. Pass this
-        /// only when no worker is running.
-        #[arg(long)]
-        force: bool,
         /// List candidates without deleting anything.
         #[arg(long)]
         dry_run: bool,
     },
-}
-
-/// Status filter accepted by `gc --status`: the stored terminal statuses plus
-/// `unknown`, entries without a terminal record whose run the workflow store no
-/// longer contains.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GcStatus {
-    Stored(StoredStatus),
-    Unknown,
-}
-
-fn parse_gc_status(s: &str) -> std::result::Result<GcStatus, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "succeeded" => Ok(GcStatus::Stored(StoredStatus::Succeeded)),
-        "failed" => Ok(GcStatus::Stored(StoredStatus::Failed)),
-        "cancelled" | "canceled" => Ok(GcStatus::Stored(StoredStatus::Cancelled)),
-        "unknown" => Ok(GcStatus::Unknown),
-        other => Err(format!(
-            "unknown status `{other}`; expected one of: succeeded, failed, cancelled, unknown"
-        )),
-    }
 }
 
 /// Resolved store handle: the shared `ObjectStore`, scoped to the path of
@@ -286,42 +262,29 @@ async fn main() -> Result<()> {
     let store_ctx = resolve_store(cli.store.as_deref())
         .await
         .context("opening store")?;
-    let sentinel = CancelSentinel::new(store_ctx.object_store.clone(), &ObjectPath::default());
 
     match &cli.command {
         Some(Command::Resume { run_id, force }) => {
-            cmd_resume(&cli, &store_ctx, &sentinel, run_id.clone(), *force).await
+            cmd_resume(&cli, &store_ctx, run_id.clone(), *force).await
         }
-        Some(Command::List) => cmd_list(&store_ctx, &sentinel).await,
-        Some(Command::Status { run_id }) => cmd_status(&store_ctx, &sentinel, run_id.clone()).await,
+        Some(Command::List) => cmd_list(&store_ctx).await,
+        Some(Command::Status { run_id }) => cmd_status(&store_ctx, run_id.clone()).await,
         Some(Command::Show { run_id, output }) => {
             cmd_show(&store_ctx, run_id.clone(), output.as_deref()).await
         }
         Some(Command::Reply { run_id, text }) => cmd_reply(&store_ctx, run_id.clone(), text).await,
-        Some(Command::Cancel { run_id }) => cmd_cancel(&store_ctx, &sentinel, run_id.clone()).await,
+        Some(Command::Cancel { run_id }) => cmd_cancel(&store_ctx, run_id.clone()).await,
         Some(Command::Init) => cmd_init(&store_ctx).await,
         Some(Command::Gc {
             older_than_days,
-            statuses,
-            force,
             dry_run,
-        }) => {
-            cmd_gc(
-                &store_ctx,
-                &sentinel,
-                *older_than_days,
-                statuses.clone(),
-                *force,
-                *dry_run,
-            )
-            .await
-        }
+        }) => cmd_gc(&store_ctx, *older_than_days, *dry_run).await,
         None => {
             let query = cli
                 .query
                 .clone()
                 .ok_or_else(|| anyhow!("missing QUERY; pass a query string or use a subcommand"))?;
-            cmd_run(&cli, &store_ctx, &sentinel, query).await
+            cmd_run(&cli, &store_ctx, query).await
         }
     }
 }
@@ -423,7 +386,16 @@ fn validate_store_arg(s: &str) -> std::result::Result<String, String> {
 
 async fn open_queue(ctx: &StoreCtx) -> Result<Arc<Queue>> {
     let opts = OpenOptions::default()
-        .default_queue_config(QueueConfig::default().lease_duration(LEASE_DURATION));
+        .default_queue_config(QueueConfig::default().lease_duration(LEASE_DURATION))
+        .queue_config(
+            WORKFLOW_CONTROL_QUEUE_NAME,
+            QueueConfig::default().keep_done_jobs(DEFAULT_INBOX_RECORD_RETENTION),
+        )
+        .inbox(InboxOptions::new([
+            WORKFLOW_QUEUE_NAME,
+            WORKFLOW_CONTROL_QUEUE_NAME,
+        ]))
+        .liveness_heartbeat(HEARTBEAT_INTERVAL);
     let queue = Queue::open_with_options(ctx.object_store.clone(), QUEUE_DB_NAME, opts)
         .await
         .context("opening taquba queue")?;
@@ -489,41 +461,115 @@ async fn view_status(view: &WorkflowView, run_id: &RunId) -> Result<Option<RunSt
         .with_context(|| format!("reading the workflow status of {run_id}"))
 }
 
-/// The current step job of `run_id` and its payload, from the job listings that
-/// the run state in `status` implies.
+/// The step job of `status` with its payload, while the queue retains the job.
 async fn current_step(
     reader: &QueueReader,
-    run_id: &str,
     status: Option<&RunStatus>,
-) -> Result<(Option<JobRecord>, Option<Vec<u8>>)> {
-    let mut job = None;
-    for listing in status.iter().flat_map(|s| step_job_listings(&s.state)) {
-        job = store::find_step_job(reader.view(), run_id, *listing).await?;
-        if job.is_some() {
-            break;
-        }
+) -> Result<Option<JobRecord>> {
+    match status {
+        Some(status) => Ok(reader.view().get_job(&status.step.job_id).await?),
+        None => Ok(None),
     }
-    let payload = match &job {
-        Some(job) => store::job_payload(reader.view(), job).await?,
-        None => None,
-    };
-    Ok((job, payload))
 }
 
-/// The job listings that can contain the step job of a run in `state`, in the
-/// order they are searched. A run in [`RunState::Pending`] whose step was
-/// dead-lettered outside the worker has its job in the dead-letter set until
-/// the next worker terminates the run.
-fn step_job_listings(state: &RunState) -> &'static [JobStatus] {
-    match state {
-        RunState::Running => &[JobStatus::Claimed],
-        RunState::Pending => &[JobStatus::Pending, JobStatus::Scheduled, JobStatus::Dead],
-        RunState::Cancelling => &[JobStatus::Claimed, JobStatus::Pending, JobStatus::Scheduled],
-        RunState::Terminated(termination) if termination.status == TerminalStatus::Failed => {
-            &[JobStatus::Dead]
-        }
-        RunState::Terminated(_) => &[],
+/// The sender of inbox entries to the queues of the store.
+fn inbox_sender(ctx: &StoreCtx) -> InboxSender {
+    InboxSender::new(ctx.object_store.clone(), default_inbox_path(QUEUE_DB_NAME))
+}
+
+/// The first value of `read` through a reader of the store, polled while the
+/// writer is live and for at most [`INBOX_WAIT`], or `None` without a live
+/// writer or after the wait.
+async fn await_writer<T>(
+    ctx: &StoreCtx,
+    read: impl AsyncFn(&QueueReader) -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    let reader = QueueReader::open_with_options(
+        ctx.object_store.clone(),
+        QUEUE_DB_NAME,
+        ReaderOptions::default()
+            .mode(ReaderMode::FollowLatest)
+            .manifest_poll_interval(Duration::from_secs(1)),
+    )
+    .await
+    .context("opening queue reader")?;
+    let value = poll_reader(&reader, read).await;
+    let _ = reader.close().await;
+    value
+}
+
+/// The first value of `read` through `reader`, polled while the writer is live
+/// and for at most [`INBOX_WAIT`].
+async fn poll_reader<T>(
+    reader: &QueueReader,
+    read: impl AsyncFn(&QueueReader) -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    if !writer_is_live(reader).await? {
+        return Ok(None);
     }
+    let deadline = Instant::now() + INBOX_WAIT;
+    loop {
+        if let Some(value) = read(reader).await? {
+            return Ok(Some(value));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The time of the earliest cancel command of each run that awaits a writer, in
+/// milliseconds from the Unix epoch, by run id. A command awaits a writer as an
+/// inbox entry, and then as a job of the control queue until the runtime
+/// applies it. An entry whose record committed before the deletion of its
+/// object is listed as well.
+async fn pending_cancellations(
+    ctx: &StoreCtx,
+    reader: &QueueReader,
+) -> Result<HashMap<String, u64>> {
+    use futures_util::TryStreamExt;
+    const PAGE: usize = 256;
+    let mut sent = HashMap::new();
+    let mut add = |payload: &[u8], at_ms: u64| {
+        if let Ok(taquba_workflow::Command::Cancel(cancel)) = rmp_serde::from_slice(payload) {
+            sent.entry(cancel.run_id.to_string())
+                .and_modify(|at: &mut u64| *at = (*at).min(at_ms))
+                .or_insert(at_ms);
+        }
+    };
+    let sender = inbox_sender(ctx);
+    let entries = sender
+        .pending(WORKFLOW_CONTROL_QUEUE_NAME)
+        .await
+        .context("listing the pending commands")?;
+    for pending in entries {
+        if *pending.kind() != EntryKind::Enqueue {
+            continue;
+        }
+        if let EntryRead::Entry(InboxEntry::Enqueue(entry)) = sender.read(&pending).await? {
+            add(&entry.payload, pending.sent_at_ms());
+        }
+    }
+    for status in [JobStatus::Pending, JobStatus::Scheduled, JobStatus::Claimed] {
+        let view = reader.view();
+        let mut jobs = std::pin::pin!(view.jobs(WORKFLOW_CONTROL_QUEUE_NAME, status, PAGE));
+        while let Some(job) = jobs.try_next().await? {
+            add(&job.payload, job.enqueued_at);
+        }
+    }
+    Ok(sent)
+}
+
+/// Whether the latest liveness beat of the writer is recent and not the beat of
+/// a clean close.
+async fn writer_is_live(reader: &QueueReader) -> Result<bool> {
+    let Some(beat) = reader.writer_heartbeat().await? else {
+        return Ok(false);
+    };
+    let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let age = Duration::from_millis(now_ms.saturating_sub(beat.at_ms));
+    Ok(!beat.closed && age < 2 * beat.interval)
 }
 
 /// Number of claimed jobs visible through `reader`, across both queues. Guards
@@ -610,7 +656,7 @@ async fn write_report(
     }
 }
 
-fn build_runner(cli: &Cli, sentinel: &CancelSentinel) -> Result<ResearchStepRunner> {
+fn build_runner(cli: &Cli) -> Result<ResearchStepRunner> {
     if cli.search != "tavily" {
         bail!(
             "unsupported search backend `{}`: the CLI supports only `tavily`",
@@ -619,7 +665,7 @@ fn build_runner(cli: &Cli, sentinel: &CancelSentinel) -> Result<ResearchStepRunn
     }
     let tavily = Tavily::from_env().context("TAVILY_API_KEY not set or empty")?;
     let search: Arc<dyn SearchBackend> = Arc::new(tavily);
-    let runner = match CliProvider::resolve(cli.provider) {
+    Ok(match CliProvider::resolve(cli.provider) {
         CliProvider::OpenAi => {
             let client = openai::OpenAI::from_env().context("OPENAI_API_KEY missing or invalid")?;
             ResearchStepRunner::new_openai(client, search)
@@ -635,8 +681,7 @@ fn build_runner(cli: &Cli, sentinel: &CancelSentinel) -> Result<ResearchStepRunn
             let client = ollama::Ollama::from_env().context("failed to build Ollama client")?;
             ResearchStepRunner::new_ollama(client, search)
         }
-    };
-    Ok(runner.with_cancellation(sentinel.clone()))
+    })
 }
 
 fn build_config(cli: &Cli) -> ResearchConfig {
@@ -654,29 +699,25 @@ fn build_config(cli: &Cli) -> ResearchConfig {
     }
 }
 
-/// Build a [`WorkflowRuntime`] with one claimer and a `CaptureHook` wrapped in
-/// a `TerminalReconciler` for the terminal channel, and spawn its worker task.
-/// The worker exits on Ctrl+C or on a terminal-hook signal sent through
-/// [`WorkerHandles::shutdown_tx`]. The Ctrl+C branch prints an
-/// "Interrupting..." acknowledgement before the drain of the current step.
-fn spawn_runtime(
+/// Build a [`WorkflowRuntime`] with one claimer and a `CaptureHook` for the
+/// terminal channel, and spawn its worker task. The worker exits on Ctrl+C or
+/// on a terminal-hook signal sent through [`WorkerHandles::shutdown_tx`]. The
+/// Ctrl+C branch prints an "Interrupting..." acknowledgement before the drain
+/// of the current step.
+async fn spawn_runtime(
     store_ctx: &StoreCtx,
-    sentinel: &CancelSentinel,
     queue: Arc<Queue>,
     runner: ResearchStepRunner,
     run_id: &RunId,
 ) -> Result<(
-    WorkflowRuntime<ResearchStepRunner, TerminalReconciler<CaptureHook>>,
+    WorkflowRuntime<ResearchStepRunner, CaptureHook>,
     WorkerHandles,
 )> {
     let (tx, rx) = oneshot::channel::<RunOutcome>();
-    let hook = TerminalReconciler::new(
-        queue.clone(),
-        CaptureHook {
-            run_id: run_id.clone(),
-            tx: Mutex::new(Some(tx)),
-        },
-    );
+    let hook = CaptureHook {
+        run_id: run_id.clone(),
+        tx: Mutex::new(Some(tx)),
+    };
     // Build the JobRunner the Fetching step submits FetchPage jobs to.
     let (job_runner, job_handle) = spawn_fetch_runner(&queue, &store_ctx.object_store);
     let runner = runner
@@ -691,7 +732,15 @@ fn spawn_runtime(
             .memo_prefix(WORKFLOW_MEMO_PREFIX)
             .max_concurrent_steps(1)
             .memo_retention(MEMO_RETENTION)
+            .control_queue(WORKFLOW_CONTROL_QUEUE_NAME)
             .build();
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            let _ = job_handle.shutdown().await;
+            return Err(e).context("building the workflow runtime");
+        }
+    };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let worker_runtime = runtime.clone();
@@ -711,13 +760,6 @@ fn spawn_runtime(
             .await
     });
 
-    let watcher = spawn_reply_watcher(
-        runtime.clone(),
-        queue,
-        replies(store_ctx),
-        Some(sentinel.clone()),
-    );
-
     Ok((
         runtime,
         WorkerHandles {
@@ -725,18 +767,12 @@ fn spawn_runtime(
             worker,
             shutdown_tx,
             job_handle,
-            watcher,
         },
     ))
 }
 
-async fn cmd_run(
-    cli: &Cli,
-    store_ctx: &StoreCtx,
-    sentinel: &CancelSentinel,
-    query: String,
-) -> Result<()> {
-    let runner = build_runner(cli, sentinel)?;
+async fn cmd_run(cli: &Cli, store_ctx: &StoreCtx, query: String) -> Result<()> {
+    let runner = build_runner(cli)?;
     let config = build_config(cli);
     let queue = open_queue(store_ctx).await?;
 
@@ -751,24 +787,20 @@ async fn cmd_run(
         );
     }
 
-    // The run id is generated before submit so the index entry's KV key can
-    // join the submit transaction: the run and its entry commit together.
+    // The run id is generated before submit so the terminal hook can filter
+    // notifications to this run.
     let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
-    let (runtime, handles) = spawn_runtime(store_ctx, sentinel, queue, runner, &run_id)?;
+    let (runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id).await?;
 
-    let entry = RunIndexEntry {
-        run_id: run_id.to_string(),
-        query: query.clone(),
-        submitted_at: Utc::now(),
-        terminal: None,
-    };
     let input = ResearchStepRunner::initial_state(query.clone(), config);
     runtime
         .submit(RunSpec {
             run_id: Some(run_id.clone()),
             input,
-            effects: SettlementEffects::default()
-                .kv_put(store::run_entry_key(&run_id), entry.to_bytes()),
+            options: RunOptions {
+                headers: HashMap::from([(QUERY_HEADER.to_string(), query.clone())]),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .await
@@ -781,46 +813,40 @@ async fn cmd_run(
     finalize(cli, store_ctx, handles, &run_id).await
 }
 
-async fn cmd_resume(
-    cli: &Cli,
-    store_ctx: &StoreCtx,
-    sentinel: &CancelSentinel,
-    run_id: String,
-    force: bool,
-) -> Result<()> {
+async fn cmd_resume(cli: &Cli, store_ctx: &StoreCtx, run_id: String, force: bool) -> Result<()> {
     let run_id: RunId = run_id
         .parse()
         .with_context(|| format!("invalid run id `{run_id}`"))?;
     // Guard against resuming a finished, dead-lettered or unknown run before
     // the (exclusive) writer open. A reader-side check suffices: the worker
-    // acts on the same entry and step job.
+    // acts on the same step job.
     {
         if !queue_exists(store_ctx).await? {
-            bail!("no run index entry for {run_id} (store contains no runs)");
+            bail!("no run {run_id} (store contains no runs)");
         }
-        let (claimed, waiting, entry, status) = with_reader(store_ctx, async |reader| {
+        let (claimed, waiting, status, cancel_requested) = with_reader(store_ctx, async |reader| {
             let claimed = count_claimed_jobs(reader).await?;
             let waiting = store::count_waiting_step_jobs(reader.view()).await?;
-            let entry = store::get_run(reader, &run_id).await?;
             let status = view_status(&workflow_view(store_ctx, reader), &run_id).await?;
-            Ok((claimed, waiting, entry, status))
+            let cancel_requested = pending_cancellations(store_ctx, reader)
+                .await?
+                .contains_key(run_id.as_str());
+            Ok((claimed, waiting, status, cancel_requested))
         })
         .await?;
-        let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
-        if let Some(terminal) = &entry.terminal {
-            bail!("run {run_id} is already terminal ({})", terminal.status);
-        }
         let state = status.map(|s| s.state);
         match state {
-            None => bail!("run {run_id} has no step to resume (status: unknown)"),
+            None => bail!("no run {run_id} (unknown or expired)"),
             Some(RunState::Terminated(termination)) => {
                 bail!("run {run_id} is already terminal ({})", termination.status)
             }
             Some(_) => {}
         }
-        // The waiting count includes this run's pending step.
+        // The waiting count includes this run's pending or scheduled step.
         let waiting_others = match state {
-            Some(RunState::Pending) => waiting.saturating_sub(1),
+            Some(RunState::Pending | RunState::Scheduled { .. } | RunState::Waiting { .. }) => {
+                waiting.saturating_sub(1)
+            }
             _ => waiting,
         };
         // Guard before taking the exclusive writer, as in `cmd_gc`. The caveats
@@ -838,24 +864,19 @@ async fn cmd_resume(
                  settings."
             );
         }
+        if cancel_requested {
+            eprintln!(
+                "Note: run {run_id} has a cancellation requested. Resuming applies it, and the \
+                 run ends as cancelled unless it terminates first."
+            );
+        }
     }
-    if sentinel
-        .is_set(&run_id)
-        .await
-        .context("checking cancellation sentinel")?
-    {
-        eprintln!(
-            "Note: run {run_id} has a cancellation requested. Resuming applies it: \
-             the next step will mark the run as cancelled."
-        );
-    }
-
-    let runner = build_runner(cli, sentinel)?;
+    let runner = build_runner(cli)?;
     let queue = open_queue(store_ctx).await?;
 
     // The runtime is discarded: cmd_resume does not submit new work. It starts
     // a worker to process the existing pending step.
-    let (_runtime, handles) = spawn_runtime(store_ctx, sentinel, queue, runner, &run_id)?;
+    let (_runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id).await?;
 
     println!("Resuming {run_id}...");
 
@@ -878,8 +899,6 @@ struct WorkerHandles {
     /// after the workflow worker drains. The workflow step that submits a
     /// FetchPage awaits it, so no fetch work remains then.
     job_handle: RunnerHandle,
-    /// The task that wakes a run waiting for a reply. Dropping it stops it.
-    watcher: ReplyWatcher,
 }
 
 /// Flatten a worker task's join result: a panic or abort (`JoinError`) and a
@@ -904,8 +923,6 @@ async fn finalize(
         mut worker,
         shutdown_tx,
         job_handle,
-        // Held until the run ends.
-        watcher: _watcher,
     } = handles;
     let result = tokio::select! {
         out = &mut rx => {
@@ -1015,60 +1032,56 @@ fn ellipsize(s: &str, max: usize) -> String {
     format!("{}...", &s[..cut])
 }
 
-/// One `list` row: the stored entry plus its derived status.
+/// The query of `run`, or an empty string for a run submitted without
+/// [`QUERY_HEADER`].
+fn query_of(run: &ListedRun) -> &str {
+    run.headers.get(QUERY_HEADER).map_or("", String::as_str)
+}
+
+/// An RFC 3339 rendering of `ms`, milliseconds from the Unix epoch.
+fn rfc3339(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|at| at.to_rfc3339())
+        .unwrap_or_default()
+}
+
+/// One `list` row: the listed run plus its derived status.
 struct RunRow {
-    entry: RunIndexEntry,
+    run: ListedRun,
     status: RunDisplayStatus,
 }
 
-/// Read every entry, the run state of each entry without a terminal record and
-/// the sentinels, and derive the display statuses. Rows are returned newest
-/// first.
-async fn gather_rows(store_ctx: &StoreCtx, sentinel: &CancelSentinel) -> Result<Vec<RunRow>> {
-    let rows = with_reader(store_ctx, async |reader| {
-        let view = workflow_view(store_ctx, reader);
-        let mut rows = Vec::new();
-        for entry in store::list_runs(reader).await?.into_iter().rev() {
-            // The view is read only for runs without a terminal record.
-            let state = match &entry.terminal {
-                Some(_) => None,
-                None => {
-                    let run_id: RunId = entry
-                        .run_id
-                        .parse()
-                        .with_context(|| format!("invalid run id `{}`", entry.run_id))?;
-                    view_status(&view, &run_id).await?.map(|s| s.state)
-                }
-            };
-            rows.push((entry, state));
-        }
-        Ok(rows)
+/// Read every listed run and the pending cancellations, and derive the display
+/// statuses. Rows are returned newest first.
+async fn gather_rows(store_ctx: &StoreCtx) -> Result<Vec<RunRow>> {
+    let active = |run: &ListedRun| !matches!(run.status.state, RunState::Terminated(_));
+    let (runs, cancellations) = with_reader(store_ctx, async |reader| {
+        let runs = store::list_runs(&workflow_view(store_ctx, reader)).await?;
+        let cancellations = if runs.iter().any(active) {
+            pending_cancellations(store_ctx, reader).await?
+        } else {
+            HashMap::new()
+        };
+        Ok((runs, cancellations))
     })
     .await?;
-
-    let mut out = Vec::with_capacity(rows.len());
-    for (entry, state) in rows {
-        // The sentinel is checked only for runs without a terminal record.
-        let cancel_requested = entry.terminal.is_none()
-            && sentinel
-                .is_set(&entry.run_id)
-                .await
-                .context("checking cancellation sentinel")?;
-        let status = store::derive_display_status(&entry, state.as_ref(), cancel_requested);
-        out.push(RunRow { entry, status });
-    }
-    Ok(out)
+    Ok(runs
+        .into_iter()
+        .map(|run| {
+            let cancel_requested = cancellations.contains_key(run.status.run_id.as_str());
+            let status = store::derive_display_status(&run.status.state, cancel_requested);
+            RunRow { run, status }
+        })
+        .collect())
 }
 
-async fn cmd_list(store_ctx: &StoreCtx, sentinel: &CancelSentinel) -> Result<()> {
+async fn cmd_list(store_ctx: &StoreCtx) -> Result<()> {
     if !queue_exists(store_ctx).await? {
         println!("Store: {}", store_ctx.source);
         println!("No runs yet.");
         return Ok(());
     }
-    let rows = gather_rows(store_ctx, sentinel)
-        .await
-        .context("listing runs")?;
+    let rows = gather_rows(store_ctx).await.context("listing runs")?;
     println!("Store: {}", store_ctx.source);
     if rows.is_empty() {
         println!("No runs yet.");
@@ -1079,31 +1092,37 @@ async fn cmd_list(store_ctx: &StoreCtx, sentinel: &CancelSentinel) -> Result<()>
         "RUN_ID", "STATUS", "SUBMITTED"
     );
     for row in rows {
-        let q = ellipsize(&row.entry.query, 50);
         println!(
             "{:<28} {:<24} {:<25} {}",
-            row.entry.run_id,
+            row.run.status.run_id,
             row.status.as_str(),
-            row.entry.submitted_at.to_rfc3339(),
-            q
+            rfc3339(row.run.submitted_at_ms),
+            ellipsize(query_of(&row.run), 50)
         );
     }
     Ok(())
 }
 
-async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: String) -> Result<()> {
+async fn cmd_status(store_ctx: &StoreCtx, run_id: String) -> Result<()> {
     if !queue_exists(store_ctx).await? {
-        bail!("no run index entry for {run_id} (store contains no runs)");
+        bail!("no run {run_id} (store contains no runs)");
     }
     let parsed: RunId = run_id
         .parse()
         .with_context(|| format!("invalid run id `{run_id}`"))?;
-    let (entry, status, job, payload, history) = with_reader(store_ctx, async |reader| {
-        let entry = store::get_run(reader, &run_id).await?;
-        let status = view_status(&workflow_view(store_ctx, reader), &parsed).await?;
+    let (run, progress, job, history, pending_cancel) = with_reader(store_ctx, async |reader| {
+        let view = workflow_view(store_ctx, reader);
+        let run = view.run(&parsed).await?;
+        let pending_cancel = match run.as_ref().map(|run| &run.status.state) {
+            None | Some(RunState::Cancelling { .. } | RunState::Terminated(_)) => None,
+            Some(_) => pending_cancellations(store_ctx, reader)
+                .await?
+                .remove(&run_id),
+        };
+        let progress = store::run_progress(&view, &parsed).await?;
         // The step job is read for its attempts, its last error and its
         // payload.
-        let (job, payload) = current_step(reader, &run_id, status.as_ref()).await?;
+        let job = current_step(reader, run.as_ref().map(|run| &run.status)).await?;
         // The attempt history is printed for dead-lettered steps only.
         let history = match &job {
             Some(job) if job.status == JobStatus::Dead => {
@@ -1111,45 +1130,33 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
             }
             _ => Vec::new(),
         };
-        Ok((entry, status, job, payload, history))
+        Ok((run, progress, job, history, pending_cancel))
     })
     .await?;
-    let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
+    let run = run.ok_or_else(|| anyhow!("no run {run_id} (unknown or expired)"))?;
 
-    let cancel_requested_at = if entry.terminal.is_none() {
-        sentinel
-            .requested_at(&run_id)
-            .await
-            .context("checking cancellation sentinel")?
-    } else {
-        None
+    let state = &run.status.state;
+    let cancel_requested_at_ms = match state {
+        RunState::Cancelling {
+            requested_at_ms, ..
+        } => Some(*requested_at_ms),
+        _ => pending_cancel,
     };
-    let state = status.as_ref().map(|s| &s.state);
-    let display = store::derive_display_status(&entry, state, cancel_requested_at.is_some());
+    let display = store::derive_display_status(state, cancel_requested_at_ms.is_some());
 
-    println!("run_id:       {}", entry.run_id);
-    println!("query:        {}", entry.query);
+    println!("run_id:       {run_id}");
+    println!("query:        {}", query_of(&run));
     println!("status:       {}", display.as_str());
-    println!("submitted_at: {}", entry.submitted_at.to_rfc3339());
-    if let Some(at) = cancel_requested_at {
-        println!("cancel_requested_at: {}", at.to_rfc3339());
+    println!("submitted_at: {}", rfc3339(run.submitted_at_ms));
+    if let Some(ms) = cancel_requested_at_ms {
+        println!("cancel_requested_at: {}", rfc3339(ms));
     }
-    if let Some(t) = &entry.terminal {
-        println!("finished_at:  {}", t.finished_at.to_rfc3339());
-        if let Some(err) = &t.error {
-            println!("error:        {err}");
-        }
-        println!(
-            "stats:        {} steps · {}s · {} tokens",
-            t.summary.steps_completed, t.summary.wall_time_secs, t.summary.token_usage.total_tokens,
-        );
+    if let RunState::Waiting { timeout_at_ms } = state {
+        println!("wait_ends_at: {}", rfc3339(*timeout_at_ms));
     }
-    if let Some(RunState::Terminated(termination)) = state {
-        // The index record contains the error once the terminal notification
-        // settles.
-        if entry.terminal.is_none()
-            && let Some(err) = &termination.error
-        {
+    if let RunState::Terminated(termination) = state {
+        println!("finished_at:  {}", rfc3339(termination.terminated_at_ms));
+        if let Some(err) = &termination.error {
             println!("error:        {err}");
         }
         if let Some(kind) = termination.error_kind {
@@ -1159,11 +1166,18 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
             };
             println!("error_kind:   {kind}");
         }
+        let progress = progress.unwrap_or_default();
+        let wall_time_secs = termination
+            .terminated_at_ms
+            .saturating_sub(run.submitted_at_ms)
+            / 1000;
+        println!(
+            "stats:        {} steps · {wall_time_secs}s · {} tokens",
+            progress.steps_completed, progress.token_usage.total_tokens,
+        );
     }
-    if let Some(status) = &status {
-        println!("step:         {}", status.current_step);
-    }
-    let progress = payload.as_deref().and_then(summarize_state);
+    println!("step:         {}", run.status.step.number);
+    let progress = job.as_ref().and_then(|job| summarize_state(&job.payload));
     if let Some(progress) = &progress {
         println!("phase:        {}", progress.phase);
     }
@@ -1207,7 +1221,7 @@ async fn cmd_status(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: Str
 async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) -> Result<()> {
     // The canonical report blob is written by the terminal path in every case,
     // and its absence means the run is unknown, unfinished or did not succeed.
-    // The index entry is consulted only for a more specific error message.
+    // The view is consulted only for a more specific error message.
     let key = store::report_path(&ObjectPath::default(), &run_id);
     // The body read shares the get's error handling: either call can return
     // NotFound depending on the backend.
@@ -1223,16 +1237,20 @@ async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) ->
             if !queue_exists(store_ctx).await? {
                 bail!("run {run_id} has no stored report (store contains no runs)");
             }
-            let entry = with_reader(store_ctx, async |reader| {
-                store::get_run(reader, &run_id).await
+            let parsed: RunId = run_id
+                .parse()
+                .with_context(|| format!("invalid run id `{run_id}`"))?;
+            let status = with_reader(store_ctx, async |reader| {
+                view_status(&workflow_view(store_ctx, reader), &parsed).await
             })
             .await?;
-            match entry.and_then(|e| e.terminal) {
-                None => bail!("run {run_id} has no stored report (not finished or unknown)"),
-                Some(t) => bail!(
+            match status.map(|s| s.state) {
+                None => bail!("run {run_id} has no stored report (unknown or expired)"),
+                Some(RunState::Terminated(termination)) => bail!(
                     "run {run_id} has no stored report (terminal status: {})",
-                    t.status
+                    termination.status
                 ),
+                Some(_) => bail!("run {run_id} has no stored report (not finished)"),
             }
         }
         Err(e) => return Err(e).context("reading stored report"),
@@ -1254,76 +1272,120 @@ async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) ->
 }
 
 async fn cmd_reply(store_ctx: &StoreCtx, run_id: String, text: &str) -> Result<()> {
-    // An empty signal wakes a waiting run for its cancellation.
     if text.trim().is_empty() {
         bail!("a reply must contain text");
     }
     if !queue_exists(store_ctx).await? {
-        bail!("no run index entry for {run_id} (store contains no runs)");
+        bail!("no run {run_id} (store contains no runs)");
     }
     let parsed: RunId = run_id
         .parse()
         .with_context(|| format!("invalid run id `{run_id}`"))?;
-    let payload = with_reader(store_ctx, async |reader| {
+    let (status, job) = with_reader(store_ctx, async |reader| {
         let status = view_status(&workflow_view(store_ctx, reader), &parsed).await?;
-        let (_, payload) = current_step(reader, &run_id, status.as_ref()).await?;
-        Ok(payload)
+        let job = current_step(reader, status.as_ref()).await?;
+        Ok((status, job))
     })
     .await?;
-    let question = payload
-        .as_deref()
-        .and_then(summarize_state)
+    let not_waiting = || anyhow!("run {run_id} is not waiting for a reply");
+    let status = status
+        .filter(|status| matches!(status.state, RunState::Waiting { .. }))
+        .ok_or_else(not_waiting)?;
+    let question = job
+        .and_then(|job| summarize_state(&job.payload))
         .and_then(|progress| progress.pending_question)
-        .ok_or_else(|| anyhow!("run {run_id} is not waiting for a reply"))?;
-    replies(store_ctx)
-        .put(&run_id, text)
+        .ok_or_else(not_waiting)?;
+    let entry = SignalEntry {
+        job_id: status.step.job_id,
+        payload: text.as_bytes().to_vec(),
+    };
+    let id = inbox_sender(store_ctx)
+        .send(WORKFLOW_QUEUE_NAME, entry)
         .await
-        .context("writing reply")?;
-    println!(
-        "Reply stored for {run_id} to \"{question}\". A running worker delivers it within a few \
-         seconds. If no worker is running, the reply takes effect on the next `resume`."
-    );
+        .context("writing the inbox entry")?;
+    let outcome = await_writer(store_ctx, async |reader| {
+        let record = reader.view().inbox_record(WORKFLOW_QUEUE_NAME, &id).await?;
+        Ok(record.map(|record| record.outcome))
+    })
+    .await?;
+    match outcome {
+        Some(InboxOutcome::Signal(SignalOutcome::Delivered)) => {
+            println!("Reply delivered to {run_id} for \"{question}\".");
+        }
+        Some(InboxOutcome::Signal(SignalOutcome::NotWaiting)) => bail!(
+            "run {run_id} stopped waiting before the reply arrived; the run proceeds on an \
+             assumption"
+        ),
+        Some(InboxOutcome::Rejected(reason)) => bail!("reply rejected: {reason}"),
+        Some(other) => bail!("unexpected outcome of the reply: {other:?}"),
+        None => println!(
+            "Reply sent to {run_id} for \"{question}\". It takes effect when a `run` or \
+             `resume` process applies it, unless the wait ends first."
+        ),
+    }
     Ok(())
 }
 
-/// The reply box of the runs in the store of `store_ctx`.
-fn replies(store_ctx: &StoreCtx) -> ReplyBox {
-    ReplyBox::new(store_ctx.object_store.clone(), &ObjectPath::default())
-}
-
-async fn cmd_cancel(store_ctx: &StoreCtx, sentinel: &CancelSentinel, run_id: String) -> Result<()> {
+async fn cmd_cancel(store_ctx: &StoreCtx, run_id: String) -> Result<()> {
     if !queue_exists(store_ctx).await? {
-        bail!("no run index entry for {run_id} (store contains no runs)");
+        bail!("no run {run_id} (store contains no runs)");
     }
     let parsed: RunId = run_id
         .parse()
         .with_context(|| format!("invalid run id `{run_id}`"))?;
-    let (entry, status) = with_reader(store_ctx, async |reader| {
-        let entry = store::get_run(reader, &run_id).await?;
-        let status = view_status(&workflow_view(store_ctx, reader), &parsed).await?;
-        Ok((entry, status))
+    let status = with_reader(store_ctx, async |reader| {
+        view_status(&workflow_view(store_ctx, reader), &parsed).await
     })
     .await?;
-    let entry = entry.ok_or_else(|| anyhow!("no run index entry for {run_id}"))?;
-    if let Some(t) = &entry.terminal {
-        bail!("run {run_id} is not cancellable (status: {})", t.status);
-    }
     match status.map(|s| s.state) {
         Some(RunState::Terminated(termination)) => bail!(
             "run {run_id} is not cancellable (status: {})",
             termination.status
         ),
-        None => bail!("run {run_id} is not cancellable: it has no step (status: unknown)"),
+        None => bail!("no run {run_id} (unknown or expired)"),
         Some(_) => {}
     }
-    sentinel
-        .mark(&run_id)
+    let command = taquba_workflow::Command::Cancel(CancelCommand {
+        reason: Some("Cancelled by user".to_string()),
+        ..CancelCommand::new(parsed.clone())
+    });
+    let id = inbox_sender(store_ctx)
+        .send(WORKFLOW_CONTROL_QUEUE_NAME, EnqueueEntry::from(command))
         .await
-        .context("writing cancel sentinel")?;
-    println!(
-        "Cancellation requested for {run_id}. The next step will mark the run as `cancelled`. \
-         If no worker is currently running, the cancellation takes effect on the next `resume`."
-    );
+        .context("writing the inbox entry")?;
+    // The state of the run after the runtime applies the command.
+    let settled = await_writer(store_ctx, async |reader| {
+        let view = workflow_view(store_ctx, reader);
+        let command = match view.command(WORKFLOW_CONTROL_QUEUE_NAME, &id).await? {
+            None | Some(CommandState::Queued { .. }) => return Ok(None),
+            Some(command) => command,
+        };
+        let state = view_status(&view, &parsed)
+            .await?
+            .map(|status| status.state);
+        Ok(Some((command, state)))
+    })
+    .await?;
+    match settled {
+        Some((CommandState::Failed(reason), _)) => bail!("cancellation rejected: {reason}"),
+        Some((CommandState::Rejected(reason), _)) => bail!("cancellation rejected: {reason}"),
+        Some((_, Some(RunState::Terminated(termination))))
+            if termination.status == TerminalStatus::Cancelled =>
+        {
+            println!("Run {run_id} cancelled.");
+        }
+        Some((_, Some(RunState::Terminated(_)) | None)) => {
+            bail!("run {run_id} terminated before the cancellation arrived")
+        }
+        Some(_) => println!(
+            "Cancellation of {run_id} reached its running step. The run ends as `cancelled` \
+             once the step returns."
+        ),
+        None => println!(
+            "Cancellation sent for {run_id}. It takes effect when a `run` or `resume` process \
+             applies it."
+        ),
+    }
     Ok(())
 }
 
@@ -1348,58 +1410,27 @@ async fn cmd_init(store_ctx: &StoreCtx) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_gc(
-    store_ctx: &StoreCtx,
-    sentinel: &CancelSentinel,
-    older_than_days: Option<i64>,
-    statuses: Vec<GcStatus>,
-    force: bool,
-    dry_run: bool,
-) -> Result<()> {
-    if !queue_exists(store_ctx).await? {
-        println!("No runs match the gc filter.");
-        return Ok(());
-    }
+async fn cmd_gc(store_ctx: &StoreCtx, older_than_days: Option<i64>, dry_run: bool) -> Result<()> {
+    use futures_util::TryStreamExt;
     let cutoff = older_than_days.map(|d| Utc::now() - chrono::Duration::days(d));
-    let wants_unknown = statuses.contains(&GcStatus::Unknown);
-    // The guard before the writer open uses the claimed-job count. A dry run
-    // never opens the writer.
-    let (claimed, mut candidates) = with_reader(store_ctx, async |reader| {
-        let claimed = count_claimed_jobs(reader).await?;
-        let view = workflow_view(store_ctx, reader);
-        let mut candidates = Vec::new();
-        for e in store::list_runs(reader).await? {
-            if cutoff.is_some_and(|c| e.submitted_at >= c) {
-                continue;
-            }
-            let matches_status = match &e.terminal {
-                // An entry without a terminal record is collected only through
-                // an explicit `--status unknown`, and only when the workflow
-                // store no longer contains its run. The run of any other such
-                // entry is still in the queue, and deleting the entry orphans
-                // that state.
-                None => {
-                    wants_unknown && {
-                        let run_id: RunId = e
-                            .run_id
-                            .parse()
-                            .with_context(|| format!("invalid run id `{}`", e.run_id))?;
-                        view_status(&view, &run_id).await?.is_none()
-                    }
-                }
-                Some(t) => statuses.is_empty() || statuses.contains(&GcStatus::Stored(t.status)),
-            };
-            if matches_status {
-                candidates.push(e);
-            }
-        }
-        Ok((claimed, candidates))
-    })
-    .await?;
-    candidates.sort_by_key(|e| e.submitted_at);
+    // Custom `--output` destinations are not tracked and are not deleted.
+    let prefix = ObjectPath::from(store::REPORTS_PREFIX);
+    let mut candidates: Vec<ObjectMeta> = store_ctx
+        .object_store
+        .list(Some(&prefix))
+        .try_filter(|meta| {
+            std::future::ready(
+                meta.location.extension() == Some("md")
+                    && cutoff.is_none_or(|c| meta.last_modified < c),
+            )
+        })
+        .try_collect()
+        .await
+        .context("listing the stored reports")?;
+    candidates.sort_by_key(|meta| meta.last_modified);
 
     if candidates.is_empty() {
-        println!("No runs match the gc filter.");
+        println!("No reports match the gc filter.");
         return Ok(());
     }
 
@@ -1409,70 +1440,32 @@ async fn cmd_gc(
         candidates.len(),
         if candidates.len() == 1 { "" } else { "s" }
     );
-    for e in &candidates {
-        let status = e
-            .terminal
-            .as_ref()
-            .map(|t| t.status.as_str())
-            .unwrap_or("unknown");
-        println!(
-            "  {}  {:<12}  {}  {}",
-            e.run_id,
-            status,
-            e.submitted_at.to_rfc3339(),
-            ellipsize(&e.query, 60)
-        );
+    for meta in &candidates {
+        let run_id = meta
+            .location
+            .filename()
+            .and_then(|name| name.strip_suffix(".md"))
+            .unwrap_or_default();
+        println!("  {run_id}  {}", meta.last_modified.to_rfc3339());
     }
 
     if dry_run {
-        println!("(dry-run: no entries deleted)");
+        println!("(dry-run: no reports deleted)");
         return Ok(());
     }
 
-    // Reader-side guard before taking the exclusive writer. The caveats are on
-    // `count_claimed_jobs`.
-    if claimed > 0 && !force {
-        bail!(
-            "claimed jobs are visible in this store; a worker may be live. \
-             Re-run with --force only when no `run`/`resume` process is active."
-        );
-    }
-
-    // KV deletes need the writer, which opens after the claimed-jobs guard.
-    let queue = open_queue(store_ctx).await?;
     let mut deleted = 0usize;
     let mut errors = 0usize;
-    for e in &candidates {
-        let mut row_failed = false;
-        if let Err(err) = queue.kv_delete(&store::run_entry_key(&e.run_id)).await {
-            tracing::warn!(run_id = %e.run_id, error = %err, "gc entry delete failed");
-            row_failed = true;
-        }
-        if let Err(err) = sentinel.clear(&e.run_id).await {
-            tracing::warn!(run_id = %e.run_id, error = %err, "gc sentinel delete failed");
-            row_failed = true;
-        }
-        if let Err(err) = replies(store_ctx).clear(&e.run_id).await {
-            tracing::warn!(run_id = %e.run_id, error = %err, "gc reply delete failed");
-            row_failed = true;
-        }
-        // Default-location report. Custom `--output` destinations are not
-        // tracked and are not deleted.
-        let report = store::report_path(&ObjectPath::default(), &e.run_id);
-        match store_ctx.object_store.delete(&report).await {
-            Ok(_) | Err(taquba::object_store::Error::NotFound { .. }) => {}
+    for meta in &candidates {
+        match store_ctx.object_store.delete(&meta.location).await {
+            Ok(_) | Err(taquba::object_store::Error::NotFound { .. }) => deleted += 1,
             Err(err) => {
-                tracing::warn!(path = %report, error = %err, "gc report delete failed");
-                row_failed = true;
+                tracing::warn!(path = %meta.location, error = %err, "gc report delete failed");
+                errors += 1;
             }
         }
-        if row_failed {
-            errors += 1;
-        } else {
-            deleted += 1;
-        }
     }
-    println!("Deleted {deleted} run(s); {errors} error(s).");
+    println!("Deleted {deleted} report(s); {errors} error(s).");
     Ok(())
 }
 
@@ -1492,8 +1485,7 @@ impl TerminalHook for CaptureHook {
         // Terminal notifications are durable jobs: one left unclaimed by a
         // terminated process is delivered to the next worker on the queue. The
         // hook acks and logs a foreign notification without consuming its
-        // outcome. The step settlement or the wrapping `TerminalReconciler`
-        // stages that run's terminal index entry.
+        // outcome.
         if outcome.run_id != self.run_id {
             tracing::warn!(
                 run_id = %outcome.run_id,
@@ -1515,8 +1507,49 @@ impl TerminalHook for CaptureHook {
 
 #[cfg(test)]
 mod tests {
-    use super::{WORKFLOW_MEMO_PREFIX, ellipsize, resolve_store, store_options};
-    use taquba_workflow::{MemoStore, RunId};
+    use std::sync::Arc;
+
+    use super::{
+        StoreCtx, WORKFLOW_CONTROL_QUEUE_NAME, WORKFLOW_MEMO_PREFIX, ellipsize, inbox_sender,
+        open_queue, open_reader, pending_cancellations, resolve_store, store_options,
+    };
+    use taquba::EnqueueEntry;
+    use taquba::object_store::memory::InMemory;
+    use taquba_workflow::{CancelCommand, Command, MemoStore, RunId};
+
+    #[tokio::test]
+    async fn pending_cancellations_include_inbox_entries_and_control_jobs() {
+        let ctx = StoreCtx {
+            object_store: Arc::new(InMemory::new()),
+            source: "memory".to_string(),
+        };
+        let cancel = |run_id: &str| {
+            EnqueueEntry::from(Command::Cancel(CancelCommand::new(
+                RunId::new(run_id).unwrap(),
+            )))
+        };
+        let queue = open_queue(&ctx).await.unwrap();
+        let sender = inbox_sender(&ctx);
+        sender
+            .send(WORKFLOW_CONTROL_QUEUE_NAME, cancel("01APPLIED"))
+            .await
+            .unwrap();
+        // The pass turns the first entry into a job of the control queue, and
+        // no runtime applies the job. The second entry follows the close, so it
+        // stays in the inbox.
+        queue.apply_inbox_now().await.unwrap();
+        Arc::into_inner(queue).unwrap().close().await.unwrap();
+        sender
+            .send(WORKFLOW_CONTROL_QUEUE_NAME, cancel("01SENT"))
+            .await
+            .unwrap();
+
+        let reader = open_reader(&ctx).await.unwrap();
+        let pending = pending_cancellations(&ctx, &reader).await.unwrap();
+        let mut run_ids: Vec<&str> = pending.keys().map(String::as_str).collect();
+        run_ids.sort_unstable();
+        assert_eq!(run_ids, ["01APPLIED", "01SENT"]);
+    }
 
     #[tokio::test]
     async fn a_url_store_keeps_the_memos_under_its_path() {

@@ -69,30 +69,33 @@ cloud URL.
 Other subcommands:
 
 - `list`, `status <id>`, `show <id>`, `cancel <id>`: inspect and manage the
-  recorded runs. `show <id> --output <path-or-url>` writes the report to that
-  location in place of stdout.
+  runs. A run stays listed until 7 days after it terminates, and its report
+  stays until `gc` deletes it. `show <id> --output <path-or-url>` writes the
+  report to that location in place of stdout.
 - `reply <id> "<text>"`: reply to the question of a run that waits for one.
 - `init`: check that the configured store is reachable, with valid credentials
   and an existing bucket. Run it before the first submission against a fresh
   cloud bucket.
-- `gc --older-than-days N [--status S]... [--dry-run]`: delete recorded runs and
-  their reports at the default location. `--status` accepts `succeeded`,
-  `failed`, `cancelled` and `unknown`. Only `unknown` deletes a run without a
-  terminal record, and it selects the entries whose run the workflow store no
-  longer contains.
+- `gc [--older-than-days N] [--dry-run]`: delete the reports at the default
+  location, or only those older than `N` days.
 
 With `--clarification-wait <SECONDS>`, the agent of the investigating step can
 ask the user a single question per run. The run then waits up to that many
 seconds for `reply`, and `status` prints the question. After the wait, the agent
 proceeds on an assumption that it states in its findings.
 
+`reply` and `cancel` write an entry to the inbox of the queue (a prefix of
+request objects separate from the queue), and the `run` or `resume` process
+applies it within 2 seconds. Without such a process, the entry takes effect at
+the next `resume`.
+
 See `taquba-research --help` for the full flag list.
 
 ## Storage
 
-`--store` (or `TAQUBA_RESEARCH_STORE`) sets the location of the SlateDB queue,
-the run index and, by default, the rendered report. It accepts either a local
-path or an object-storage URL:
+`--store` (or `TAQUBA_RESEARCH_STORE`) sets the location of the SlateDB queue
+and, by default, the rendered report. It accepts either a local path or an
+object-storage URL:
 
 ```bash
 # Local (default at ~/.taquba-research/)

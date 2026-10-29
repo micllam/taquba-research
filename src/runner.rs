@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rig_agent::agent::{AgentBuilder, CompletionCall, PromptResponse, TypedPromptResponse};
 use rig_agent::completion::{PromptError, StructuredOutputError};
 use rig_core::DynModel;
@@ -35,18 +35,11 @@ use crate::state::{
     Clarification, Phase, Reply, ResearchConfig, ResearchState, SourceQuote, Summary,
     SynthesisOutput, TokenUsage,
 };
-use crate::store::{
-    CancelSentinel, RunIndexEntry, RunSummary, StoredStatus, TerminalRecord,
-    clarification_signal_key,
-};
+use crate::store::{PROGRESS_KEY, RunProgress};
 
 /// Preamble applied to every Rig agent built by the runner. The per-phase
 /// prompts contain the task-specific instructions.
 pub(crate) const AGENT_PREAMBLE: &str = "Be precise and concise.";
-/// Cadence at which a step polls its cancellation sentinel while phase work is
-/// in flight. Sets the upper bound on how long an LLM or HTTP call keeps
-/// running after the CLI's `cancel` lands.
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Upper bound on a single LLM completion call. The step's lease is extended by
 /// this much before the call is issued, so the delivery is not re-queued
@@ -83,7 +76,6 @@ const MEMO_KEY_WRITING: &str = "writing";
 pub struct ResearchStepRunner {
     provider: Arc<ProviderClient>,
     search: Arc<dyn SearchBackend>,
-    cancel: Option<CancelSentinel>,
     job_runner: Option<JobRunner>,
     queue: Option<Arc<Queue>>,
     report_store: Option<(Arc<dyn ObjectStore>, Path)>,
@@ -142,21 +134,10 @@ impl ResearchStepRunner {
         Self {
             provider: Arc::new(provider),
             search,
-            cancel: None,
             job_runner: None,
             queue: None,
             report_store: None,
         }
-    }
-
-    /// Attach a [`CancelSentinel`] used to check for cross-process cancellation
-    /// throughout each step. The runner polls the sentinel concurrently with
-    /// the phase work, so a long-running LLM or HTTP call is dropped within ~1
-    /// second of the sentinel appearing. When unset, the runner ignores
-    /// cancellation.
-    pub fn with_cancellation(mut self, sentinel: CancelSentinel) -> Self {
-        self.cancel = Some(sentinel);
-        self
     }
 
     /// Attach the [`JobRunner`] the fetching phase submits per-URL `FetchPage`
@@ -204,141 +185,41 @@ impl StepRunner for ResearchStepRunner {
         let mut state = ResearchState::from_bytes(&step.payload)
             .map_err(|e| StepError::permanent(format!("malformed research state: {e}")))?;
 
-        // Cross-process cancellation: the CLI's `cancel` subcommand writes a
-        // sentinel object that the runner watches for. The in-process registry
-        // of the workflow runtime does not see the cross-process cancel, so the
-        // runner returns it as `StepOutcome::Cancel`. The watcher races the
-        // phase work, so a long LLM or HTTP call is dropped within
-        // `CANCEL_POLL_INTERVAL` of the sentinel appearing.
-        let work = self.dispatch_phase(step, &mut state);
-        let outcome = match &self.cancel {
-            Some(sentinel) => {
-                tokio::select! {
-                    res = work => res?,
-                    () = poll_cancelled(sentinel, &step.run_id) => StepOutcome::Cancel {
-                        reason: "Cancelled by user".to_string(),
-                    },
-                }
-            }
-            None => work.await?,
+        // The token fires when the runtime cancels the run, so a slow LLM or
+        // HTTP call is dropped at once. A redelivery of a cancelled step starts
+        // with the token cancelled and skips the phase work.
+        let outcome = tokio::select! {
+            biased;
+            () = step.cancel_token.cancelled() => StepOutcome::Cancel {
+                reason: "Cancelled by user".to_string(),
+            },
+            res = self.dispatch_phase(step, &mut state) => res?,
         };
-        // The terminal index entry for a cancellation joins the settlement
-        // transaction of the Cancel outcome. The Succeed entry is staged in
-        // `dispatch_phase`, where the report is available.
-        if let StepOutcome::Cancel { reason } = &outcome {
-            stage_entry(step, &cancelled_entry(step, &state, reason))?;
-        }
+        stage_progress(step, &state)?;
         Ok(outcome)
     }
 }
 
-/// Resolves when the run's cancellation sentinel appears. Polls at
-/// [`CANCEL_POLL_INTERVAL`] cadence. The initial check fires immediately, so an
-/// already-cancelled run short-circuits before any phase work runs.
-async fn poll_cancelled(sentinel: &CancelSentinel, run_id: &str) {
-    loop {
-        match sentinel.is_set(run_id).await {
-            Ok(true) => return,
-            Ok(false) => {}
-            // Logged and retried at the poll cadence. The check must not fail
-            // phase work.
-            Err(e) => tracing::warn!(error = %e, "cancellation sentinel check failed"),
-        }
-        tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
-    }
-}
-
-/// The wait of a run for the reply of the user.
-struct Wait {
-    /// The correlation key of a signal that ends the wait.
-    key: String,
-    /// The end of the wait without a signal.
-    timeout: Duration,
-}
-
-/// How a step after a wait resolves the question asked at `asked_at`.
-#[derive(Debug, PartialEq, Eq)]
-enum Resolution {
-    Reply(Reply),
-    /// The run waits again for the rest of the wait.
-    Wait(Duration),
-}
-
-/// A signal with text is the reply, and a step without a signal follows the end
-/// of the wait, so the agent proceeds on an assumption. An empty signal wakes
-/// the step for a cancellation, and the run waits for the rest of `wait` at
-/// `now`.
-fn resolve_reply(
-    signal: Option<&[u8]>,
-    asked_at: DateTime<Utc>,
-    wait: Duration,
-    now: DateTime<Utc>,
-) -> Resolution {
+/// The reply that the signal of the step after a wait contains. A step without
+/// a signal follows the end of the wait, so the agent proceeds on an
+/// assumption.
+fn resolve_reply(signal: Option<&[u8]>) -> Reply {
     match signal {
-        None => Resolution::Reply(Reply::Assumed),
-        Some(payload) if !payload.is_empty() => {
-            Resolution::Reply(Reply::Given(String::from_utf8_lossy(payload).into_owned()))
-        }
-        Some(_) => {
-            let waited = (now - asked_at).to_std().unwrap_or_default();
-            match wait.checked_sub(waited) {
-                Some(rest) if !rest.is_zero() => Resolution::Wait(rest),
-                _ => Resolution::Reply(Reply::Assumed),
-            }
-        }
+        Some(payload) => Reply::Given(String::from_utf8_lossy(payload).into_owned()),
+        None => Reply::Assumed,
     }
 }
 
-/// Terminal index entry for a successful run, with a summary of the report's
-/// stats.
-fn succeeded_entry(step: &Step, state: &ResearchState, report: &Report) -> RunIndexEntry {
-    RunIndexEntry {
-        run_id: step.run_id.to_string(),
-        query: state.query.clone(),
-        submitted_at: state.started_at,
-        terminal: Some(TerminalRecord {
-            status: StoredStatus::Succeeded,
-            error: None,
-            finished_at: report.stats.finished_at,
-            summary: RunSummary {
-                steps_completed: report.stats.steps_completed,
-                wall_time_secs: report.stats.wall_time.as_secs(),
-                token_usage: report.stats.token_usage,
-            },
-        }),
-    }
-}
-
-/// Terminal index entry for a cancelled run. The summary reflects progress up
-/// to the cancellation.
-fn cancelled_entry(step: &Step, state: &ResearchState, reason: &str) -> RunIndexEntry {
-    let finished_at = Utc::now();
-    let wall_time = (finished_at - state.started_at)
-        .to_std()
-        .unwrap_or_default();
-    RunIndexEntry {
-        run_id: step.run_id.to_string(),
-        query: state.query.clone(),
-        submitted_at: state.started_at,
-        terminal: Some(TerminalRecord {
-            status: StoredStatus::Cancelled,
-            error: Some(reason.to_string()),
-            finished_at,
-            summary: RunSummary {
-                steps_completed: state.steps_completed,
-                wall_time_secs: wall_time.as_secs(),
-                token_usage: state.token_usage,
-            },
-        }),
-    }
-}
-
-/// Stage `entry` on the step's effects handle, so it commits in the same
-/// transaction as the terminal outcome's settlement.
-fn stage_entry(step: &Step, entry: &RunIndexEntry) -> Result<(), StepError> {
+/// Stage the progress of `state` on the step's effects handle, so it commits
+/// with the settlement of the step.
+fn stage_progress(step: &Step, state: &ResearchState) -> Result<(), StepError> {
+    let progress = RunProgress {
+        steps_completed: state.steps_completed,
+        token_usage: state.token_usage,
+    };
     step.effects
-        .put(crate::store::run_entry_key(&entry.run_id), entry.to_bytes())
-        .map_err(|e| StepError::permanent(format!("staging run index entry: {e}")))
+        .put_run_kv(PROGRESS_KEY, progress.to_bytes())
+        .map_err(|e| StepError::permanent(format!("staging run progress: {e}")))
 }
 
 /// Drop-guard that fires `Queue::cancel` on a non-empty set of in-flight job
@@ -399,7 +280,7 @@ struct SynthesisDocument {
 impl ResearchStepRunner {
     /// Runs the phase indicated by `state.phase` and returns the resulting
     /// `StepOutcome`. Separated from `run_step` so it can be raced against the
-    /// cancellation watcher via `tokio::select!`.
+    /// cancellation token of the step via `tokio::select!`.
     async fn dispatch_phase(
         &self,
         step: &Step,
@@ -413,11 +294,7 @@ impl ResearchStepRunner {
             Phase::Investigating => {
                 // A wait is not a completed step.
                 if let Some(wait) = self.run_investigating(step, state).await? {
-                    return Ok(StepOutcome::continue_on_signal(
-                        state.to_bytes(),
-                        wait.key,
-                        wait.timeout,
-                    ));
+                    return Ok(StepOutcome::continue_on_signal(state.to_bytes(), wait));
                 }
             }
             Phase::Synthesizing => self.run_synthesizing(step, state).await?,
@@ -427,7 +304,7 @@ impl ResearchStepRunner {
                 // record saying succeeded implies the report exists. A
                 // redelivered step rewrites the same memoized bytes.
                 self.put_report(step, &report).await?;
-                stage_entry(step, &succeeded_entry(step, state, &report))?;
+                state.steps_completed = report.stats.steps_completed;
                 let record = RunRecord {
                     report: Some(report),
                     run_id: step.run_id.to_string(),
@@ -677,7 +554,7 @@ impl ResearchStepRunner {
         &self,
         step: &Step,
         state: &mut ResearchState,
-    ) -> Result<Option<Wait>, StepError> {
+    ) -> Result<Option<Duration>, StepError> {
         let turns = state.config.investigation_turns;
         if turns == 0 {
             state.phase = Phase::Synthesizing;
@@ -689,31 +566,16 @@ impl ResearchStepRunner {
             .ok_or_else(|| StepError::permanent("investigating phase requires a JobRunner"))?;
         let run_id = step.run_id.to_string();
         let max_chars = state.config.max_page_chars;
-        let wait_for = |timeout| Wait {
-            key: clarification_signal_key(&run_id),
-            timeout,
-        };
 
         let asking = match (
-            state
-                .config
-                .clarification_wait_secs
-                .map(Duration::from_secs),
+            state.config.clarification_wait_secs,
             &mut state.clarification,
         ) {
             (None, _) => Asking::Off,
             (Some(_), None) => Asking::Open,
-            (Some(wait), Some(clarification)) => {
+            (Some(_), Some(clarification)) => {
                 if clarification.reply.is_none() {
-                    match resolve_reply(
-                        step.signal.as_deref(),
-                        clarification.asked_at,
-                        wait,
-                        Utc::now(),
-                    ) {
-                        Resolution::Reply(reply) => clarification.reply = Some(reply),
-                        Resolution::Wait(rest) => return Ok(Some(wait_for(rest))),
-                    }
+                    clarification.reply = Some(resolve_reply(step.signal.as_deref()));
                 }
                 Asking::Replied(clarification.clone())
             }
@@ -755,7 +617,7 @@ impl ResearchStepRunner {
                     reply: None,
                 });
                 let wait = state.config.clarification_wait_secs.unwrap_or_default();
-                return Ok(Some(wait_for(Duration::from_secs(wait))));
+                return Ok(Some(Duration::from_secs(wait)));
             }
             Investigated::Finished {
                 findings,
@@ -1311,10 +1173,6 @@ mod tests {
     use taquba::object_store::path::Path;
     use taquba_workflow::{MemoStore, RunId, StepErrorKind};
 
-    fn test_sentinel() -> CancelSentinel {
-        CancelSentinel::new(Arc::new(InMemory::new()), &Path::default())
-    }
-
     /// Build a `Step` with a fresh in-memory `Memo` and otherwise inert fields,
     /// suitable for exercising memo-using helpers.
     fn test_step(run_id: &str, step_number: u32) -> Step {
@@ -1354,79 +1212,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_cancelled_returns_immediately_if_already_cancelled() {
-        let sentinel = test_sentinel();
-        sentinel.mark("run-1").await.unwrap();
+    async fn a_cancelled_step_returns_cancel_without_phase_work() {
+        let runner = ResearchStepRunner::new_ollama(
+            ollama::Ollama::from_env().unwrap(),
+            Arc::new(crate::search::Tavily::new("unused")),
+        );
+        let mut step = test_step("run-1", 0);
+        step.payload = ResearchState::new("q", ResearchConfig::new("m")).to_bytes();
+        step.cancel_token.cancel();
 
-        // Initial check fires before any sleep, so this returns without
-        // yielding to the timer.
-        poll_cancelled(&sentinel, "run-1").await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn poll_cancelled_resolves_after_sentinel_appears() {
-        let sentinel = test_sentinel();
-        let writer = sentinel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            writer.mark("run-2").await.unwrap();
-        });
-
-        // With virtual time the polling loop's sleep auto-advances when the
-        // runtime is idle.
-        poll_cancelled(&sentinel, "run-2").await;
-    }
-
-    #[test]
-    fn cancelled_entry_records_reason_and_progress() {
-        let step = test_step("run-3", 4);
-        let mut state = ResearchState::new("q", ResearchConfig::new("m"));
-        state.steps_completed = 4;
-        state.token_usage.input_tokens = 10;
-
-        let entry = cancelled_entry(&step, &state, "Cancelled by user");
-
-        assert_eq!(entry.run_id, "run-3");
-        assert_eq!(entry.query, "q");
-        assert_eq!(entry.submitted_at, state.started_at);
-        let t = entry.terminal.expect("terminal record");
-        assert_eq!(t.status, StoredStatus::Cancelled);
-        assert_eq!(t.error.as_deref(), Some("Cancelled by user"));
-        assert_eq!(t.summary.steps_completed, 4);
-        assert_eq!(t.summary.token_usage.input_tokens, 10);
-    }
-
-    #[test]
-    fn succeeded_entry_summarizes_report_stats() {
-        let step = test_step("run-4", 9);
-        let state = ResearchState::new("q", ResearchConfig::new("m"));
-        let stats = crate::report::RunStats {
-            steps_completed: 9,
-            wall_time: Duration::from_secs(120),
-            started_at: state.started_at,
-            finished_at: Utc::now(),
-            token_usage: TokenUsage {
-                input_tokens: 5,
-                ..TokenUsage::default()
-            },
-            output_truncated: false,
-        };
-        let report = Report {
-            run_id: "run-4".to_string(),
-            query: "q".to_string(),
-            markdown: String::new(),
-            citations: Vec::new(),
-            stats,
-        };
-
-        let entry = succeeded_entry(&step, &state, &report);
-
-        let t = entry.terminal.expect("terminal record");
-        assert_eq!(t.status, StoredStatus::Succeeded);
-        assert!(t.error.is_none());
-        assert_eq!(t.summary.steps_completed, 9);
-        assert_eq!(t.summary.wall_time_secs, 120);
-        assert_eq!(t.summary.token_usage.input_tokens, 5);
+        // The planning phase would call the model, and the runner does not
+        // reach it.
+        let outcome = runner.run_step(&step).await.unwrap();
+        assert!(matches!(outcome, StepOutcome::Cancel { .. }));
     }
 
     #[test]
@@ -1668,8 +1466,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_index_entry_joins_submit_and_succeed_settlements() {
-        use crate::store::run_entry_key;
+    async fn the_writing_step_commits_its_progress_and_writes_the_report() {
+        use crate::store::run_progress;
         use taquba_workflow::{RunSpec, TerminalStatus, WorkflowRuntime};
 
         let object_store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -1707,7 +1505,8 @@ mod tests {
             .queue_name("test-workflow")
             .memo_prefix("test-memo")
             .max_concurrent_steps(1)
-            .build();
+            .build()
+            .unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let worker_runtime = runtime.clone();
         let worker = tokio::spawn(async move {
@@ -1718,55 +1517,25 @@ mod tests {
                 .await
         });
 
-        let entry = RunIndexEntry {
-            run_id: run_id.to_string(),
-            query: "a query".to_string(),
-            submitted_at: state.started_at,
-            terminal: None,
-        };
         runtime
             .submit(RunSpec {
                 run_id: Some(run_id.clone()),
                 input: state.to_bytes(),
-                effects: taquba::SettlementEffects::default()
-                    .kv_put(run_entry_key(&run_id), entry.to_bytes()),
                 ..Default::default()
             })
             .await
             .unwrap();
-
-        // The submit-time entry is readable as soon as submit returns.
-        let bytes = queue
-            .view()
-            .kv_get(&run_entry_key(&run_id))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            RunIndexEntry::from_bytes(&bytes)
-                .unwrap()
-                .terminal
-                .is_none()
-        );
 
         let outcome = rx.await.unwrap();
         assert_eq!(outcome.status, TerminalStatus::Succeeded);
         let _ = shutdown_tx.send(());
         let _ = worker.await;
 
-        // The terminal entry was applied by the Succeed settlement.
-        let bytes = queue
-            .view()
-            .kv_get(&run_entry_key(&run_id))
+        let progress = run_progress(runtime.view(), &run_id)
             .await
             .unwrap()
-            .unwrap();
-        let stored = RunIndexEntry::from_bytes(&bytes).unwrap();
-        assert_eq!(stored.query, "a query");
-        let terminal = stored.terminal.expect("terminal record");
-        assert_eq!(terminal.status, StoredStatus::Succeeded);
-        assert!(terminal.error.is_none());
-        assert_eq!(terminal.summary.steps_completed, 1);
+            .expect("the Succeed settlement commits the progress");
+        assert_eq!(progress.steps_completed, 1);
 
         // The Writing step wrote the canonical report blob before it settled.
         let blob = object_store
@@ -1842,27 +1611,10 @@ mod tests {
 
     #[test]
     fn resolve_reply_reads_the_signal_of_the_wait() {
-        let asked_at = Utc::now();
-        let wait = Duration::from_secs(60);
-        let before_end = asked_at + chrono::Duration::seconds(45);
-        let at_end = asked_at + chrono::Duration::seconds(60);
-
         assert_eq!(
-            resolve_reply(Some(b"the 2024 edition"), asked_at, wait, at_end),
-            Resolution::Reply(Reply::Given("the 2024 edition".to_string()))
+            resolve_reply(Some(b"the 2024 edition")),
+            Reply::Given("the 2024 edition".to_string())
         );
-        assert_eq!(
-            resolve_reply(None, asked_at, wait, before_end),
-            Resolution::Reply(Reply::Assumed)
-        );
-        // An empty signal wakes the step for a cancellation.
-        assert_eq!(
-            resolve_reply(Some(b""), asked_at, wait, before_end),
-            Resolution::Wait(Duration::from_secs(15))
-        );
-        assert_eq!(
-            resolve_reply(Some(b""), asked_at, wait, at_end),
-            Resolution::Reply(Reply::Assumed)
-        );
+        assert_eq!(resolve_reply(None), Reply::Assumed);
     }
 }
