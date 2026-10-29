@@ -47,11 +47,11 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "1"
+thiserror = "2"
 ulid = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 anyhow = "1"
-dirs = "5"
+dirs = "7"
 futures-util = { version = "0.3", default-features = false }
 schemars = "1"
 html2text = "0.17"
