@@ -26,11 +26,10 @@ pub struct ResearchConfig {
     /// Hard cap on URLs queued for fetching. Search results beyond this cap are
     /// dropped before the fetch phase starts.
     pub max_sources: usize,
-    /// Model identifier passed to Rig. Provider-specific, such as
-    /// `"gpt-5-nano"` for OpenAI or `"claude-haiku-4-5"` for Anthropic. Must be
-    /// a valid identifier for whichever provider the runner was built against
-    /// (see [`crate::ResearchStepRunner::new_openai`] /
-    /// [`crate::ResearchStepRunner::new_anthropic`]).
+    /// Model identifier that the runner resolves to a Rig model for each call.
+    /// Provider-specific, such as `"gpt-5-nano"` for OpenAI or
+    /// `"claude-haiku-4-5"` for Anthropic. It must be a valid identifier for
+    /// the models of the runner.
     pub model: String,
     /// Maximum tokens per single LLM call. When `None`, no explicit limit is
     /// sent and the provider's or model's default applies.

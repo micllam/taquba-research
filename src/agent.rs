@@ -19,7 +19,9 @@ use tokio::sync::oneshot;
 
 use crate::Report;
 use crate::fetch_job::spawn_fetch_runner;
-use crate::runner::{ProviderClient, ResearchStepRunner, RunRecord};
+use crate::runner::{
+    Models, ResearchStepRunner, RunRecord, anthropic_models, ollama_models, openai_models,
+};
 use crate::search::SearchBackend;
 use crate::state::ResearchConfig;
 use crate::store::{
@@ -218,7 +220,7 @@ impl ResearchAgent {
 /// process.
 #[derive(Default)]
 pub struct ResearchAgentBuilder {
-    provider: Option<ProviderClient>,
+    models: Option<Models>,
     search: Option<Arc<dyn SearchBackend>>,
     config: Option<ResearchConfig>,
     inbox: bool,
@@ -227,19 +229,19 @@ pub struct ResearchAgentBuilder {
 impl ResearchAgentBuilder {
     /// Set the Rig OpenAI client.
     pub fn openai(mut self, client: openai::OpenAI) -> Self {
-        self.provider = Some(ProviderClient::OpenAi(Box::new(client)));
+        self.models = Some(openai_models(client));
         self
     }
 
     /// Set the Rig Anthropic client.
     pub fn anthropic(mut self, client: anthropic::Anthropic) -> Self {
-        self.provider = Some(ProviderClient::Anthropic(client));
+        self.models = Some(anthropic_models(client));
         self
     }
 
     /// Set the Rig Ollama client, for local models.
     pub fn ollama(mut self, client: ollama::Ollama) -> Self {
-        self.provider = Some(ProviderClient::Ollama(client));
+        self.models = Some(ollama_models(client));
         self
     }
 
@@ -273,7 +275,7 @@ impl ResearchAgentBuilder {
 
     /// Finalise the builder.
     pub fn build(self) -> Result<ResearchAgent> {
-        let provider = self.provider.ok_or_else(|| {
+        let models = self.models.ok_or_else(|| {
             anyhow!(
                 "ResearchAgent requires a provider client (call .openai(), .anthropic(), or .ollama())"
             )
@@ -285,7 +287,7 @@ impl ResearchAgentBuilder {
             .config
             .ok_or_else(|| anyhow!("ResearchAgent requires a ResearchConfig"))?;
         Ok(ResearchAgent {
-            runner: ResearchStepRunner::from_provider(provider, search),
+            runner: ResearchStepRunner::from_models(models, search),
             config,
             inbox: self.inbox,
         })

@@ -34,6 +34,8 @@ The CLI never selects Ollama automatically, so an Ollama run requires
 exposes `ResearchStepRunner::new_openai`, `ResearchStepRunner::new_anthropic`
 and `ResearchStepRunner::new_ollama`, and the matching `.openai(...)`,
 `.anthropic(...)` and `.ollama(...)` builder methods on `ResearchAgent`.
+`ResearchStepRunner::new` builds the runner from a function that returns the Rig
+model of a model identifier.
 
 Anthropic runs pass the fetched pages as citation-enabled document blocks during
 synthesis. When Claude returns citation metadata, the final report includes the

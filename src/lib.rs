@@ -41,6 +41,8 @@
 //!   [`ResearchStepRunner::new_ollama`] build the runner, and the
 //!   `.openai(...)`, `.anthropic(...)` and `.ollama(...)` methods of
 //!   [`ResearchAgent::builder`] configure the agent.
+//!   [`ResearchStepRunner::new`] builds the runner from a function that returns
+//!   the Rig model of a model identifier.
 //! - **Citations**: Anthropic runs pass the fetched pages as citation-enabled
 //!   document blocks during synthesis. When Claude returns citation metadata,
 //!   the final report includes the cited source excerpts. OpenAI and Ollama

@@ -74,29 +74,29 @@ const MEMO_KEY_WRITING: &str = "writing";
 /// [`WorkflowRuntime`]: taquba_workflow::WorkflowRuntime
 #[derive(Clone)]
 pub struct ResearchStepRunner {
-    provider: Arc<ProviderClient>,
+    models: Models,
     search: Arc<dyn SearchBackend>,
     job_runner: Option<JobRunner>,
     queue: Option<Arc<Queue>>,
     report_store: Option<(Arc<dyn ObjectStore>, Path)>,
 }
 
-/// Per-provider LLM client.
-pub(crate) enum ProviderClient {
-    OpenAi(Box<openai::OpenAI>),
-    Anthropic(anthropic::Anthropic),
-    Ollama(ollama::Ollama),
+/// The lookup of a completion model by the model identifier of a run.
+pub(crate) type Models = Arc<dyn Fn(&str) -> DynModel<Completion> + Send + Sync>;
+
+/// The completion models of an OpenAI client.
+pub(crate) fn openai_models(client: openai::OpenAI) -> Models {
+    Arc::new(move |model| client.completion(model).into())
 }
 
-impl ProviderClient {
-    /// The completion model `model` of this provider.
-    fn completion_model(&self, model: &str) -> DynModel<Completion> {
-        match self {
-            Self::OpenAi(client) => client.completion(model).into(),
-            Self::Anthropic(client) => client.completion(model).into(),
-            Self::Ollama(client) => client.native_completion(model).into(),
-        }
-    }
+/// The completion models of an Anthropic client.
+pub(crate) fn anthropic_models(client: anthropic::Anthropic) -> Models {
+    Arc::new(move |model| client.completion(model).into())
+}
+
+/// The native completion models of an Ollama client.
+pub(crate) fn ollama_models(client: ollama::Ollama) -> Models {
+    Arc::new(move |model| client.native_completion(model).into())
 }
 
 /// What the terminal hook persists for a finished run: the final report and the
@@ -114,25 +114,34 @@ pub struct RunRecord {
 }
 
 impl ResearchStepRunner {
+    /// Build a runner from a lookup of completion models and a search backend.
+    /// Each step calls `models` with [`ResearchConfig::model`] of its run.
+    pub fn new(
+        models: impl Fn(&str) -> DynModel<Completion> + Send + Sync + 'static,
+        search: Arc<dyn SearchBackend>,
+    ) -> Self {
+        Self::from_models(Arc::new(models), search)
+    }
+
     /// Build a runner from a Rig OpenAI client and a search backend.
     pub fn new_openai(client: openai::OpenAI, search: Arc<dyn SearchBackend>) -> Self {
-        Self::from_provider(ProviderClient::OpenAi(Box::new(client)), search)
+        Self::from_models(openai_models(client), search)
     }
 
     /// Build a runner from a Rig Anthropic client and a search backend.
     pub fn new_anthropic(client: anthropic::Anthropic, search: Arc<dyn SearchBackend>) -> Self {
-        Self::from_provider(ProviderClient::Anthropic(client), search)
+        Self::from_models(anthropic_models(client), search)
     }
 
     /// Build a runner from a Rig Ollama client and a search backend, for local
     /// models.
     pub fn new_ollama(client: ollama::Ollama, search: Arc<dyn SearchBackend>) -> Self {
-        Self::from_provider(ProviderClient::Ollama(client), search)
+        Self::from_models(ollama_models(client), search)
     }
 
-    pub(crate) fn from_provider(provider: ProviderClient, search: Arc<dyn SearchBackend>) -> Self {
+    pub(crate) fn from_models(models: Models, search: Arc<dyn SearchBackend>) -> Self {
         Self {
-            provider: Arc::new(provider),
+            models,
             search,
             job_runner: None,
             queue: None,
@@ -584,7 +593,7 @@ impl ResearchStepRunner {
 
         let can_ask = !matches!(asking, Asking::Off);
         let investigator = Investigator {
-            model: self.provider.completion_model(&state.config.model),
+            model: (self.models)(&state.config.model),
             search: self.search.clone(),
             fetch: FetchPageTool {
                 jobs: jobs.clone(),
@@ -800,7 +809,7 @@ impl ResearchStepRunner {
         prompt: &str,
         state: &mut ResearchState,
     ) -> Result<PromptOutput, StepError> {
-        let model = self.provider.completion_model(&state.config.model);
+        let model = (self.models)(&state.config.model);
         let max_tokens = state.config.max_tokens_per_call;
         let response = under_lease(
             lease,
@@ -823,10 +832,10 @@ impl ResearchStepRunner {
         source_documents: &[SynthesisDocument],
         state: &mut ResearchState,
     ) -> Result<(String, Vec<SourceQuote>), StepError> {
-        match self.provider.as_ref() {
-            ProviderClient::Anthropic(_) if !source_documents.is_empty() => {
+        let model = (self.models)(&state.config.model);
+        match model.name() {
+            anthropic::PROVIDER_NAME if !source_documents.is_empty() => {
                 let message = anthropic_document_message(prompt, source_documents);
-                let model = self.provider.completion_model(&state.config.model);
                 let response = under_lease(
                     lease,
                     LLM_CALL_TIMEOUT,
@@ -857,7 +866,7 @@ impl ResearchStepRunner {
     where
         T: JsonSchema + DeserializeOwned + Send + 'static,
     {
-        let model = self.provider.completion_model(&state.config.model);
+        let model = (self.models)(&state.config.model);
         let max_tokens = state.config.max_tokens_per_call;
         let response = under_lease(
             lease,
@@ -1168,6 +1177,7 @@ mod tests {
     use super::*;
     use reqwest::StatusCode;
     use rig_core::http_client;
+    use rig_core::test_utils::MockCompletionModel;
     use rig_core::{ProviderError, ProviderResponseError};
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
@@ -1225,6 +1235,27 @@ mod tests {
         // reach it.
         let outcome = runner.run_step(&step).await.unwrap();
         assert!(matches!(outcome, StepOutcome::Cancel { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_step_looks_up_the_model_of_its_run() {
+        let plan = r#"{"sub_questions":["a sub-question"]}"#;
+        let model = MockCompletionModel::text(plan);
+        let looked_up = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let models = {
+            let looked_up = looked_up.clone();
+            move |id: &str| {
+                looked_up.lock().unwrap().push(id.to_string());
+                model.clone().into()
+            }
+        };
+        let runner =
+            ResearchStepRunner::new(models, Arc::new(crate::search::Tavily::new("unused")));
+        let mut step = test_step("run-1", 0);
+        step.payload = ResearchState::new("q", ResearchConfig::new("run-model")).to_bytes();
+
+        runner.run_step(&step).await.unwrap();
+        assert_eq!(*looked_up.lock().unwrap(), ["run-model"]);
     }
 
     #[test]
@@ -1492,8 +1523,8 @@ mod tests {
         let mut state = ResearchState::new("a query", ResearchConfig::new("m"));
         state.phase = Phase::Writing;
 
-        let runner = ResearchStepRunner::from_provider(
-            ProviderClient::Ollama(rig_core::providers::ollama::Ollama::from_env().unwrap()),
+        let runner = ResearchStepRunner::new_ollama(
+            rig_core::providers::ollama::Ollama::from_env().unwrap(),
             Arc::new(NoSearch),
         )
         .with_report_store(object_store.clone(), &Path::default());

@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use rig_core::providers::ollama::OllamaConfig;
-use serde_json::{Value, json};
+use rig_core::completion::message::{Message, UserContent};
+use rig_core::test_utils::{MockCompletionModel, MockTurn};
+use serde_json::json;
 use taquba::EnqueueEntry;
 use taquba::object_store::memory::InMemory;
 use taquba_research::ResearchStepRunner;
@@ -11,8 +12,6 @@ use taquba_research::search::{SearchBackend, SearchError, SearchResult};
 use taquba_research::store::RunDisplayStatus;
 use taquba_workflow::{CancelCommand, Command, MemoStore, RunId};
 use tokio::sync::oneshot;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use super::{
     Cli, ReplyOutcome, StoreCtx, WORKFLOW_CONTROL_QUEUE_NAME, WORKFLOW_MEMO_PREFIX, cmd_reply,
@@ -37,88 +36,39 @@ impl SearchBackend for NoResults {
     }
 }
 
-/// A fake of the `/api/chat` of Ollama that replies to each phase by a phrase
-/// of its prompt. The investigating agent calls `ask_user` until the request
-/// contains its result.
-struct FakeOllama;
-
-impl Respond for FakeOllama {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        let body: Value = serde_json::from_slice(&request.body).expect("a JSON request");
-        let prompt: String = messages(&body)
-            .iter()
-            .filter_map(|message| message["content"].as_str())
-            .collect();
-        let answered = !tool_results(&body).is_empty();
-        let message = if prompt.contains("research planner") {
-            text(json!({ "sub_questions": ["test sub-question"] }).to_string())
-        } else if prompt.contains("research investigator") && !answered {
-            json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "id": "call_1",
-                    "function": { "name": "ask_user", "arguments": { "question": QUESTION } }
-                }]
-            })
-        } else if prompt.contains("research investigator") {
-            text(json!({ "findings": [] }).to_string())
-        } else {
-            text("test answer".to_string())
-        };
-        ResponseTemplate::new(200).set_body_json(json!({
-            "model": "llama3.2",
-            "created_at": "2026-10-29T00:00:00Z",
-            "done": true,
-            "done_reason": "stop",
-            "message": message,
-        }))
-    }
+/// The model replies of a run, in the order of its phases. The investigating
+/// agent asks a question before it reports its findings.
+fn model() -> MockCompletionModel {
+    MockCompletionModel::from_turns([
+        MockTurn::text(json!({ "sub_questions": ["test sub-question"] }).to_string()),
+        MockTurn::tool_call("call_1", "ask_user", json!({ "question": QUESTION })),
+        MockTurn::text(json!({ "findings": [] }).to_string()),
+        MockTurn::text("test synthesis"),
+        MockTurn::text("test report"),
+    ])
 }
 
-fn text(content: String) -> Value {
-    json!({ "role": "assistant", "content": content })
-}
-
-fn messages(body: &Value) -> Vec<Value> {
-    body["messages"].as_array().cloned().unwrap_or_default()
-}
-
-/// The contents of the tool results that a chat request sends.
-fn tool_results(body: &Value) -> Vec<String> {
-    messages(body)
-        .iter()
-        .filter(|message| message["role"] == "tool")
-        .filter_map(|message| message["content"].as_str().map(str::to_string))
-        .collect()
-}
-
-/// A store in memory and the fake provider of its runs.
+/// A store in memory and the model of its runs.
 struct Harness {
-    server: MockServer,
+    model: MockCompletionModel,
     ctx: StoreCtx,
 }
 
 impl Harness {
-    async fn start() -> Self {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(FakeOllama)
-            .mount(&server)
-            .await;
+    fn start() -> Self {
         let ctx = StoreCtx {
             object_store: Arc::new(InMemory::new()),
             source: "memory".to_string(),
         };
-        Self { server, ctx }
+        Self {
+            model: model(),
+            ctx,
+        }
     }
 
     fn runner(&self) -> ResearchStepRunner {
-        let client = OllamaConfig::new()
-            .with_base_url(self.server.uri())
-            .client();
-        ResearchStepRunner::new_ollama(client, Arc::new(NoResults))
+        let model = self.model.clone();
+        ResearchStepRunner::new(move |_| model.clone().into(), Arc::new(NoResults))
     }
 
     /// A `run` of [`QUERY`] that may wait up to 600 seconds for a reply, until
@@ -150,13 +100,21 @@ impl Harness {
         .expect("the run waits for a reply")
     }
 
-    /// The tool results that the fake provider received, in request order.
-    async fn received_tool_results(&self) -> Vec<String> {
-        let requests = self.server.received_requests().await.unwrap_or_default();
-        requests
-            .iter()
-            .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
-            .flat_map(|body| tool_results(&body))
+    /// The text of the tool results that the model received, in request order.
+    fn received_tool_results(&self) -> Vec<String> {
+        let requests = self.model.requests();
+        let messages = requests.iter().flat_map(|request| &request.chat_history);
+        let contents = messages.filter_map(|message| match message.as_ref() {
+            Message::User { content } => Some(content),
+            _ => None,
+        });
+        let results = contents.flatten().filter_map(|content| match content {
+            UserContent::ToolResult(result) => Some(&result.content),
+            _ => None,
+        });
+        results
+            .flatten()
+            .filter_map(|content| content.as_text().map(str::to_string))
             .collect()
     }
 }
@@ -176,7 +134,7 @@ async fn join(task: tokio::task::JoinHandle<anyhow::Result<()>>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reply_reaches_the_waiting_run_of_a_live_writer() {
-    let harness = Harness::start().await;
+    let harness = Harness::start();
     let run = harness.spawn_run(std::future::pending());
     let run_id = harness.await_waiting().await;
 
@@ -184,7 +142,7 @@ async fn a_reply_reaches_the_waiting_run_of_a_live_writer() {
     let question = QUESTION.to_string();
     assert_eq!(outcome.unwrap(), ReplyOutcome::Delivered { question });
     join(run).await;
-    assert_eq!(harness.received_tool_results().await, [REPLY]);
+    assert_eq!(harness.received_tool_results(), [REPLY]);
     let late = cmd_reply(&harness.ctx, run_id, "late reply").await;
     assert!(
         late.unwrap_err()
@@ -195,7 +153,7 @@ async fn a_reply_reaches_the_waiting_run_of_a_live_writer() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reply_without_a_writer_takes_effect_at_resume() {
-    let harness = Harness::start().await;
+    let harness = Harness::start();
     let (interrupt, interrupted) = oneshot::channel::<()>();
     let run = harness.spawn_run(async move {
         let _ = interrupted.await;
@@ -222,7 +180,7 @@ async fn a_reply_without_a_writer_takes_effect_at_resume() {
         .await
         .expect("resume returns")
         .expect("resume succeeds");
-    assert_eq!(harness.received_tool_results().await, [REPLY]);
+    assert_eq!(harness.received_tool_results(), [REPLY]);
 }
 
 #[tokio::test]

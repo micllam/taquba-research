@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ResearchConfig::clarification_wait_secs`. The `reply` command sends a
   `taquba::SignalEntry` to the job id of the waiting step through the inbox of
   the queue, and `list` and `status` display the run as `waiting for reply`.
+- `ResearchStepRunner::new`, which builds a runner from a function that returns
+  the Rig `DynModel<Completion>` of a model identifier. A test can pass rig's
+  `MockCompletionModel`, and a deployment can choose its own provider client.
 
 ### Changed
 - **Breaking:** `store::derive_display_status` takes the run's `RunState` from

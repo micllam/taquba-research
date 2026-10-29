@@ -63,7 +63,5 @@ tokio = { version = "1", features = ["test-util"] }
 # `CancellationToken` for constructing `taquba_workflow::Step` in tests.
 tokio-util = { version = "0.7", default-features = false }
 # `test-utils` enables `MockCompletionModel`, the scripted model of the tests of
-# the investigating phase.
+# the investigating phase and of the CLI.
 rig-core = { version = "0.45", features = ["test-utils"] }
-# The fake Ollama server of the CLI tests.
-wiremock = "0.6"
