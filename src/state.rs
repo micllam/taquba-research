@@ -35,8 +35,10 @@ pub struct ResearchConfig {
     /// Maximum tokens per single LLM call. When `None`, no explicit limit is
     /// sent and the provider's or model's default applies.
     pub max_tokens_per_call: Option<u64>,
-    /// Per-page text limit fed to the summarising step (UTF-8 chars). Larger
-    /// pages are truncated.
+    /// Length of a chunk of the text of a fetched page in UTF-8 chars. The run
+    /// state keeps the first chunk of each fetched page for the summarising
+    /// step, and the `fetch_page` tool of the investigating step returns one
+    /// chunk per call.
     pub max_page_chars: usize,
     /// Model-call budget of the investigating step. With 0 the run skips the
     /// step. A state persisted without the field decodes as 0.
@@ -176,8 +178,58 @@ pub fn summarize_state(payload: &[u8]) -> Option<StateSummary> {
 pub struct FetchedPage {
     /// Best-effort page title (from `<title>` or the original search result).
     pub title: String,
-    /// Extracted plain text, truncated to [`ResearchConfig::max_page_chars`].
+    /// Extracted plain text. In the run state, the first chunk of
+    /// [`ResearchConfig::max_page_chars`] characters.
     pub text: String,
+}
+
+/// A chunk of the text of a [`FetchedPage`], as the `fetch_page` tool returns
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TextChunk {
+    pub(crate) title: String,
+    pub(crate) text: String,
+    /// The number of the chunk, counted from 1.
+    pub(crate) chunk: usize,
+    /// The number of chunks of the text.
+    pub(crate) chunk_count: usize,
+    /// The length of the whole text in characters.
+    pub(crate) total_chars: usize,
+}
+
+impl FetchedPage {
+    /// Chunk `chunk` of the text, counted from 1, in chunks of `chunk_chars`
+    /// characters, or `None` past the last chunk. A text shorter than a chunk
+    /// is one chunk.
+    pub(crate) fn chunk(&self, chunk: usize, chunk_chars: usize) -> Option<TextChunk> {
+        let chunk_chars = chunk_chars.max(1);
+        let total_chars = self.text.chars().count();
+        let chunk_count = total_chars.div_ceil(chunk_chars).max(1);
+        if chunk == 0 || chunk > chunk_count {
+            return None;
+        }
+        Some(TextChunk {
+            title: self.title.clone(),
+            text: self
+                .text
+                .chars()
+                .skip((chunk - 1) * chunk_chars)
+                .take(chunk_chars)
+                .collect(),
+            chunk,
+            chunk_count,
+            total_chars,
+        })
+    }
+
+    /// The page with its text cut to its first chunk of `chunk_chars`
+    /// characters, as the run state keeps it.
+    pub(crate) fn first_chunk(&self, chunk_chars: usize) -> Self {
+        Self {
+            title: self.title.clone(),
+            text: self.text.chars().take(chunk_chars).collect(),
+        }
+    }
 }
 
 /// Per-page summary produced by the summarising step.
@@ -423,5 +475,22 @@ mod tests {
         let usage: TokenUsage = serde_json::from_str(json).unwrap();
         assert_eq!(usage.tool_use_prompt_tokens, 0);
         assert_eq!(usage.input_tokens, 1);
+    }
+
+    #[test]
+    fn chunk_returns_each_chunk_of_the_text_and_none_past_the_last() {
+        let fetched = FetchedPage {
+            title: "Title".to_string(),
+            text: "abcdefghij".to_string(),
+        };
+        let texts: Vec<String> = (1..=3)
+            .map(|chunk| fetched.chunk(chunk, 4).unwrap().text)
+            .collect();
+        assert_eq!(texts, ["abcd", "efgh", "ij"]);
+        let last = fetched.chunk(3, 4).unwrap();
+        assert_eq!((last.chunk_count, last.total_chars), (3, 10));
+        assert!(fetched.chunk(0, 4).is_none());
+        assert!(fetched.chunk(4, 4).is_none());
+        assert_eq!(fetched.first_chunk(4).text, "abcd");
     }
 }

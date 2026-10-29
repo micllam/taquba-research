@@ -1,5 +1,6 @@
 //! `FetchPage`: the durable [`Job`] that fetches a single URL and returns its
-//! title and extracted plain text.
+//! title and its whole extracted plain text, which the run result record of the
+//! job keeps.
 //!
 //! The [`Phase::Fetching`](crate::state::Phase::Fetching) step parallelises its
 //! work by submitting a `FetchPage` per URL with a deterministic
@@ -24,8 +25,7 @@ use url::Url;
 
 use crate::state::FetchedPage;
 
-/// Maximum bytes read from a single fetch response, before the `max_chars` cap
-/// on extracted text applies.
+/// Maximum bytes read from a single fetch response.
 const FETCH_RESPONSE_BYTE_CAP: usize = 2 * 1024 * 1024;
 /// Per-fetch HTTP timeout.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -77,8 +77,6 @@ pub(crate) struct FetchPage {
     pub run_id: String,
     /// The URL to fetch.
     pub url: Url,
-    /// Per-page text cap applied after HTML extraction.
-    pub max_chars: usize,
 }
 
 /// Failure modes for [`FetchPage`].
@@ -133,7 +131,7 @@ impl Job for FetchPage {
         // `Queue::cancel(job_id)`, which fires this token. The in-flight HTTP
         // request is then aborted before the reqwest timeout.
         tokio::select! {
-            result = fetch_and_extract(http, &self.url, self.max_chars) => result,
+            result = fetch_and_extract(http, &self.url) => result,
             _ = ctx.cancel_token.cancelled() => Err(FetchError::Cancelled),
         }
     }
@@ -163,14 +161,9 @@ fn is_transient_status(code: u16) -> bool {
 }
 
 /// Fetch `url`, decode the response and return the page title and a plain-text
-/// rendering of the body capped at `max_chars`. Returns a structured
-/// [`FetchError`] that [`FetchPage::classify`] maps to a retry or a permanent
-/// failure.
-async fn fetch_and_extract(
-    http: &reqwest::Client,
-    url: &Url,
-    max_chars: usize,
-) -> Result<FetchedPage, FetchError> {
+/// rendering of the body. Returns a structured [`FetchError`] that
+/// [`FetchPage::classify`] maps to a retry or a permanent failure.
+async fn fetch_and_extract(http: &reqwest::Client, url: &Url) -> Result<FetchedPage, FetchError> {
     let resp = http
         .get(url.as_str())
         .send()
@@ -205,7 +198,6 @@ async fn fetch_and_extract(
     } else {
         (String::new(), raw.to_string())
     };
-    let text: String = text.chars().take(max_chars).collect();
     if text.trim().is_empty() {
         return Err(FetchError::Empty);
     }
@@ -267,7 +259,6 @@ mod tests {
         let job = FetchPage {
             run_id: "r".into(),
             url: Url::parse("http://example.com/").unwrap(),
-            max_chars: 1000,
         };
         assert_eq!(
             job.classify(&FetchError::Transport("dns".into())),
@@ -292,7 +283,6 @@ mod tests {
         let job = FetchPage {
             run_id: "r".into(),
             url: Url::parse("http://example.com/").unwrap(),
-            max_chars: 1000,
         };
         assert_eq!(
             job.classify(&FetchError::HttpStatus(404)),

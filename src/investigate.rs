@@ -35,7 +35,7 @@ use crate::runner::{
     classify_structured_err,
 };
 use crate::search::{SearchBackend, SearchError, SearchResult};
-use crate::state::{Clarification, FetchedPage, Reply, Summary, TokenUsage};
+use crate::state::{Clarification, FetchedPage, Reply, Summary, TextChunk, TokenUsage};
 
 /// Results per `web_search` call.
 const SEARCH_LIMIT: usize = 5;
@@ -340,19 +340,25 @@ impl Tool for WebSearch {
 }
 
 /// The `fetch_page` tool, which fetches a page through a `FetchPage` job of the
-/// run.
+/// run and returns one chunk of its text. The recorded result of the job keeps
+/// the whole text, so a call for a later chunk does not fetch the page again.
 pub(crate) struct FetchPageTool {
     pub(crate) jobs: JobRunner,
     pub(crate) run_id: String,
-    pub(crate) max_chars: usize,
+    /// The length of a chunk in characters.
+    pub(crate) chunk_chars: usize,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct FetchPageArgs {
     url: Url,
+    /// The chunk to return, counted from 1, or the first chunk when absent.
+    #[serde(default)]
+    chunk: Option<usize>,
 }
 
-/// A failed `FetchPage` job, as the model reads it.
+/// A failed `FetchPage` job, or a chunk past the last one, as the model reads
+/// it.
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub(crate) struct FetchPageError(String);
@@ -360,18 +366,28 @@ pub(crate) struct FetchPageError(String);
 impl Tool for FetchPageTool {
     const NAME: &'static str = "fetch_page";
     type Args = FetchPageArgs;
-    type Output = FetchedPage;
+    type Output = TextChunk;
     type Error = FetchPageError;
 
     fn description(&self) -> String {
-        "Fetch a web page. Returns its title and its text.".to_string()
+        format!(
+            "Fetch a web page. Returns its title and one chunk of at most {} characters of \
+             its text, with the chunk number, the number of chunks and the length of the \
+             whole text. Pass `chunk` to read a later chunk.",
+            self.chunk_chars
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "The absolute URL of the page." }
+                "url": { "type": "string", "description": "The absolute URL of the page." },
+                "chunk": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "The chunk of the text to return, 1 by default."
+                }
             },
             "required": ["url"]
         })
@@ -381,25 +397,27 @@ impl Tool for FetchPageTool {
         &self,
         _context: &mut ToolContext,
         args: FetchPageArgs,
-    ) -> Result<FetchedPage, FetchPageError> {
-        fetch_page(&self.jobs, &self.run_id, args.url, self.max_chars)
+    ) -> Result<TextChunk, FetchPageError> {
+        let fetched = fetch_page(&self.jobs, &self.run_id, args.url)
             .await
-            .map_err(FetchPageError)
+            .map_err(FetchPageError)?;
+        let chunk = args.chunk.unwrap_or(1);
+        fetched.chunk(chunk, self.chunk_chars).ok_or_else(|| {
+            FetchPageError(format!("chunk {chunk} is past the last chunk of the text"))
+        })
     }
 }
 
-/// Fetch `url` through a `FetchPage` job. A job of the same run and URL returns
-/// its recorded result.
+/// Fetch `url` through a `FetchPage` job, with its whole text. A job of the
+/// same run and URL returns its recorded result.
 pub(crate) async fn fetch_page(
     jobs: &JobRunner,
     run_id: &str,
     url: Url,
-    max_chars: usize,
 ) -> Result<FetchedPage, String> {
     let job = FetchPage {
         run_id: run_id.to_string(),
         url,
-        max_chars,
     };
     let handle = jobs
         .submit(job)
@@ -586,7 +604,7 @@ mod tests {
             fetch: FetchPageTool {
                 jobs,
                 run_id: "run".to_string(),
-                max_chars: 100,
+                chunk_chars: 100,
             },
             asking,
             max_tokens: None,

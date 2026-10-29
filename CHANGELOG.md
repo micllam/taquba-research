@@ -18,8 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Its `progress` line becomes `phase`.
 - The investigating step, between summarising and synthesis, in which a Rig
   agent with the `web_search` and `fetch_page` tools adds sources for the gaps
-  of the summaries, at up to 8 more model calls per run. The CLI flag
-  `--investigation-turns` sets the budget, and 0 skips the step.
+  of the summaries, at up to 8 more model calls per run. `fetch_page` returns a
+  chunk of `ResearchConfig::max_page_chars` characters of the text of a page,
+  and the agent can request a later chunk. The CLI flag `--investigation-turns`
+  sets that limit, and 0 skips the step.
 - `store::journal_entries` and `store::JournalEntry`, the ordered completions
   and tool calls of an investigating step, readable from a second process. The
   `status` command prints them as `journal` while a run investigates.

@@ -567,7 +567,6 @@ impl ResearchStepRunner {
             let job = FetchPage {
                 run_id: step.run_id.to_string(),
                 url: url.clone(),
-                max_chars: state.config.max_page_chars,
             };
             let handle = job_runner
                 .submit(job)
@@ -599,7 +598,9 @@ impl ResearchStepRunner {
             match handle.await {
                 Ok(page) => {
                     state.summarize_queue.push_back(url.clone());
-                    state.fetched.insert(url.clone(), page);
+                    state
+                        .fetched
+                        .insert(url.clone(), page.first_chunk(state.config.max_page_chars));
                 }
                 Err(JoinError::Job(je)) => {
                     tracing::warn!(url = %url, error = %je, "fetch failed, skipping page");
@@ -726,7 +727,7 @@ impl ResearchStepRunner {
             fetch: FetchPageTool {
                 jobs: jobs.clone(),
                 run_id: run_id.clone(),
-                max_chars,
+                chunk_chars: max_chars,
             },
             asking,
             max_tokens: state.config.max_tokens_per_call,
@@ -777,7 +778,7 @@ impl ResearchStepRunner {
                 continue;
             }
             let page = under_lease(&step.lease, FETCH_JOIN_LEASE, "fetch", async {
-                Ok(investigate::fetch_page(jobs, &run_id, url.clone(), max_chars).await)
+                Ok(investigate::fetch_page(jobs, &run_id, url.clone()).await)
             })
             .await?;
             let page = match page {
@@ -795,7 +796,7 @@ impl ResearchStepRunner {
                     relevance: finding.relevance.clamp(0.0, 1.0),
                 },
             );
-            state.fetched.insert(url, page);
+            state.fetched.insert(url, page.first_chunk(max_chars));
             added += 1;
         }
         tracing::info!("investigation added {added} sources");
