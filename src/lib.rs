@@ -1,92 +1,55 @@
-//! Durable research agent for Rust, built on [Rig] and [taquba-workflow].
+//! taquba-research runs [Rig] agents as durable workflows on [taquba-workflow].
+//! Its host, the code that moves an agent run between steps, gives each
+//! workflow step one model call and the tool calls of its reply. The crate
+//! includes a research pipeline with a command-line interface as a worked
+//! example of the host.
 //!
-//! `taquba-research` is a multi-step research agent whose runs persist across
-//! process crashes. A run consists of a planning step, a fan-out of search and
-//! page-fetch steps, per-page summarisation, an investigation of the gaps by a
-//! Rig agent with tools, synthesis and a final report-writing step. The agent
-//! writes every transition to the object-storage-backed task queue of taquba
-//! and memoizes every completed LLM call. An interrupted run resumes from the
-//! last completed step and does not pay for any of its completed model calls
-//! again.
+//! The step memo records the model reply and every tool result of a step, so a
+//! step that runs again after a crash reuses them without calling the model or
+//! a tool again. When the agent asks the user a question, the step ends and the
+//! run waits without holding a worker. The reply then resumes the run in a
+//! later step.
 //!
-//! This crate is a reference implementation and a CLI tool. It is a worked
-//! example of how Rig (LLM orchestration) and the taquba stack (durable queues,
-//! workflows and jobs) combine into a crash-safe agent. It is not intended as a
-//! general-purpose library dependency. To make another Rig agent durable, copy
-//! the pattern: per-step memoization of LLM calls over
-//! [`taquba_workflow::Memo`], and the mapping of Rig errors to a transient or
-//! permanent [`StepError`](workflow::StepError). The phase state machine of
-//! this crate is specific to research.
+//! The research pipeline starts from a question and ends with a cited report.
+//! On the way, it plans, searches the web, fetches and summarises pages,
+//! investigates the gaps with an agent on the host and synthesises the
+//! findings. A run that stops after twenty paid model calls resumes from its
+//! last completed step and does not pay for those calls again.
 //!
-//! Both public surfaces run or embed this research agent:
+//! The host is internal to the crate, and the public API runs or embeds the
+//! research pipeline. A project with its own durable Rig agent can adopt the
+//! same form:
 //!
-//! - **High-level**: [`ResearchAgent`], a builder that combines Rig, a
-//!   [`SearchBackend`](search::SearchBackend) and a [`ResearchConfig`] into a
-//!   `run(queue, object_store, query)` helper.
-//! - **Low-level**: [`ResearchStepRunner`], a [`taquba_workflow::StepRunner`]
-//!   for a caller's own [`taquba_workflow::WorkflowRuntime`].
+//! - A hand-run `AgentRun` of rig-agent as the state of each step.
+//! - The step memo ([`taquba_workflow::Memo`]) for each model reply and each
+//!   tool result.
+//! - A signal wait when the agent needs a human in the loop.
 //!
 //! # Providers
 //!
-//! OpenAI, Anthropic and Ollama (local models) are supported through Rig.
+//! The CLI calls OpenAI, Anthropic or a local Ollama model through Rig. It
+//! chooses Anthropic when `ANTHROPIC_API_KEY` is set and `OPENAI_API_KEY` is
+//! not, and OpenAI in every other case. `--provider openai|anthropic|ollama`
+//! overrides that choice.
 //!
-//! - **CLI**: `--provider openai|anthropic|ollama` selects the provider.
-//!   Without it, the CLI selects Anthropic when `ANTHROPIC_API_KEY` is set and
-//!   `OPENAI_API_KEY` is not, and OpenAI otherwise. The CLI never selects
-//!   Ollama automatically, so an Ollama run requires `--provider ollama`.
-//!   Ollama does not use an API key and connects to `http://localhost:11434`
-//!   unless `OLLAMA_API_BASE_URL` is set.
-//! - **Library**: [`ResearchStepRunner::new_openai`],
-//!   [`ResearchStepRunner::new_anthropic`] and
-//!   [`ResearchStepRunner::new_ollama`] build the runner, and the
-//!   `.openai(...)`, `.anthropic(...)` and `.ollama(...)` methods of
-//!   [`ResearchAgent::builder`] configure the agent.
-//!   [`ResearchStepRunner::new`] builds the runner from a function that returns
-//!   the Rig model of a model identifier.
-//! - **Citations**: Anthropic runs pass the fetched pages as citation-enabled
-//!   document blocks during synthesis. When Claude returns citation metadata,
-//!   the final report includes the cited source excerpts. OpenAI and Ollama
-//!   runs keep the standard numeric list of sources.
-//! - **Structured phases**: the `Planning`, `Summarizing` and `Investigating`
-//!   phases use structured (`prompt_typed`) completions, and `Investigating`
-//!   also uses tool calls. An Ollama model must emit schema-valid JSON and tool
-//!   calls reliably, and a model that does not dead-letters those steps.
+//! To use a local Ollama model, pass `--provider ollama`. The CLI then connects
+//! to `http://localhost:11434` without an API key, or to the address in
+//! `OLLAMA_API_BASE_URL`.
 //!
-//! # Quick start
+//! The providers differ in their citations. On Anthropic, synthesis passes the
+//! fetched pages as citation-enabled document blocks, and the report quotes the
+//! excerpts that Claude cites. OpenAI and Ollama runs keep a numbered list of
+//! sources.
 //!
-//! ```no_run
-//! use std::sync::Arc;
-//! use taquba::{Queue, object_store::local::LocalFileSystem};
-//! use taquba_research::{ResearchAgent, ResearchConfig, search::Tavily};
-//!
-//! # async fn run() -> anyhow::Result<()> {
-//! let store = Arc::new(LocalFileSystem::new_with_prefix("./store")?);
-//! let queue = Arc::new(Queue::open(store.clone(), "taquba-research").await?);
-//!
-//! let rig = rig_core::providers::openai::OpenAI::from_env()?;
-//!
-//! // ...or .anthropic(rig_core::providers::anthropic::Anthropic::from_env()?)
-//! //       with a matching model id, for example "claude-haiku-4-5".
-//! let agent = ResearchAgent::builder()
-//!     .openai(rig)
-//!     .search(Tavily::from_env()?)
-//!     .config(ResearchConfig::new("gpt-5-nano"))
-//!     .build()?;
-//!
-//! // `store` also backs the per-step memo of the workflow, which
-//! // short-circuits retried LLM calls.
-//! let report = agent
-//!     .run(queue, store, "Postgres vs SQLite for read-heavy workloads")
-//!     .await?;
-//! println!("{}", report.markdown);
-//! # Ok(()) }
-//! ```
+//! The planning, summarising and investigating phases request structured
+//! output, and the investigating phase also calls tools. An Ollama model must
+//! produce schema-valid JSON and tool calls reliably, because a malformed reply
+//! dead-letters its step.
 //!
 //! # Command-line interface
 //!
-//! `cargo install taquba-research` installs a single `taquba-research` binary
-//! on `$PATH`. The default invocation starts a new run. Ctrl+C stops the
-//! process at any time, and the run persists in the configured store.
+//! `cargo install taquba-research` installs the `taquba-research` binary. A run
+//! requires the key of its provider and `TAVILY_API_KEY` for the web search.
 //!
 //! ```text
 //! taquba-research "your query"            # start a new run
@@ -101,41 +64,37 @@
 //! taquba-research gc --older-than-days 7  # delete reports older than 7 days
 //! ```
 //!
+//! The CLI prints the run id when it submits the run. The process can stop at
+//! any moment, through Ctrl+C or a crash, and the run state stays in the
+//! configured store. `resume` continues the run from its last completed step.
+//!
+//! The command that starts a run and `resume` both stay in the foreground until
+//! the work ends, and both require the two keys. The other subcommands inspect
+//! or maintain the store, from another shell during a run or at any later time,
+//! and they require neither key. When `--store` is a cloud URL, every
+//! subcommand reads the standard `AWS_*`, `GOOGLE_*` or `AZURE_*` credentials.
+//!
 //! A run stays listed until 7 days after it terminates, and its report stays
-//! until `gc` deletes it.
+//! until `gc` deletes it. `init` checks that the configured store is reachable,
+//! with valid credentials and an existing bucket.
 //!
-//! `run` and `resume` are foreground processes that stay alive for the duration
-//! of the work. They require `TAVILY_API_KEY` and the API key of the chosen
-//! `--provider`. The other subcommands (`list`, `status`, `show`, `cancel`,
-//! `reply`, `init` and `gc`) inspect or maintain the shared store, from another
-//! shell while a run is in flight or at any later time, and they require
-//! neither key. Every subcommand reads object-store credentials (the standard
-//! `AWS_*`, `GOOGLE_*` or `AZURE_*` environment variables) when `--store` is a
-//! cloud URL.
+//! With `--clarification-wait <SECONDS>`, the investigating agent can ask the
+//! user one question per run. `status` then shows the question, and `reply`
+//! delivers the reply of the user within the wait. When the wait ends first,
+//! the agent proceeds on an assumption and states it in its findings.
 //!
-//! With `--clarification-wait <SECONDS>`, the agent of the investigating step
-//! can ask the user a single question per run. The run then waits up to that
-//! many seconds for `reply`, and `status` prints the question. After the wait,
-//! the agent proceeds on an assumption that it states in its findings.
+//! `reply` and `cancel` take effect within 2 seconds while a process runs the
+//! work. Without such a process, they take effect at the next `resume`.
 //!
-//! `reply` and `cancel` write an entry to the inbox of the queue (a prefix of
-//! request objects separate from the queue), and the `run` or `resume` process
-//! applies it within 2 seconds. Without such a process, the entry takes effect
-//! at the next `resume`.
-//!
-//! See `taquba-research --help` for the full flag list.
+//! `taquba-research --help` lists every flag.
 //!
 //! # Storage
 //!
-//! `--store` (or `TAQUBA_RESEARCH_STORE`) sets the location of the SlateDB
-//! queue and, by default, the rendered report. It accepts either of these
-//! forms:
-//!
-//! - A local path, `~/.taquba-research/` by default.
-//! - An object-storage URL, such as `s3://bucket/prefix`, `gs://bucket/prefix`,
-//!   `az://container/prefix` or `file:///abs/path`.
-//!
-//! Cloud URLs require the matching cargo feature:
+//! By default, the queue and the reports are stored in `~/.taquba-research/`.
+//! `--store`, or the `TAQUBA_RESEARCH_STORE` variable, moves them to another
+//! local path or to object storage, such as `s3://bucket/prefix`,
+//! `gs://bucket/prefix`, `az://container/prefix` or `file:///abs/path`. Each
+//! cloud scheme requires the cargo feature of its provider:
 //!
 //! ```bash
 //! cargo install taquba-research --features aws    # S3 / MinIO
@@ -143,63 +102,81 @@
 //! cargo install taquba-research --features azure  # Azure Blob
 //! ```
 //!
-//! The CLI always saves the report to `<store>/reports/<run_id>.md` in the
-//! store of the queue, so an S3-backed deployment keeps the report and the
-//! queue in one bucket. `--output` accepts the same path-or-URL form and writes
-//! an additional copy there.
+//! The CLI saves each report to `<store>/reports/<run_id>.md`, so an S3
+//! deployment keeps the queue and the reports in one bucket. `--output` writes
+//! an additional copy to any path or URL of the same form.
 //!
-//! # Durability model
+//! # Two public surfaces
 //!
-//! - **A retry does not pay for a model call again.** Each LLM-backed phase
-//!   memoizes its output in its per-step [`Memo`](taquba_workflow::Memo). An
-//!   at-least-once redelivery short-circuits to the stored value and does not
-//!   call or bill the model again.
-//! - **An investigation makes one model call per step.** Each step of the
-//!   investigating phase makes one model call of its Rig agent and runs the
-//!   tool calls of the reply. The per-step memo records the reply and each tool
-//!   result, and a redelivery reuses both. A failed model call stays out of the
-//!   memo, so a retry calls the model again.
-//! - **The delivery lease covers every slow call.** Every LLM and search call
-//!   runs under a timeout, and the step extends its lease
-//!   ([`taquba::LeaseHandle::ensure_at_least`]) by that bound before the call.
-//!   The fetching step extends the lease again as each page job completes. A
-//!   hung call times out as a transient step error and is retried.
+//! Both surfaces run the research pipeline, whose phases are specific to
+//! research.
 //!
-//! Inherited from taquba:
+//! [`ResearchAgent`] is the high-level surface. Its builder combines a Rig
+//! provider client, a [`SearchBackend`](search::SearchBackend) and a
+//! [`ResearchConfig`] into a `run(queue, object_store, query)` helper, which
+//! the CLI and the example that follows use.
 //!
-//! - **Single-process, single-writer.** All workers for a queue run in one
-//!   binary and share one `Arc<Queue>`.
-//! - **At-least-once delivery.** Steps must be idempotent for
-//!   `(run_id, step_number)`. The runtime deduplicates by that pair while a
-//!   step is pending or scheduled.
-//! - **Per-transition durability.** Every state change of a step is a SlateDB
-//!   write to the configured object store (local FS, S3, GCS or Azure).
+//! ```no_run
+//! use std::sync::Arc;
+//! use taquba::{Queue, object_store::local::LocalFileSystem};
+//! use taquba_research::{ResearchAgent, ResearchConfig, search::Tavily};
 //!
-//! ## Fetching is the one fan-out phase
+//! # async fn run() -> anyhow::Result<()> {
+//! let store = Arc::new(LocalFileSystem::new_with_prefix("./store")?);
+//! let queue = Arc::new(Queue::open(store.clone(), "research").await?);
 //!
-//! Every other phase is one workflow step per unit of work. The fetching phase
-//! is a single workflow step that submits one `FetchPage` job per URL to a
-//! [`JobRunner`](taquba_workflow::jobs::JobRunner), then awaits the handles
-//! with `try_join_all`. The `JobRunner` shares the queue and uses a distinct
-//! queue name. The per-URL `idempotency_key` derives from `(run_id, url)`, so
-//! on a step retry the idempotent submit of the job runner returns the recorded
-//! result, and no URL is fetched twice. The `fetch_page` tool of the
-//! investigating step submits the same job for each page it reads.
+//! let agent = ResearchAgent::builder()
+//!     .openai(rig_core::providers::openai::OpenAI::from_env()?)
+//!     // ...or .anthropic(rig_core::providers::anthropic::Anthropic::from_env()?)
+//!     //       with a matching model id, for example "claude-haiku-4-5".
+//!     .search(Tavily::from_env()?)
+//!     .config(ResearchConfig::new("gpt-5-nano"))
+//!     .build()?;
 //!
-//! [`spawn_fetch_runner`] builds and spawns this `JobRunner`.
-//! `ResearchAgent::run` and the CLI call it internally, and a caller with a
-//! custom [`WorkflowRuntime`](taquba_workflow::WorkflowRuntime) will need to
-//! call it and attach the runner with [`ResearchStepRunner::with_job_runner`]
-//! and [`ResearchStepRunner::with_queue`]. With the queue attached, the
-//! fetching step cancels its in-flight `FetchPage` jobs through `Queue::cancel`
-//! when the run is cancelled, and the jobs do not run until the per-fetch HTTP
-//! timeout.
+//! // `store` also backs the per-step memo of the workflow, which
+//! // short-circuits retried LLM calls.
+//! let report = agent
+//!     .run(queue, store, "Postgres vs SQLite for read-heavy workloads")
+//!     .await?;
+//! println!("{}", report.markdown);
+//! # Ok(()) }
+//! ```
 //!
-//! See [taquba-workflow's docs] for the underlying runtime semantics.
+//! [`ResearchStepRunner`] is the low-level surface, a
+//! [`taquba_workflow::StepRunner`] for a caller's own
+//! [`taquba_workflow::WorkflowRuntime`]. That runtime can combine research
+//! steps with other workflow steps, share a worker pool or install its own
+//! terminal hook. It must also attach the fetch runner that
+//! [`spawn_fetch_runner`] builds.
+//!
+//! # Durability
+//!
+//! A run persists across a crash at any step, and a retry repeats only the work
+//! that did not complete. taquba writes every state change of a step to the
+//! object store and delivers each step at least once. The crate adds these
+//! guarantees:
+//!
+//! - **A retry does not pay for a model call again.** Each step memoizes the
+//!   reply of each completed model call, and a redelivered step reads the
+//!   stored reply. A failed call stays out of the memo, so a retry calls the
+//!   model again.
+//! - **A page is fetched once per run.** Each fetch is a job that uses the run
+//!   and the URL as its key, so a retried step receives the recorded page.
+//! - **A wait for the user ends the step.** The run waits for a reply without a
+//!   worker or a lease, and the step after the wait reads the reply from its
+//!   signal.
+//! - **Rig classifies each model failure.** A failure that Rig reports as
+//!   retryable is a transient step error, which taquba retries up to
+//!   `max_attempts`. Any other model failure dead-letters the run at once.
+//! - **A hung call fails the step.** Every model and search call runs under a
+//!   timeout within the lease of its step, and a timeout is a transient step
+//!   error.
+//!
+//! The store of taquba allows one writer at a time, so all workers of a queue
+//! must run in one process and share one `Arc<Queue>`.
 //!
 //! [Rig]: https://crates.io/crates/rig-core
 //! [taquba-workflow]: https://crates.io/crates/taquba-workflow
-//! [taquba-workflow's docs]: https://docs.rs/taquba-workflow
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
