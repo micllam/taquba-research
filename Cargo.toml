@@ -25,7 +25,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "taquba-research"
-path = "src/bin/taquba_research.rs"
+path = "src/bin/taquba_research/main.rs"
 
 [package.metadata.docs.rs]
 # docs.rs builds with one cloud backend enabled.
@@ -65,3 +65,5 @@ tokio-util = { version = "0.7", default-features = false }
 # `test-utils` enables `MockCompletionModel`, the scripted model of the tests of
 # the investigating phase.
 rig-core = { version = "0.45", features = ["test-utils"] }
+# The fake Ollama server of the CLI tests.
+wiremock = "0.6"

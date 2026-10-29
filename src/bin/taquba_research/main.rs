@@ -265,14 +265,27 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Some(Command::Resume { run_id, force }) => {
-            cmd_resume(&cli, &store_ctx, run_id.clone(), *force).await
+            let runner = build_runner(&cli)?;
+            cmd_resume(
+                &cli,
+                &store_ctx,
+                runner,
+                run_id.clone(),
+                *force,
+                interrupt(),
+            )
+            .await
         }
         Some(Command::List) => cmd_list(&store_ctx).await,
         Some(Command::Status { run_id }) => cmd_status(&store_ctx, run_id.clone()).await,
         Some(Command::Show { run_id, output }) => {
             cmd_show(&store_ctx, run_id.clone(), output.as_deref()).await
         }
-        Some(Command::Reply { run_id, text }) => cmd_reply(&store_ctx, run_id.clone(), text).await,
+        Some(Command::Reply { run_id, text }) => {
+            let outcome = cmd_reply(&store_ctx, run_id.clone(), text).await?;
+            print_reply(run_id, &outcome);
+            Ok(())
+        }
         Some(Command::Cancel { run_id }) => cmd_cancel(&store_ctx, run_id.clone()).await,
         Some(Command::Init) => cmd_init(&store_ctx).await,
         Some(Command::Gc {
@@ -284,9 +297,18 @@ async fn main() -> Result<()> {
                 .query
                 .clone()
                 .ok_or_else(|| anyhow!("missing QUERY; pass a query string or use a subcommand"))?;
-            cmd_run(&cli, &store_ctx, query).await
+            let runner = build_runner(&cli)?;
+            cmd_run(&cli, &store_ctx, runner, query, interrupt()).await
         }
     }
+}
+
+/// The interrupt of the terminal, after which the worker stops at the end of
+/// its current step.
+async fn interrupt() {
+    let _ = tokio::signal::ctrl_c().await;
+    eprintln!();
+    eprintln!("Interrupting; waiting for current step to finish...");
 }
 
 fn init_tracing(quiet: bool) {
@@ -709,6 +731,7 @@ async fn spawn_runtime(
     queue: Arc<Queue>,
     runner: ResearchStepRunner,
     run_id: &RunId,
+    interrupt: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(
     WorkflowRuntime<ResearchStepRunner, CaptureHook>,
     WorkerHandles,
@@ -747,13 +770,10 @@ async fn spawn_runtime(
     let worker = tokio::spawn(async move {
         worker_runtime
             .run(async move {
-                // Exit on Ctrl+C or on the shutdown signal that `finalize`
-                // sends after a terminal outcome.
+                // Exit on the interrupt or on the shutdown signal that
+                // `finalize` sends after a terminal outcome.
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        eprintln!();
-                        eprintln!("Interrupting; waiting for current step to finish...");
-                    }
+                    () = interrupt => {}
                     _ = shutdown_rx => {}
                 }
             })
@@ -771,8 +791,13 @@ async fn spawn_runtime(
     ))
 }
 
-async fn cmd_run(cli: &Cli, store_ctx: &StoreCtx, query: String) -> Result<()> {
-    let runner = build_runner(cli)?;
+async fn cmd_run(
+    cli: &Cli,
+    store_ctx: &StoreCtx,
+    runner: ResearchStepRunner,
+    query: String,
+    interrupt: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let config = build_config(cli);
     let queue = open_queue(store_ctx).await?;
 
@@ -790,7 +815,8 @@ async fn cmd_run(cli: &Cli, store_ctx: &StoreCtx, query: String) -> Result<()> {
     // The run id is generated before submit so the terminal hook can filter
     // notifications to this run.
     let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
-    let (runtime, handles) = spawn_runtime(store_ctx, queue.clone(), runner, &run_id).await?;
+    let (runtime, handles) =
+        spawn_runtime(store_ctx, queue.clone(), runner, &run_id, interrupt).await?;
 
     let input = ResearchStepRunner::initial_state(query.clone(), config);
     runtime
@@ -815,7 +841,14 @@ async fn cmd_run(cli: &Cli, store_ctx: &StoreCtx, query: String) -> Result<()> {
     result.and(close_queue(queue).await)
 }
 
-async fn cmd_resume(cli: &Cli, store_ctx: &StoreCtx, run_id: String, force: bool) -> Result<()> {
+async fn cmd_resume(
+    cli: &Cli,
+    store_ctx: &StoreCtx,
+    runner: ResearchStepRunner,
+    run_id: String,
+    force: bool,
+    interrupt: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     let run_id: RunId = run_id
         .parse()
         .with_context(|| format!("invalid run id `{run_id}`"))?;
@@ -873,12 +906,12 @@ async fn cmd_resume(cli: &Cli, store_ctx: &StoreCtx, run_id: String, force: bool
             );
         }
     }
-    let runner = build_runner(cli)?;
     let queue = open_queue(store_ctx).await?;
 
     // cmd_resume does not submit new work. It starts a worker to process the
     // existing pending step.
-    let (runtime, handles) = spawn_runtime(store_ctx, queue.clone(), runner, &run_id).await?;
+    let (runtime, handles) =
+        spawn_runtime(store_ctx, queue.clone(), runner, &run_id, interrupt).await?;
 
     println!("Resuming {run_id}...");
 
@@ -1282,7 +1315,28 @@ async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) ->
     Ok(())
 }
 
-async fn cmd_reply(store_ctx: &StoreCtx, run_id: String, text: &str) -> Result<()> {
+/// The outcome of `reply` for the question of a waiting run.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyOutcome {
+    /// A live writer delivered the reply to the waiting step.
+    Delivered { question: String },
+    /// The reply awaits a writer, without one live within [`INBOX_WAIT`].
+    Sent { question: String },
+}
+
+fn print_reply(run_id: &str, outcome: &ReplyOutcome) {
+    match outcome {
+        ReplyOutcome::Delivered { question } => {
+            println!("Reply delivered to {run_id} for \"{question}\".");
+        }
+        ReplyOutcome::Sent { question } => println!(
+            "Reply sent to {run_id} for \"{question}\". It takes effect when a `run` or \
+             `resume` process applies it, unless the wait ends first."
+        ),
+    }
+}
+
+async fn cmd_reply(store_ctx: &StoreCtx, run_id: String, text: &str) -> Result<ReplyOutcome> {
     if text.trim().is_empty() {
         bail!("a reply must contain text");
     }
@@ -1321,7 +1375,7 @@ async fn cmd_reply(store_ctx: &StoreCtx, run_id: String, text: &str) -> Result<(
     .await?;
     match outcome {
         Some(InboxOutcome::Signal(SignalOutcome::Delivered)) => {
-            println!("Reply delivered to {run_id} for \"{question}\".");
+            Ok(ReplyOutcome::Delivered { question })
         }
         Some(InboxOutcome::Signal(SignalOutcome::NotWaiting)) => bail!(
             "run {run_id} stopped waiting before the reply arrived; the run proceeds on an \
@@ -1329,12 +1383,8 @@ async fn cmd_reply(store_ctx: &StoreCtx, run_id: String, text: &str) -> Result<(
         ),
         Some(InboxOutcome::Rejected(reason)) => bail!("reply rejected: {reason}"),
         Some(other) => bail!("unexpected outcome of the reply: {other:?}"),
-        None => println!(
-            "Reply sent to {run_id} for \"{question}\". It takes effect when a `run` or \
-             `resume` process applies it, unless the wait ends first."
-        ),
+        None => Ok(ReplyOutcome::Sent { question }),
     }
-    Ok(())
 }
 
 async fn cmd_cancel(store_ctx: &StoreCtx, run_id: String) -> Result<()> {
@@ -1517,101 +1567,4 @@ impl TerminalHook for CaptureHook {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::{
-        StoreCtx, WORKFLOW_CONTROL_QUEUE_NAME, WORKFLOW_MEMO_PREFIX, ellipsize, inbox_sender,
-        open_queue, open_reader, pending_cancellations, resolve_store, store_options,
-    };
-    use taquba::EnqueueEntry;
-    use taquba::object_store::memory::InMemory;
-    use taquba_workflow::{CancelCommand, Command, MemoStore, RunId};
-
-    #[tokio::test]
-    async fn pending_cancellations_include_inbox_entries_and_control_jobs() {
-        let ctx = StoreCtx {
-            object_store: Arc::new(InMemory::new()),
-            source: "memory".to_string(),
-        };
-        let cancel = |run_id: &str| {
-            EnqueueEntry::from(Command::Cancel(CancelCommand::new(
-                RunId::new(run_id).unwrap(),
-            )))
-        };
-        let queue = open_queue(&ctx).await.unwrap();
-        let sender = inbox_sender(&ctx);
-        sender
-            .send(WORKFLOW_CONTROL_QUEUE_NAME, cancel("01APPLIED"))
-            .await
-            .unwrap();
-        // The pass turns the first entry into a job of the control queue, and
-        // no runtime applies the job. The second entry follows the close, so it
-        // stays in the inbox.
-        queue.apply_inbox_now().await.unwrap();
-        Arc::into_inner(queue).unwrap().close().await.unwrap();
-        sender
-            .send(WORKFLOW_CONTROL_QUEUE_NAME, cancel("01SENT"))
-            .await
-            .unwrap();
-
-        let reader = open_reader(&ctx).await.unwrap();
-        let pending = pending_cancellations(&ctx, &reader).await.unwrap();
-        let mut run_ids: Vec<&str> = pending.keys().map(String::as_str).collect();
-        run_ids.sort_unstable();
-        assert_eq!(run_ids, ["01APPLIED", "01SENT"]);
-    }
-
-    #[tokio::test]
-    async fn a_url_store_keeps_the_memos_under_its_path() {
-        let dir = std::env::temp_dir().join(format!("taquba-research-{}", ulid::Ulid::new()));
-        let ctx = resolve_store(Some(&format!("file://{}/sub", dir.display())))
-            .await
-            .unwrap();
-        MemoStore::new(ctx.object_store.clone(), WORKFLOW_MEMO_PREFIX)
-            .new_run_memo(&RunId::new("01RUN").unwrap())
-            .put("key", b"value")
-            .await
-            .unwrap();
-        let under_path = dir.join("sub").join(WORKFLOW_MEMO_PREFIX).exists();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(under_path);
-    }
-
-    #[test]
-    fn store_options_are_the_provider_variables_in_lowercase() {
-        let vars = [
-            ("AWS_ENDPOINT", "http://127.0.0.1:9000"),
-            ("ENDPOINT", "other"),
-            ("GOOGLE_SERVICE_ACCOUNT", "sa.json"),
-            ("AZURE_STORAGE_ACCOUNT_NAME", "account"),
-            ("HOME", "/home/u"),
-        ]
-        .map(|(name, value)| (name.to_string(), value.to_string()));
-        let options: Vec<(String, String)> = store_options(vars.into_iter()).collect();
-        assert_eq!(
-            options,
-            [
-                ("aws_endpoint", "http://127.0.0.1:9000"),
-                ("google_service_account", "sa.json"),
-                ("azure_storage_account_name", "account"),
-            ]
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-        );
-    }
-
-    #[test]
-    fn ellipsize_keeps_strings_within_the_limit() {
-        assert_eq!(ellipsize("short", 50), "short");
-        let exact = "a".repeat(50);
-        assert_eq!(ellipsize(&exact, 50), exact);
-    }
-
-    #[test]
-    fn ellipsize_truncates_on_char_boundaries() {
-        let ascii = "a".repeat(60);
-        assert_eq!(ellipsize(&ascii, 50), format!("{}...", "a".repeat(47)));
-        let multibyte = "é".repeat(30);
-        assert_eq!(ellipsize(&multibyte, 25), format!("{}...", "é".repeat(22)));
-    }
-}
+mod tests;
