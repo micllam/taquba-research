@@ -1002,45 +1002,23 @@ where
     Ok(fresh)
 }
 
-/// Classify a Rig prompt error as transient or permanent.
+/// Classify a Rig prompt error as transient or permanent. A provider failure is
+/// transient when Rig reports it as retryable.
 pub(crate) fn classify_rig_err(err: PromptError) -> StepError {
-    let msg = err.to_string();
-    match err {
-        // Configuration / runner-policy issues.
+    let retryable = match &err {
+        PromptError::Provider(error) => error.is_retryable(),
+        PromptError::Report(report) => report.is_retryable(),
         PromptError::MaxTurns { .. }
         | PromptError::Cancelled { .. }
-        | PromptError::UnknownToolCall { .. } => {
-            StepError::permanent(format!("LLM permanent failure: {msg}"))
-        }
-
-        // Errors that preserve a provider HTTP status classify by that status.
-        // This covers both non-success responses and error envelopes returned
-        // with a 2xx status (2xx classifies as transient in
-        // `is_transient_status`). Errors without a status (transport, decode,
-        // `MemoryError`, any future variant of the non-exhaustive
-        // `PromptError`) default to transient and are dead-lettered after
-        // `max_attempts` when persistent.
-        err => match err.provider_response_status() {
-            Some(status) => classify_status(status.as_u16(), &msg),
-            None => StepError::transient(format!("LLM call failed: {msg}")),
-        },
+        | PromptError::UnknownToolCall { .. } => false,
+        // `PromptError::Memory` and a future variant.
+        _ => true,
+    };
+    if retryable {
+        StepError::transient(format!("LLM call failed: {err}"))
+    } else {
+        StepError::permanent(format!("LLM permanent failure: {err}"))
     }
-}
-
-fn classify_status(code: u16, msg: &str) -> StepError {
-    match code {
-        401 | 403 => StepError::permanent(format!("LLM authentication failure: {msg}")),
-        code if !is_transient_status(code) => {
-            StepError::permanent(format!("LLM client error {code}: {msg}"))
-        }
-        _ => StepError::transient(format!("LLM HTTP error: {msg}")),
-    }
-}
-
-/// HTTP retry policy: 429 (rate limit), 5xx (server errors) and any non-4xx
-/// code are transient, and any other 4xx is permanent.
-fn is_transient_status(code: u16) -> bool {
-    code == 429 || !(400..500).contains(&code)
 }
 
 impl From<SearchError> for StepError {
@@ -1185,7 +1163,7 @@ mod tests {
     use reqwest::StatusCode;
     use rig_core::http_client;
     use rig_core::test_utils::MockCompletionModel;
-    use rig_core::{ProviderError, ProviderResponseError};
+    use rig_core::{ErrorKind, ErrorReport, ProviderError, ProviderResponseError};
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
     use taquba_workflow::{MemoStore, RunId, StepErrorKind};
@@ -1266,51 +1244,6 @@ mod tests {
     }
 
     #[test]
-    fn is_transient_status_retries_rate_limit_and_5xx() {
-        assert!(is_transient_status(429));
-        assert!(is_transient_status(500));
-        assert!(is_transient_status(502));
-        assert!(is_transient_status(503));
-        assert!(is_transient_status(504));
-    }
-
-    #[test]
-    fn is_transient_status_marks_non_429_4xx_as_permanent() {
-        assert!(!is_transient_status(400));
-        assert!(!is_transient_status(401));
-        assert!(!is_transient_status(403));
-        assert!(!is_transient_status(404));
-        assert!(!is_transient_status(422));
-    }
-
-    #[test]
-    fn is_transient_status_defaults_outside_4xx_to_transient() {
-        // Codes outside the standard 4xx range fall back to transient.
-        assert!(is_transient_status(200));
-        assert!(is_transient_status(0));
-    }
-
-    #[test]
-    fn classify_status_routes_401_403_to_permanent() {
-        assert_permanent(&classify_status(401, "unauthorized"));
-        assert_permanent(&classify_status(403, "forbidden"));
-    }
-
-    #[test]
-    fn classify_status_routes_other_4xx_to_permanent() {
-        assert_permanent(&classify_status(400, "bad request"));
-        assert_permanent(&classify_status(404, "not found"));
-        assert_permanent(&classify_status(422, "unprocessable"));
-    }
-
-    #[test]
-    fn classify_status_routes_rate_limit_and_5xx_to_transient() {
-        assert_transient(&classify_status(429, "rate limited"));
-        assert_transient(&classify_status(500, "server error"));
-        assert_transient(&classify_status(503, "unavailable"));
-    }
-
-    #[test]
     fn classify_structured_err_empty_response_is_transient() {
         assert_transient(&classify_structured_err(
             StructuredOutputError::EmptyResponse,
@@ -1329,31 +1262,41 @@ mod tests {
     }
 
     #[test]
-    fn classify_rig_err_http_401_is_permanent() {
-        let err = PromptError::Provider(http_status(401));
-        assert_permanent(&classify_rig_err(err));
-    }
-
-    #[test]
-    fn classify_rig_err_http_429_is_transient() {
-        let err = PromptError::Provider(http_status(429));
-        assert_transient(&classify_rig_err(err));
-    }
-
-    #[test]
-    fn classify_rig_err_provider_response_4xx_is_permanent() {
-        let err = PromptError::Provider(ProviderError::ProviderResponse(
-            ProviderResponseError::new(StatusCode::BAD_REQUEST, "invalid request"),
-        ));
-        assert_permanent(&classify_rig_err(err));
-    }
-
-    #[test]
-    fn classify_rig_err_provider_response_2xx_envelope_is_transient() {
-        let err = PromptError::Provider(ProviderError::ProviderResponse(
-            ProviderResponseError::new(StatusCode::OK, "{\"error\":{\"message\":\"overloaded\"}}"),
-        ));
-        assert_transient(&classify_rig_err(err));
+    fn classify_rig_err_follows_the_retry_verdict_of_rig() {
+        let failures = [
+            http_status(401),
+            http_status(408),
+            http_status(429),
+            ProviderError::ProviderResponse(ProviderResponseError::new(
+                StatusCode::OK,
+                "{\"error\":{\"type\":\"overloaded_error\"}}",
+            )),
+            ProviderError::ProviderResponse(ProviderResponseError::new(
+                StatusCode::OK,
+                "{\"error\":{\"message\":\"no code\"}}",
+            )),
+            ProviderError::Truncated,
+        ];
+        for failure in failures {
+            let retryable = failure.is_retryable();
+            let err = classify_rig_err(PromptError::Provider(failure));
+            assert_eq!(
+                matches!(err.kind, StepErrorKind::Transient),
+                retryable,
+                "{}",
+                err.message
+            );
+        }
+        for retryable in [true, false] {
+            let report = ErrorReport::new(ErrorKind::Http, "relayed").with_retryable(retryable);
+            let err = classify_rig_err(PromptError::Report(report));
+            assert_eq!(
+                matches!(err.kind, StepErrorKind::Transient),
+                retryable,
+                "{}",
+                err.message
+            );
+        }
     }
 
     #[test]

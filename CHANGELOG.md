@@ -98,6 +98,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certificate store of the platform, in place of a bundled set of root
   certificates. Install the CA certificates of the platform on a host without
   them.
+- A failed model call takes the retry class that rig reports for it, so a step
+  retries a 408 or a 425 and fails at once on an unreadable reply or on an error
+  reply with a 2xx status and an unknown code. A deployment keeps its
+  configuration.
 
 ### Fixed
 - The CLI keeps the workflow memos and the fetch job records of a `--store` URL

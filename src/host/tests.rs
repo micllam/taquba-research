@@ -303,7 +303,11 @@ async fn a_call_to_a_tool_without_a_definition_fails_the_step_permanently() {
 
 #[tokio::test]
 async fn a_failed_model_call_fails_the_step_transiently() {
-    let model = MockCompletionModel::from_turns([MockTurn::error("overloaded")]);
+    let model = MockCompletionModel::from_turns([MockTurn::provider_response_error(
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "overloaded",
+        "request-1",
+    )]);
     let tools = tools(Arc::new(CountingSearch::default()));
     let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
     let memo = step_memo(1);
