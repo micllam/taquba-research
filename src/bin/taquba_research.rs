@@ -790,7 +790,7 @@ async fn cmd_run(cli: &Cli, store_ctx: &StoreCtx, query: String) -> Result<()> {
     // The run id is generated before submit so the terminal hook can filter
     // notifications to this run.
     let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
-    let (runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id).await?;
+    let (runtime, handles) = spawn_runtime(store_ctx, queue.clone(), runner, &run_id).await?;
 
     let input = ResearchStepRunner::initial_state(query.clone(), config);
     runtime
@@ -810,7 +810,9 @@ async fn cmd_run(cli: &Cli, store_ctx: &StoreCtx, query: String) -> Result<()> {
         "Run {run_id} started. (Ctrl+C to interrupt; resume with `taquba-research resume {run_id}`)"
     );
 
-    finalize(cli, store_ctx, handles, &run_id).await
+    let result = finalize(cli, store_ctx, handles, &run_id).await;
+    drop(runtime);
+    result.and(close_queue(queue).await)
 }
 
 async fn cmd_resume(cli: &Cli, store_ctx: &StoreCtx, run_id: String, force: bool) -> Result<()> {
@@ -874,15 +876,24 @@ async fn cmd_resume(cli: &Cli, store_ctx: &StoreCtx, run_id: String, force: bool
     let runner = build_runner(cli)?;
     let queue = open_queue(store_ctx).await?;
 
-    // The runtime is discarded: cmd_resume does not submit new work. It starts
-    // a worker to process the existing pending step.
-    let (_runtime, handles) = spawn_runtime(store_ctx, queue, runner, &run_id).await?;
+    // cmd_resume does not submit new work. It starts a worker to process the
+    // existing pending step.
+    let (runtime, handles) = spawn_runtime(store_ctx, queue.clone(), runner, &run_id).await?;
 
     println!("Resuming {run_id}...");
 
     // The run's step jobs already exist in the queue. The terminal hook fires
     // when the run reaches a terminal step.
-    finalize(cli, store_ctx, handles, &run_id).await
+    let result = finalize(cli, store_ctx, handles, &run_id).await;
+    drop(runtime);
+    result.and(close_queue(queue).await)
+}
+
+/// Close the writer `queue` after its worker and fetch runner stop, so its last
+/// liveness beat marks a clean close.
+async fn close_queue(queue: Arc<Queue>) -> Result<()> {
+    let queue = Arc::into_inner(queue).ok_or_else(|| anyhow!("the queue is still shared"))?;
+    queue.close().await.context("closing taquba queue")
 }
 
 /// Handles tied to a running `WorkflowRuntime` worker task and its paired
