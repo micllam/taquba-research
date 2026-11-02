@@ -40,8 +40,8 @@ pub struct ResearchConfig {
     /// step, and the `fetch_page` tool of the investigating step returns one
     /// chunk per call.
     pub max_page_chars: usize,
-    /// Model-call budget of the investigating step. With 0 the run skips the
-    /// step. A state persisted without the field decodes as 0.
+    /// Maximum number of model calls of the investigating step. With 0 the run
+    /// skips the step. A state persisted without the field decodes as 0.
     #[serde(default)]
     pub investigation_turns: usize,
     /// How long a run waits for the reply of the user to a question of the

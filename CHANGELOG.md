@@ -54,11 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads the step job by the job id that the view reports.
 - **Breaking:** `Phase` gains `Investigating`, so an exhaustive match on `Phase`
   fails to compile. Add an arm for `Phase::Investigating`.
-- **Breaking:** `ResearchConfig` gains `investigation_turns`, the model-call
-  budget of the investigating step, and `clarification_wait_secs`, so a struct
-  literal without them fails to compile and a state of 0.5.0 decodes with 0 and
-  `None`. Set the fields, or start from `ResearchConfig::new`, which sets 8 and
-  `None`.
+- **Breaking:** `ResearchConfig` gains `investigation_turns`, the maximum number
+  of model calls of the investigating step, and `clarification_wait_secs`, so a
+  struct literal without them fails to compile and a state of 0.5.0 decodes with
+  0 and `None`. Set the fields, or start from `ResearchConfig::new`, which sets
+  8 and `None`.
 - **Breaking:** `StateSummary` gains `pending_question`, the question of a run
   that waits for a reply, and `transcript`, so a struct literal of it fails to
   compile. Build the summary with `summarize_state`.

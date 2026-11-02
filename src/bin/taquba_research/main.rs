@@ -145,8 +145,9 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     max_sources: usize,
 
-    /// Model-call budget of the investigating step, which searches and fetches
-    /// pages for the gaps of the summaries. With 0 the run skips the step.
+    /// Maximum number of model calls of the investigating step, which searches
+    /// and fetches pages for the gaps of the summaries. With 0 the run skips
+    /// the step.
     #[arg(long, default_value_t = 8)]
     investigation_turns: usize,
 
