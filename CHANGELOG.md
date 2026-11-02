@@ -62,9 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `StateSummary` gains `pending_question`, the question of a run
   that waits for a reply, and `transcript`, so a struct literal of it fails to
   compile. Build the summary with `summarize_state`.
-- **Breaking:** The crate depends on rig-core 0.45 and rig-agent 0.45, so the
-  constructors of `ResearchStepRunner` take the provider clients of rig 0.45.
-  Upgrade rig to 0.45 in the crate that builds the clients.
+- **Breaking:** The crate depends on rig-core 0.46 and rig-agent 0.46, so the
+  constructors of `ResearchStepRunner` take the provider clients of rig 0.46.
+  Upgrade rig to 0.46 in the crate that builds the clients.
 - **Breaking:** The `cancel` command sends a `taquba_workflow::CancelCommand`
   through the inbox to the control queue `store::WORKFLOW_CONTROL_QUEUE_NAME` in
   place of a sentinel object, which the `run` or `resume` process applies within
