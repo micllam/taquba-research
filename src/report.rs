@@ -121,8 +121,8 @@ pub(crate) fn render_markdown(
     out
 }
 
-/// Render a compact " · tokens: <in> in / <out> out / <total>" suffix for the
-/// stats line. Returns an empty string when no provider reported usage
+/// Render a compact ` · tokens: <in> in / <out> out / <total> total` suffix for
+/// the stats line. Returns an empty string when no provider reported usage
 /// (all-zero `TokenUsage`).
 fn format_tokens(u: &TokenUsage) -> String {
     if u.is_zero() {

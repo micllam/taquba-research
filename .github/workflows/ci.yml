@@ -38,6 +38,9 @@ jobs:
       - run: cargo doc --features aws --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+      - run: cargo doc --features aws --no-deps --document-private-items --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
       # Every feature of the crate must be built by a job of this file.
       - name: check that every feature is built
