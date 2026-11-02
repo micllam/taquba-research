@@ -193,21 +193,12 @@ pub async fn list_runs(view: &WorkflowView) -> taquba_workflow::Result<Vec<Liste
 pub async fn count_waiting_step_jobs(view: &QueueView) -> taquba::Result<usize> {
     let mut count = 0usize;
     for status in [JobStatus::Pending, JobStatus::Scheduled] {
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let page = view
-                .list_jobs(WORKFLOW_QUEUE_NAME, status, cursor.as_deref(), SCAN_PAGE)
-                .await?;
-            count += page
-                .jobs
-                .iter()
-                .filter(|j| !j.headers.contains_key(HEADER_TERMINAL))
-                .count();
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
+        count += view
+            .jobs(WORKFLOW_QUEUE_NAME, status, SCAN_PAGE)
+            .try_fold(0, |n, job| async move {
+                Ok(n + usize::from(!job.headers.contains_key(HEADER_TERMINAL)))
+            })
+            .await?;
     }
     Ok(count)
 }
