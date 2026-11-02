@@ -424,48 +424,46 @@ async fn open_queue(ctx: &StoreCtx) -> Result<Arc<Queue>> {
     Ok(Arc::new(queue))
 }
 
-/// Whether a queue has ever been created in this store. A [`QueueReader`]
-/// cannot open a store without a manifest, so the inspection commands map that
-/// case to "no runs".
-async fn queue_exists(ctx: &StoreCtx) -> Result<bool> {
-    use futures_util::TryStreamExt;
-    let mut stream = ctx
-        .object_store
-        .list(Some(&ObjectPath::from(QUEUE_DB_NAME)));
-    Ok(stream
-        .try_next()
-        .await
-        .context("probing queue store")?
-        .is_some())
-}
-
-/// Open a read-only view of the queue store. `FollowLatest` does not perform
-/// object-store writes, so read-only credentials suffice.
-async fn open_reader(ctx: &StoreCtx) -> Result<QueueReader> {
-    QueueReader::open_with_options(
+/// Open a read-only view of the queue store, or `None` when no queue has been
+/// created in the store. `FollowLatest` does not perform object-store writes,
+/// so read-only credentials suffice.
+async fn open_reader(ctx: &StoreCtx) -> Result<Option<QueueReader>> {
+    let opened = QueueReader::open_with_options(
         ctx.object_store.clone(),
         QUEUE_DB_NAME,
         ReaderOptions::default().mode(ReaderMode::FollowLatest),
     )
-    .await
-    .context("opening queue reader")
+    .await;
+    match opened {
+        Ok(reader) => Ok(Some(reader)),
+        Err(taquba::Error::StoreNotInitialized { .. }) => Ok(None),
+        Err(e) => Err(e).context("opening queue reader"),
+    }
 }
 
-/// Run `op` against a read-only view of the queue store, retrying once on
-/// failure. A `FollowLatest` read can fail on an object collected under its
-/// view. The retry opens a fresh reader whose view postdates the collection.
-async fn with_reader<T>(ctx: &StoreCtx, op: impl AsyncFn(&QueueReader) -> Result<T>) -> Result<T> {
-    let reader = open_reader(ctx).await?;
+/// Run `op` against a read-only view of the queue store and retry it once on
+/// failure. Returns `None` when no queue has been created in the store. A
+/// `FollowLatest` read can fail on an object collected under its view. The
+/// retry opens a fresh reader whose view postdates the collection.
+async fn with_reader<T>(
+    ctx: &StoreCtx,
+    op: impl AsyncFn(&QueueReader) -> Result<T>,
+) -> Result<Option<T>> {
+    let Some(reader) = open_reader(ctx).await? else {
+        return Ok(None);
+    };
     let first = op(&reader).await;
     let _ = reader.close().await;
     match first {
-        Ok(v) => Ok(v),
+        Ok(v) => Ok(Some(v)),
         Err(first) => {
             tracing::debug!(error = %first, "read failed; retrying with a fresh reader");
-            let reader = open_reader(ctx).await?;
+            let Some(reader) = open_reader(ctx).await? else {
+                return Ok(None);
+            };
             let second = op(&reader).await;
             let _ = reader.close().await;
-            second
+            second.map(Some)
         }
     }
 }
@@ -856,10 +854,7 @@ async fn cmd_resume(
     // the (exclusive) writer open. A reader-side check suffices: the worker
     // acts on the same step job.
     {
-        if !queue_exists(store_ctx).await? {
-            bail!("no run {run_id} (store contains no runs)");
-        }
-        let (claimed, waiting, status, cancel_requested) = with_reader(store_ctx, async |reader| {
+        let read = with_reader(store_ctx, async |reader| {
             let claimed = count_claimed_jobs(reader).await?;
             let waiting = store::count_waiting_step_jobs(reader.view()).await?;
             let status = view_status(&workflow_view(store_ctx, reader), &run_id).await?;
@@ -869,6 +864,9 @@ async fn cmd_resume(
             Ok((claimed, waiting, status, cancel_requested))
         })
         .await?;
+        let Some((claimed, waiting, status, cancel_requested)) = read else {
+            bail!("no run {run_id} (store contains no runs)");
+        };
         let state = status.map(|s| s.state);
         match state {
             None => bail!("no run {run_id} (unknown or expired)"),
@@ -1141,7 +1139,8 @@ async fn gather_rows(store_ctx: &StoreCtx) -> Result<Vec<RunRow>> {
         };
         Ok((runs, cancellations))
     })
-    .await?;
+    .await?
+    .unwrap_or_default();
     Ok(runs
         .into_iter()
         .map(|run| {
@@ -1153,11 +1152,6 @@ async fn gather_rows(store_ctx: &StoreCtx) -> Result<Vec<RunRow>> {
 }
 
 async fn cmd_list(store_ctx: &StoreCtx) -> Result<()> {
-    if !queue_exists(store_ctx).await? {
-        println!("Store: {}", store_ctx.source);
-        println!("No runs yet.");
-        return Ok(());
-    }
     let rows = gather_rows(store_ctx).await.context("listing runs")?;
     println!("Store: {}", store_ctx.source);
     if rows.is_empty() {
@@ -1181,13 +1175,10 @@ async fn cmd_list(store_ctx: &StoreCtx) -> Result<()> {
 }
 
 async fn cmd_status(store_ctx: &StoreCtx, run_id: String) -> Result<()> {
-    if !queue_exists(store_ctx).await? {
-        bail!("no run {run_id} (store contains no runs)");
-    }
     let parsed: RunId = run_id
         .parse()
         .with_context(|| format!("invalid run id `{run_id}`"))?;
-    let (run, progress, job, history, pending_cancel) = with_reader(store_ctx, async |reader| {
+    let read = with_reader(store_ctx, async |reader| {
         let view = workflow_view(store_ctx, reader);
         let run = view.run(&parsed).await?;
         let pending_cancel = match run.as_ref().map(|run| &run.status.state) {
@@ -1210,6 +1201,9 @@ async fn cmd_status(store_ctx: &StoreCtx, run_id: String) -> Result<()> {
         Ok((run, progress, job, history, pending_cancel))
     })
     .await?;
+    let Some((run, progress, job, history, pending_cancel)) = read else {
+        bail!("no run {run_id} (store contains no runs)");
+    };
     let run = run.ok_or_else(|| anyhow!("no run {run_id} (unknown or expired)"))?;
 
     let state = &run.status.state;
@@ -1299,16 +1293,16 @@ async fn cmd_show(store_ctx: &StoreCtx, run_id: String, output: Option<&str>) ->
             String::from_utf8(bytes.to_vec()).context("decoding stored report as UTF-8")?
         }
         Err(taquba::object_store::Error::NotFound { .. }) => {
-            if !queue_exists(store_ctx).await? {
-                bail!("run {run_id} has no stored report (store contains no runs)");
-            }
             let parsed: RunId = run_id
                 .parse()
                 .with_context(|| format!("invalid run id `{run_id}`"))?;
-            let status = with_reader(store_ctx, async |reader| {
+            let read = with_reader(store_ctx, async |reader| {
                 view_status(&workflow_view(store_ctx, reader), &parsed).await
             })
             .await?;
+            let Some(status) = read else {
+                bail!("run {run_id} has no stored report (store contains no runs)");
+            };
             match status.map(|s| s.state) {
                 None => bail!("run {run_id} has no stored report (unknown or expired)"),
                 Some(RunState::Terminated(termination)) => bail!(
@@ -1361,18 +1355,18 @@ async fn cmd_reply(store_ctx: &StoreCtx, run_id: String, text: &str) -> Result<R
     if text.trim().is_empty() {
         bail!("a reply must contain text");
     }
-    if !queue_exists(store_ctx).await? {
-        bail!("no run {run_id} (store contains no runs)");
-    }
     let parsed: RunId = run_id
         .parse()
         .with_context(|| format!("invalid run id `{run_id}`"))?;
-    let (status, job) = with_reader(store_ctx, async |reader| {
+    let read = with_reader(store_ctx, async |reader| {
         let status = view_status(&workflow_view(store_ctx, reader), &parsed).await?;
         let job = current_step(reader, status.as_ref()).await?;
         Ok((status, job))
     })
     .await?;
+    let Some((status, job)) = read else {
+        bail!("no run {run_id} (store contains no runs)");
+    };
     let not_waiting = || anyhow!("run {run_id} is not waiting for a reply");
     let status = status
         .filter(|status| matches!(status.state, RunState::Waiting { .. }))
@@ -1409,16 +1403,16 @@ async fn cmd_reply(store_ctx: &StoreCtx, run_id: String, text: &str) -> Result<R
 }
 
 async fn cmd_cancel(store_ctx: &StoreCtx, run_id: String) -> Result<()> {
-    if !queue_exists(store_ctx).await? {
-        bail!("no run {run_id} (store contains no runs)");
-    }
     let parsed: RunId = run_id
         .parse()
         .with_context(|| format!("invalid run id `{run_id}`"))?;
-    let status = with_reader(store_ctx, async |reader| {
+    let read = with_reader(store_ctx, async |reader| {
         view_status(&workflow_view(store_ctx, reader), &parsed).await
     })
     .await?;
+    let Some(status) = read else {
+        bail!("no run {run_id} (store contains no runs)");
+    };
     match status.map(|s| s.state) {
         Some(RunState::Terminated(termination)) => bail!(
             "run {run_id} is not cancellable (status: {})",

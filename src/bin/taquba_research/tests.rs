@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 use super::{
     Cli, ReplyOutcome, StoreCtx, WORKFLOW_CONTROL_QUEUE_NAME, WORKFLOW_MEMO_PREFIX, cmd_reply,
-    cmd_resume, cmd_run, ellipsize, gather_rows, inbox_sender, open_queue, open_reader,
+    cmd_resume, cmd_run, cmd_status, ellipsize, gather_rows, inbox_sender, open_queue, open_reader,
     pending_cancellations, resolve_store, store_options, transcript_lines, with_reader,
     writer_is_live,
 };
@@ -163,7 +163,11 @@ async fn a_reply_without_a_writer_takes_effect_at_resume() {
     interrupt.send(()).unwrap();
     join(run).await;
     let live = with_reader(&harness.ctx, async |reader| writer_is_live(reader).await).await;
-    assert!(!live.unwrap(), "the interrupted run closes its writer");
+    assert_eq!(
+        live.unwrap(),
+        Some(false),
+        "the interrupted run closes its writer"
+    );
 
     let outcome = cmd_reply(&harness.ctx, run_id.clone(), REPLY).await;
     let question = QUESTION.to_string();
@@ -211,11 +215,22 @@ async fn pending_cancellations_include_inbox_entries_and_control_jobs() {
         .await
         .unwrap();
 
-    let reader = open_reader(&ctx).await.unwrap();
+    let reader = open_reader(&ctx).await.unwrap().unwrap();
     let pending = pending_cancellations(&ctx, &reader).await.unwrap();
     let mut run_ids: Vec<&str> = pending.keys().map(String::as_str).collect();
     run_ids.sort_unstable();
     assert_eq!(run_ids, ["01APPLIED", "01SENT"]);
+}
+
+#[tokio::test]
+async fn a_store_without_a_queue_has_no_runs() {
+    let ctx = StoreCtx {
+        object_store: Arc::new(InMemory::new()),
+        source: "memory".to_string(),
+    };
+    assert!(gather_rows(&ctx).await.unwrap().is_empty());
+    let err = cmd_status(&ctx, "01RUN".to_string()).await.unwrap_err();
+    assert_eq!(err.to_string(), "no run 01RUN (store contains no runs)");
 }
 
 #[tokio::test]
