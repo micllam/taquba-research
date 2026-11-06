@@ -16,9 +16,9 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use taquba::object_store;
-use taquba::{JobStatus, KvOrder, QueueReader, QueueView};
+use taquba::{KvOrder, QueueReader, QueueView};
 use taquba_workflow::{
-    HEADER_TERMINAL, ListedRun, MemoStore, RunFilter, RunId, RunState, TerminalStatus, WorkflowView,
+    ListedRun, MemoStore, RunFilter, RunId, RunState, TerminalStatus, WorkflowView,
 };
 
 use crate::state::TokenUsage;
@@ -121,13 +121,15 @@ pub enum RunDisplayStatus {
     /// The view reports [`RunState::Cancelling`], or a cancel command awaits a
     /// writer.
     CancellationRequested,
-    /// The view reports [`RunState::Waiting`]: the run waits for the reply of
-    /// the user.
+    /// The view reports [`RunState::Waiting`]: the run is waiting for the reply
+    /// of the user.
     Waiting,
-    /// The view reports [`RunState::Running`]: a worker claimed the current
+    /// The view reports [`RunState::Running`]: a worker has claimed the current
     /// step. A claim abandoned by a killed worker process also derives this
     /// state: lease expiry is writer-process state, so the job stays claimed
-    /// until the next writer open requeues it.
+    /// until the next writer open requeues it. The view also reports
+    /// [`RunState::WaitingForGroup`]: the current step is waiting for the jobs
+    /// that the previous step submitted.
     Running,
     /// The view reports [`RunState::Pending`] or [`RunState::Scheduled`]: an
     /// interrupted run that awaits `resume`, the interval between an
@@ -171,7 +173,7 @@ pub fn derive_display_status(state: &RunState, cancel_requested: bool) -> RunDis
         _ if cancel_requested => RunDisplayStatus::CancellationRequested,
         RunState::Cancelling { .. } => RunDisplayStatus::CancellationRequested,
         RunState::Waiting { .. } => RunDisplayStatus::Waiting,
-        RunState::Running => RunDisplayStatus::Running,
+        RunState::Running | RunState::WaitingForGroup { .. } => RunDisplayStatus::Running,
         RunState::Pending | RunState::Scheduled { .. } => RunDisplayStatus::Queued,
     }
 }
@@ -186,21 +188,13 @@ pub async fn list_runs(view: &WorkflowView) -> taquba_workflow::Result<Vec<Liste
         .await
 }
 
-/// Number of step jobs waiting in the workflow queue (pending or scheduled,
-/// terminal notifications excluded). The workflow is sequential, so each
+/// Number of step jobs waiting in the workflow queue, pending or scheduled,
+/// from the job counters of the queue. The workflow is sequential, so each
 /// waiting run has exactly one step job and the count equals the number of
 /// interrupted or queued runs. `view` is the view of the writer or of a reader.
 pub async fn count_waiting_step_jobs(view: &QueueView) -> taquba::Result<usize> {
-    let mut count = 0usize;
-    for status in [JobStatus::Pending, JobStatus::Scheduled] {
-        count += view
-            .jobs(WORKFLOW_QUEUE_NAME, status, SCAN_PAGE)
-            .try_fold(0, |n, job| async move {
-                Ok(n + usize::from(!job.headers.contains_key(HEADER_TERMINAL)))
-            })
-            .await?;
-    }
-    Ok(count)
+    let stats = view.stats(WORKFLOW_QUEUE_NAME).await?;
+    Ok(usize::try_from(stats.pending + stats.scheduled).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -209,9 +203,7 @@ mod tests {
     use std::collections::HashMap;
     use taquba::object_store::memory::InMemory;
     use taquba::{Queue, ReaderMode, ReaderOptions};
-    use taquba_workflow::{
-        HEADER_RUN_ID, NoopTerminalHook, RunOptions, RunSpec, StepError, StepRef, WorkflowRuntime,
-    };
+    use taquba_workflow::{RunOptions, RunSpec, StepError, StepRef, WorkflowRuntime};
 
     fn terminated(status: TerminalStatus) -> RunState {
         RunState::Terminated(taquba_workflow::RunTermination {
@@ -270,6 +262,14 @@ mod tests {
                 RunDisplayStatus::Running,
                 CancellationRequested,
             ),
+            (
+                RunState::WaitingForGroup {
+                    group_id: RunId::new("group").unwrap(),
+                    timeout_at_ms: 0,
+                },
+                RunDisplayStatus::Running,
+                CancellationRequested,
+            ),
             (RunState::Pending, Queued, CancellationRequested),
             (
                 RunState::Scheduled { run_at_ms: 0 },
@@ -294,16 +294,11 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let queue = Arc::new(Queue::open(object_store.clone(), "q").await.unwrap());
         // The worker is not started, so the submitted steps stay pending.
-        let runtime = WorkflowRuntime::builder(
-            queue.clone(),
-            object_store.clone(),
-            AlwaysFail,
-            NoopTerminalHook,
-        )
-        .queue_name(WORKFLOW_QUEUE_NAME)
-        .memo_prefix(WORKFLOW_MEMO_PREFIX)
-        .build()
-        .unwrap();
+        let runtime = WorkflowRuntime::builder(queue.clone(), object_store.clone(), AlwaysFail)
+            .queue_name(WORKFLOW_QUEUE_NAME)
+            .memo_prefix(WORKFLOW_MEMO_PREFIX)
+            .build()
+            .unwrap();
         for (run_id, query) in queries {
             runtime
                 .submit(RunSpec {
@@ -357,33 +352,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn count_waiting_excludes_terminal_notifications() {
-        use taquba::EnqueueOptions;
+    async fn count_waiting_step_jobs_counts_each_queued_run() {
+        let (reader, _) =
+            reader_with_runs(&[("01A", "first query"), ("01B", "second query")]).await;
 
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let queue = Queue::open(object_store, "q").await.unwrap();
-        for run in ["01A", "01B"] {
-            queue
-                .enqueue_with(
-                    WORKFLOW_QUEUE_NAME,
-                    Vec::new(),
-                    EnqueueOptions::default().header(HEADER_RUN_ID, run),
-                )
-                .await
-                .unwrap();
-        }
-        queue
-            .enqueue_with(
-                WORKFLOW_QUEUE_NAME,
-                Vec::new(),
-                EnqueueOptions::default()
-                    .header(HEADER_RUN_ID, "01A")
-                    .header(HEADER_TERMINAL, "true"),
-            )
-            .await
-            .unwrap();
+        assert_eq!(count_waiting_step_jobs(reader.view()).await.unwrap(), 2);
 
-        assert_eq!(count_waiting_step_jobs(queue.view()).await.unwrap(), 2);
+        reader.close().await.unwrap();
     }
 
     struct AlwaysFail;

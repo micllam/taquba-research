@@ -1168,6 +1168,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "html2text"
 version = "0.17.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2267,11 +2273,11 @@ dependencies = [
 
 [[package]]
 name = "rand_xoshiro"
-version = "0.7.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
+checksum = "662effc7698e08ea324d3acccf8d9d7f7bf79b9785e270a174ea36e56900c91d"
 dependencies = [
- "rand_core 0.9.5",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -2940,9 +2946,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slatedb"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "543da8a0c19e1a6af286a3c314a1c936af598603f3af98549514fffffb837334"
+checksum = "d4c3416299ebf61cbaa9b2fb2fc574a08ead53c9abf0eeaa1f84b23d6c530d2c"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -2965,11 +2971,12 @@ dependencies = [
  "object_store",
  "ouroboros",
  "parking_lot",
- "rand 0.9.5",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "siphasher",
  "slatedb-common",
+ "slatedb-mirror",
  "slatedb-txn-obj",
  "smallvec",
  "sysinfo",
@@ -2985,14 +2992,18 @@ dependencies = [
 
 [[package]]
 name = "slatedb-common"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5cb9fe0fa807c333fbb5880b222f5e72889fa22e40b2f13f479490d8b22f192"
+checksum = "9b4bc81b9976656a06649896cc62d44d45eb9b9125a8b8b5c0ffd5469915bca2"
 dependencies = [
+ "async-trait",
+ "bytes",
  "chrono",
  "log",
+ "lru",
  "object_store",
- "rand 0.9.5",
+ "parking_lot",
+ "rand 0.10.3",
  "rand_xoshiro",
  "serde",
  "thread_local",
@@ -3000,10 +3011,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "slatedb-txn-obj"
-version = "0.17.0"
+name = "slatedb-mirror"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "872044a3b57e2846a3761619bab7cb88052034d137cf17afb2382c63a24c3b11"
+checksum = "b7c444accc750b41fa54191fa503ff284ae4921018b7168531b985e5c9fe84ea"
+dependencies = [
+ "async-trait",
+ "backon",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "log",
+ "md-5",
+ "object_store",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "slatedb-common",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "slatedb-txn-obj"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "780edc205fafc7a25137979d21bcfa22ec77de511e64dc32d61a33f7c979321e"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3171,9 +3206,9 @@ dependencies = [
 
 [[package]]
 name = "taquba"
-version = "0.16.0"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33fd10f2d279a66f1539304248621e4418ad915daa614699be3b0aa196694568"
+checksum = "124c790f79e617292feedc0b6f72507819f60e5695a9b81f705129705958e0f5"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3220,9 +3255,9 @@ dependencies = [
 
 [[package]]
 name = "taquba-workflow"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2aac8c4105dcdc1315cb62fcd371dae27b74132eac6f7c050f1c53e884166b24"
+checksum = "75b7bb4ad54295b292f61d43f694bbba05db288c28f82378eee122bddbdd9758"
 dependencies = [
  "bytes",
  "futures-util",

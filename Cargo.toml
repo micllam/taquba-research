@@ -32,8 +32,8 @@ path = "src/bin/taquba_research/main.rs"
 features = ["aws"]
 
 [dependencies]
-taquba = "0.16"
-taquba-workflow = "0.15"
+taquba = "0.17"
+taquba-workflow = "0.16"
 rig-core = { version = "0.46", features = ["reqwest"] }
 rig-agent = "0.46"
 

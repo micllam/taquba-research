@@ -99,9 +99,9 @@ pub(crate) fn ollama_models(client: ollama::Ollama) -> Models {
     Arc::new(move |model| client.native_completion(model).into())
 }
 
-/// What the terminal hook persists for a finished run: the final report and the
-/// metadata to render it. The runner builds a `RunRecord` only on success, and
-/// a failure reason is stored in [`taquba_workflow::RunOutcome::error`].
+/// The result of a succeeded run: the final report and the metadata to render
+/// it. The runner builds a `RunRecord` only on success, and a failure reason is
+/// stored in [`taquba_workflow::RunTermination::error`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     /// Final report.
@@ -1429,23 +1429,6 @@ mod tests {
         }
     }
 
-    struct SignalOutcome {
-        tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<taquba_workflow::RunOutcome>>>,
-    }
-
-    impl taquba_workflow::TerminalHook for SignalOutcome {
-        async fn on_termination(
-            &self,
-            outcome: &taquba_workflow::RunOutcome,
-            _effects: &taquba_workflow::TerminalEffects,
-        ) -> Result<(), StepError> {
-            if let Some(tx) = self.tx.lock().unwrap().take() {
-                let _ = tx.send(outcome.clone());
-            }
-            Ok(())
-        }
-    }
-
     #[tokio::test]
     async fn the_writing_step_commits_its_progress_and_writes_the_report() {
         use crate::store::run_progress;
@@ -1478,11 +1461,7 @@ mod tests {
             Arc::new(NoSearch),
         )
         .with_report_store(object_store.clone(), &Path::default());
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let hook = SignalOutcome {
-            tx: std::sync::Mutex::new(Some(tx)),
-        };
-        let runtime = WorkflowRuntime::builder(queue.clone(), object_store.clone(), runner, hook)
+        let runtime = WorkflowRuntime::builder(queue.clone(), object_store.clone(), runner)
             .queue_name("test-workflow")
             .memo_prefix("test-memo")
             .max_concurrent_steps(1)
@@ -1507,8 +1486,8 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = rx.await.unwrap();
-        assert_eq!(outcome.status, TerminalStatus::Succeeded);
+        let outcome = runtime.wait(&run_id).await.unwrap();
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
         let _ = shutdown_tx.send(());
         let _ = worker.await;
 

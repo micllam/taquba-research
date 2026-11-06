@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `store::WORKFLOW_MEMO_PREFIX`, the memo prefix of both runtimes, and
-  `store::workflow_view`, the `WorkflowView` of taquba-workflow 0.15 over a
+  `store::workflow_view`, the `WorkflowView` of taquba-workflow 0.16 over a
   `QueueReader`. The `workflow` module re-exports `RunState`, `RunStatus`,
   `RunTermination`, `StepErrorKind` and `WorkflowView`.
 - The `status` command prints `step`, the current step number from the workflow
@@ -88,8 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** The `gc` command deletes the reports at the default location by
   their age through the object store alone, and its `--status` and `--force`
   flags are removed. Pass `--older-than-days` and `--dry-run` alone.
-- **Breaking (on-disk):** The crate depends on taquba 0.16 and taquba-workflow
-  0.15, whose job and run records differ from those of taquba 0.14 and
+- **Breaking (on-disk):** The crate depends on taquba 0.17 and taquba-workflow
+  0.16, whose job and run records differ from those of taquba 0.14 and
   taquba-workflow 0.13. Start from a fresh store.
 - **Breaking:** The crate depends on reqwest 0.13, so `SearchError::Transport`
   contains a `reqwest::Error` of reqwest 0.13. Upgrade reqwest to 0.13 in a
@@ -102,6 +102,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retries a 408 or a 425 and fails at once on an unreadable reply or on an error
   reply with a 2xx status and an unknown code. A deployment keeps its
   configuration.
+- **Breaking:** The `workflow` module re-exports `TerminatedRun` in place of
+  `RunOutcome` and `NoopTerminalHook`, which taquba-workflow 0.16 removes, so
+  code that refers to either type fails to compile. Await
+  `WorkflowRuntime::wait` for the end of a run, and build a runtime without a
+  hook argument.
 
 ### Fixed
 - The CLI keeps the workflow memos and the fetch job records of a `--store` URL

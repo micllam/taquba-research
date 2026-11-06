@@ -1,6 +1,6 @@
-//! Convenience wrapper around a Rig client, a search backend, a
-//! [`taquba_workflow::WorkflowRuntime`] and a one-shot terminal hook, exposed
-//! through a single `run(queue, query)` call.
+//! Convenience wrapper around a Rig client, a search backend and a
+//! [`taquba_workflow::WorkflowRuntime`], exposed through a single
+//! `run(queue, query)` call.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,11 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rig_core::providers::{anthropic, ollama, openai};
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
-use taquba_workflow::{
-    RunId, RunOptions, RunOutcome, RunSpec, StepError, TerminalEffects, TerminalHook,
-    TerminalStatus, WorkflowRuntime,
-};
-use tokio::sync::Mutex;
+use taquba_workflow::{RunId, RunOptions, RunSpec, TerminalStatus, WorkflowRuntime};
 use tokio::sync::oneshot;
 
 use crate::Report;
@@ -67,14 +63,7 @@ impl ResearchAgent {
         query: impl Into<String>,
     ) -> Result<Report> {
         let query = query.into();
-        // The run id is generated before submit so the terminal hook can filter
-        // notifications to this run.
         let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
-        let (tx, rx) = oneshot::channel::<RunOutcome>();
-        let hook = CaptureOutcome {
-            run_id: run_id.clone(),
-            tx: Mutex::new(Some(tx)),
-        };
 
         // The worker drains the shared workflow queue, so other queued runs'
         // pending steps execute in this call too.
@@ -106,7 +95,7 @@ impl ResearchAgent {
         // `StepOutcome::Continue` enqueues the next step only after the current
         // one acks. One worker is enough and avoids unnecessary claim
         // transaction conflicts.
-        let mut builder = WorkflowRuntime::builder(queue.clone(), object_store, runner, hook)
+        let mut builder = WorkflowRuntime::builder(queue.clone(), object_store, runner)
             .queue_name(WORKFLOW_QUEUE_NAME)
             .memo_prefix(WORKFLOW_MEMO_PREFIX)
             .max_concurrent_steps(1)
@@ -152,22 +141,22 @@ impl ResearchAgent {
                 .await
         });
 
-        // Await the terminal signal and the worker together, so a worker task
-        // that fails or panics before the run terminates ends this call with an
-        // error and does not leave it waiting on `rx`.
+        // Await the termination and the worker together, so a worker task that
+        // fails or panics before the run terminates ends this call with an
+        // error and does not leave it waiting.
         let outcome = tokio::select! {
-            out = rx => {
+            out = runtime.wait(&run_id) => {
                 let _ = shutdown_tx.send(());
                 // The outcome is already committed, so a worker exit error is
                 // logged only.
                 if let Err(e) = flatten_worker_exit((&mut worker).await) {
                     tracing::warn!(error = %e, "worker exit error after the terminal outcome");
                 }
-                out.map_err(|_| anyhow!("terminal hook dropped before signalling"))
+                out.context("waiting for the research run")
             }
             joined = &mut worker => {
-                // The worker exited before the terminal signal. The run's step
-                // job stays in the queue.
+                // The worker exited before the termination. The run's step job
+                // stays in the queue.
                 drop(shutdown_tx);
                 Err(match flatten_worker_exit(joined) {
                     Ok(()) => anyhow!("worker exited before the run terminated"),
@@ -181,7 +170,7 @@ impl ResearchAgent {
         let _ = job_handle.shutdown().await;
         let outcome = outcome?;
 
-        match outcome.status {
+        match outcome.termination.status {
             TerminalStatus::Succeeded => {
                 let result = outcome
                     .result
@@ -195,13 +184,19 @@ impl ResearchAgent {
             TerminalStatus::Failed => {
                 bail!(
                     "research run failed: {}",
-                    outcome.error.unwrap_or_else(|| "(no reason)".to_string())
+                    outcome
+                        .termination
+                        .error
+                        .unwrap_or_else(|| "(no reason)".to_string())
                 );
             }
             TerminalStatus::Cancelled => {
                 bail!(
                     "research run cancelled: {}",
-                    outcome.error.unwrap_or_else(|| "(no reason)".to_string())
+                    outcome
+                        .termination
+                        .error
+                        .unwrap_or_else(|| "(no reason)".to_string())
                 );
             }
         }
@@ -300,42 +295,4 @@ fn flatten_worker_exit(
     joined: std::result::Result<taquba_workflow::Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
     Ok(joined??)
-}
-
-/// Terminal hook that forwards the [`RunOutcome`] on a oneshot channel so the
-/// caller can `await` the whole run.
-struct CaptureOutcome {
-    /// Run this invocation submitted. `on_termination` acknowledges the
-    /// notifications of every other run as stale.
-    run_id: RunId,
-    tx: Mutex<Option<oneshot::Sender<RunOutcome>>>,
-}
-
-impl TerminalHook for CaptureOutcome {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        // Terminal notifications are durable jobs: a notification left
-        // unclaimed by a terminated process is delivered to the next worker on
-        // the queue. A foreign notification is acked and logged without
-        // forwarding its outcome.
-        if outcome.run_id != self.run_id {
-            tracing::warn!(
-                run_id = %outcome.run_id,
-                status = %outcome.status,
-                "acknowledged stale terminal notification from another run"
-            );
-            return Ok(());
-        }
-        // Take the sender out of the mutex before sending so the lock guard is
-        // not held across `tx.send`. A redelivered notification does not find a
-        // sender and is a no-op.
-        let tx = self.tx.lock().await.take();
-        if let Some(tx) = tx {
-            let _ = tx.send(outcome.clone());
-        }
-        Ok(())
-    }
 }

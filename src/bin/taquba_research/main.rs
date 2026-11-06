@@ -45,8 +45,8 @@ use taquba_research::store::{
     WORKFLOW_QUEUE_NAME,
 };
 use taquba_research::workflow::{
-    ListedRun, RunId, RunOptions, RunOutcome, RunSpec, RunState, RunStatus, StepError,
-    StepErrorKind, TerminalEffects, TerminalHook, TerminalStatus, WorkflowRuntime, WorkflowView,
+    ListedRun, RunId, RunOptions, RunSpec, RunState, RunStatus, StepErrorKind, TerminalStatus,
+    TerminatedRun, WorkflowRuntime, WorkflowView,
 };
 use taquba_research::{
     FETCH_QUEUE_NAME, Record, ResearchConfig, ResearchStepRunner, RunRecord,
@@ -54,7 +54,7 @@ use taquba_research::{
     spawn_fetch_runner, summarize_state,
 };
 use taquba_workflow::{CancelCommand, CommandState};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -720,26 +720,17 @@ fn build_config(cli: &Cli) -> ResearchConfig {
     }
 }
 
-/// Build a [`WorkflowRuntime`] with one claimer and a `CaptureHook` for the
-/// terminal channel, and spawn its worker task. The worker exits on Ctrl+C or
-/// on a terminal-hook signal sent through [`WorkerHandles::shutdown_tx`]. The
-/// Ctrl+C branch prints an "Interrupting..." acknowledgement before the drain
-/// of the current step.
+/// Build a [`WorkflowRuntime`] with one claimer and spawn its worker task. The
+/// worker exits on Ctrl+C or on the signal that `finalize` sends through
+/// [`WorkerHandles::shutdown_tx`] after the termination of the run. The Ctrl+C
+/// branch prints an "Interrupting..." acknowledgement before the drain of the
+/// current step.
 async fn spawn_runtime(
     store_ctx: &StoreCtx,
     queue: Arc<Queue>,
     runner: ResearchStepRunner,
-    run_id: &RunId,
     interrupt: impl Future<Output = ()> + Send + 'static,
-) -> Result<(
-    WorkflowRuntime<ResearchStepRunner, CaptureHook>,
-    WorkerHandles,
-)> {
-    let (tx, rx) = oneshot::channel::<RunOutcome>();
-    let hook = CaptureHook {
-        run_id: run_id.clone(),
-        tx: Mutex::new(Some(tx)),
-    };
+) -> Result<(WorkflowRuntime<ResearchStepRunner>, WorkerHandles)> {
     // Build the JobRunner the Fetching step submits FetchPage jobs to.
     let (job_runner, job_handle) = spawn_fetch_runner(&queue, &store_ctx.object_store);
     let runner = runner
@@ -748,14 +739,13 @@ async fn spawn_runtime(
         .with_report_store(store_ctx.object_store.clone(), &ObjectPath::default());
 
     // Sequential workflow: one claimer is enough. See agent.rs for context.
-    let runtime =
-        WorkflowRuntime::builder(queue.clone(), store_ctx.object_store.clone(), runner, hook)
-            .queue_name(WORKFLOW_QUEUE_NAME)
-            .memo_prefix(WORKFLOW_MEMO_PREFIX)
-            .max_concurrent_steps(1)
-            .memo_retention(MEMO_RETENTION)
-            .control_queue(WORKFLOW_CONTROL_QUEUE_NAME)
-            .build();
+    let runtime = WorkflowRuntime::builder(queue.clone(), store_ctx.object_store.clone(), runner)
+        .queue_name(WORKFLOW_QUEUE_NAME)
+        .memo_prefix(WORKFLOW_MEMO_PREFIX)
+        .max_concurrent_steps(1)
+        .memo_retention(MEMO_RETENTION)
+        .control_queue(WORKFLOW_CONTROL_QUEUE_NAME)
+        .build();
     let runtime = match runtime {
         Ok(runtime) => runtime,
         Err(e) => {
@@ -782,7 +772,6 @@ async fn spawn_runtime(
     Ok((
         runtime,
         WorkerHandles {
-            rx,
             worker,
             shutdown_tx,
             job_handle,
@@ -811,11 +800,8 @@ async fn cmd_run(
         );
     }
 
-    // The run id is generated before submit so the terminal hook can filter
-    // notifications to this run.
     let run_id = RunId::new(ulid::Ulid::new().to_string()).expect("a ULID is a valid run id");
-    let (runtime, handles) =
-        spawn_runtime(store_ctx, queue.clone(), runner, &run_id, interrupt).await?;
+    let (runtime, handles) = spawn_runtime(store_ctx, queue.clone(), runner, interrupt).await?;
 
     let input = ResearchStepRunner::initial_state(query.clone(), config);
     runtime
@@ -835,7 +821,7 @@ async fn cmd_run(
         "Run {run_id} started. (Ctrl+C to interrupt; resume with `taquba-research resume {run_id}`)"
     );
 
-    let result = finalize(cli, store_ctx, handles, &run_id).await;
+    let result = finalize(cli, store_ctx, &runtime, handles, &run_id).await;
     drop(runtime);
     result.and(close_queue(queue).await)
 }
@@ -909,14 +895,11 @@ async fn cmd_resume(
 
     // cmd_resume does not submit new work. It starts a worker to process the
     // existing pending step.
-    let (runtime, handles) =
-        spawn_runtime(store_ctx, queue.clone(), runner, &run_id, interrupt).await?;
+    let (runtime, handles) = spawn_runtime(store_ctx, queue.clone(), runner, interrupt).await?;
 
     println!("Resuming {run_id}...");
 
-    // The run's step jobs already exist in the queue. The terminal hook fires
-    // when the run reaches a terminal step.
-    let result = finalize(cli, store_ctx, handles, &run_id).await;
+    let result = finalize(cli, store_ctx, &runtime, handles, &run_id).await;
     drop(runtime);
     result.and(close_queue(queue).await)
 }
@@ -931,8 +914,6 @@ async fn close_queue(queue: Arc<Queue>) -> Result<()> {
 /// Handles tied to a running `WorkflowRuntime` worker task and its paired
 /// fetch-job `JobRunner`.
 struct WorkerHandles {
-    /// Terminal-hook signal.
-    rx: oneshot::Receiver<RunOutcome>,
     /// Spawned workflow worker task.
     worker: tokio::task::JoinHandle<taquba_workflow::Result<()>>,
     /// Sends a clean-shutdown signal so the workflow worker stops polling once
@@ -955,20 +936,19 @@ fn flatten_worker_exit(
 async fn finalize(
     cli: &Cli,
     store_ctx: &StoreCtx,
+    runtime: &WorkflowRuntime<ResearchStepRunner>,
     handles: WorkerHandles,
-    run_id: &str,
+    run_id: &RunId,
 ) -> Result<()> {
-    // Either the terminal hook fires (run reached a terminal step) or the
-    // worker exited (Ctrl+C or a worker error). Whichever happens first
-    // determines the exit message.
+    // Either the run terminates or the worker exits (Ctrl+C or a worker error).
+    // Whichever happens first determines the exit message.
     let WorkerHandles {
-        mut rx,
         mut worker,
         shutdown_tx,
         job_handle,
     } = handles;
     let result = tokio::select! {
-        out = &mut rx => {
+        out = runtime.wait(run_id) => {
             // Run reached a terminal step. Tell the worker to stop polling the
             // queue, then await its clean exit before writing the report. The
             // outcome is already committed, so an exit error is logged only.
@@ -976,17 +956,20 @@ async fn finalize(
             if let Err(e) = flatten_worker_exit((&mut worker).await) {
                 tracing::warn!(error = %e, "worker exit error after the terminal outcome");
             }
-            handle_terminal(cli, store_ctx, run_id, out.ok()).await
+            match out.context("waiting for the run") {
+                Ok(outcome) => handle_terminal(cli, store_ctx, run_id.as_str(), outcome).await,
+                Err(e) => Err(e),
+            }
         }
         joined = &mut worker => {
-            // Worker exited without a terminal signal. The pending step job
-            // keeps the run resumable, without an index write. Drop
-            // shutdown_tx, whose receiver is dropped.
+            // Worker exited before the termination. The pending step job keeps
+            // the run resumable, without an index write. Drop shutdown_tx,
+            // whose receiver is dropped.
             drop(shutdown_tx);
             match flatten_worker_exit(joined) {
                 // Clean exit: the worker's Ctrl+C branch resolved.
                 Ok(()) => {
-                    print_interrupted(run_id);
+                    print_interrupted(run_id.as_str());
                     Ok(())
                 }
                 Err(e) => Err(e.context(format!(
@@ -1005,15 +988,13 @@ async fn handle_terminal(
     cli: &Cli,
     store_ctx: &StoreCtx,
     run_id: &str,
-    outcome: Option<RunOutcome>,
+    outcome: TerminatedRun,
 ) -> Result<()> {
-    let outcome = outcome.ok_or_else(|| anyhow!("terminal hook produced no outcome"))?;
-
-    match outcome.status {
+    match outcome.termination.status {
         TerminalStatus::Succeeded => {
             let result_bytes = outcome.result.unwrap_or_default();
             let record: RunRecord = serde_json::from_slice(&result_bytes)
-                .context("decoding RunRecord from terminal hook")?;
+                .context("decoding the RunRecord of the run")?;
             let report = record
                 .report
                 .ok_or_else(|| anyhow!("succeeded run has no report"))?;
@@ -1042,13 +1023,20 @@ async fn handle_terminal(
         TerminalStatus::Failed => {
             eprintln!(
                 "✗ Run {run_id} failed: {}",
-                outcome.error.unwrap_or_else(|| "(no reason)".to_string())
+                outcome
+                    .termination
+                    .error
+                    .unwrap_or_else(|| "(no reason)".to_string())
             );
             std::process::exit(1);
         }
         TerminalStatus::Cancelled => {
             // User-initiated stop, which exits 0.
-            let reason = outcome.error.as_deref().unwrap_or("(no reason supplied)");
+            let reason = outcome
+                .termination
+                .error
+                .as_deref()
+                .unwrap_or("(no reason supplied)");
             eprintln!("⊘ Run {run_id} cancelled: {reason}");
         }
     }
@@ -1544,42 +1532,6 @@ async fn cmd_gc(store_ctx: &StoreCtx, older_than_days: Option<i64>, dry_run: boo
     }
     println!("Deleted {deleted} report(s); {errors} error(s).");
     Ok(())
-}
-
-struct CaptureHook {
-    /// Run this invocation submitted or resumed. Notifications for any other
-    /// run are stale (see `on_termination`).
-    run_id: RunId,
-    tx: Mutex<Option<oneshot::Sender<RunOutcome>>>,
-}
-
-impl TerminalHook for CaptureHook {
-    async fn on_termination(
-        &self,
-        outcome: &RunOutcome,
-        _effects: &TerminalEffects,
-    ) -> std::result::Result<(), StepError> {
-        // Terminal notifications are durable jobs: one left unclaimed by a
-        // terminated process is delivered to the next worker on the queue. The
-        // hook acks and logs a foreign notification without consuming its
-        // outcome.
-        if outcome.run_id != self.run_id {
-            tracing::warn!(
-                run_id = %outcome.run_id,
-                status = %outcome.status,
-                "acknowledged stale terminal notification from another run"
-            );
-            return Ok(());
-        }
-        // Take the sender out of the mutex before sending so the lock guard is
-        // not held across `tx.send`. A redelivered notification does not find a
-        // sender and is a no-op.
-        let tx = self.tx.lock().await.take();
-        if let Some(tx) = tx {
-            let _ = tx.send(outcome.clone());
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

@@ -208,9 +208,9 @@ pub use state::{Phase, ResearchConfig, StateSummary, TokenUsage, summarize_state
 /// [`ResearchStepRunner`].
 pub mod workflow {
     pub use taquba_workflow::{
-        Delivery, EffectsHandle, ListedRun, NoopTerminalHook, RunId, RunOptions, RunOutcome,
-        RunSpec, RunState, RunStatus, RunTermination, Step, StepError, StepErrorKind, StepOutcome,
-        StepRef, StepRunner, SubmitOutcome, TerminalEffects, TerminalHook, TerminalStatus,
+        Delivery, EffectsHandle, ListedRun, RunId, RunOptions, RunSpec, RunState, RunStatus,
+        RunTermination, Step, StepError, StepErrorKind, StepOutcome, StepRef, StepRunner,
+        SubmitOutcome, TerminalEffects, TerminalHook, TerminalStatus, TerminatedRun,
         WorkflowRuntime, WorkflowView,
     };
 }
