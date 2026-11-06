@@ -15,11 +15,12 @@ use rig_core::tool::{Tool, ToolContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use taquba_workflow::jobs::JobRunner;
+use taquba_workflow::jobs::{Job, JobRunner};
+use taquba_workflow::{Error as WorkflowError, RunId};
 use thiserror::Error;
 use url::Url;
 
-use crate::fetch_job::FetchPage;
+use crate::fetch_job::{FetchPage, fetch_group_id};
 use crate::host::{ASK_USER, Record};
 use crate::runner::{AGENT_PREAMBLE, FETCH_JOIN_LEASE, SEARCH_CALL_TIMEOUT};
 use crate::search::{SearchBackend, SearchError, SearchResult};
@@ -159,7 +160,7 @@ impl Tool for WebSearch {
 /// the whole text, so a call for a later chunk does not fetch the page again.
 pub(crate) struct FetchPageTool {
     pub(crate) jobs: JobRunner,
-    pub(crate) run_id: String,
+    pub(crate) run_id: RunId,
     /// The length of a chunk in characters.
     pub(crate) chunk_chars: usize,
 }
@@ -223,22 +224,47 @@ impl Tool for FetchPageTool {
     }
 }
 
-/// Fetch `url` through a `FetchPage` job, with its whole text. A job of the
-/// same run and URL returns its recorded result.
+/// Fetch `url` through a `FetchPage` job, with its whole text. A page of the
+/// fetch group of the run, or a job of the same run and URL, returns its
+/// recorded result.
 pub(crate) async fn fetch_page(
     jobs: &JobRunner,
-    run_id: &str,
+    run_id: &RunId,
     url: Url,
 ) -> Result<FetchedPage, String> {
     let job = FetchPage {
         run_id: run_id.to_string(),
         url,
     };
+    if let Some(page) = grouped_page(jobs, run_id, &job).await? {
+        return Ok(page);
+    }
     let handle = jobs
         .submit(job)
         .await
         .map_err(|e| format!("fetch submit: {e}"))?;
     handle.await.map_err(|e| e.to_string())
+}
+
+/// The page of `job` in the fetch group of the run, or `None` for a run without
+/// the group or a page that the group did not fetch. A member of the group has
+/// another run id than a job with its idempotency key, so the read is by key.
+async fn grouped_page(
+    jobs: &JobRunner,
+    run_id: &RunId,
+    job: &FetchPage,
+) -> Result<Option<FetchedPage>, String> {
+    let group = jobs.group::<FetchPage>(fetch_group_id(run_id).map_err(|e| e.to_string())?);
+    let key = job.idempotency_key().expect("a fetch has a member key");
+    match group.result(&key).await {
+        Ok(member) => Ok(member.result.ok()),
+        Err(
+            WorkflowError::GroupNotFound(_)
+            | WorkflowError::MemberNotFound { .. }
+            | WorkflowError::MemberNotSubmitted { .. },
+        ) => Ok(None),
+        Err(e) => Err(format!("fetch group read: {e}")),
+    }
 }
 
 /// The structured output of the investigating agent.

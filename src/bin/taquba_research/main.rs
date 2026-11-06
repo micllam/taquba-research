@@ -735,7 +735,6 @@ async fn spawn_runtime(
     let (job_runner, job_handle) = spawn_fetch_runner(&queue, &store_ctx.object_store);
     let runner = runner
         .with_job_runner(job_runner)
-        .with_queue(queue.clone())
         .with_report_store(store_ctx.object_store.clone(), &ObjectPath::default());
 
     // Sequential workflow: one claimer is enough. See agent.rs for context.
@@ -864,9 +863,12 @@ async fn cmd_resume(
         }
         // The waiting count includes this run's pending or scheduled step.
         let waiting_others = match state {
-            Some(RunState::Pending | RunState::Scheduled { .. } | RunState::Waiting { .. }) => {
-                waiting.saturating_sub(1)
-            }
+            Some(
+                RunState::Pending
+                | RunState::Scheduled { .. }
+                | RunState::Waiting { .. }
+                | RunState::WaitingForGroup { .. },
+            ) => waiting.saturating_sub(1),
             _ => waiting,
         };
         // Guard before taking the exclusive writer, as in `cmd_gc`. The caveats

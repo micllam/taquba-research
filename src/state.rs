@@ -299,6 +299,10 @@ pub struct ResearchState {
     /// Queue of URLs yet to be fetched. Deduplicated against `fetched.keys()`
     /// before insertion.
     pub fetch_queue: VecDeque<Url>,
+    /// Whether the fetching step has submitted the fetch group of the run, so
+    /// that the next step reads its results.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fetch_submitted: bool,
     /// Successfully fetched pages, with the URL as the key.
     pub fetched: BTreeMap<Url, FetchedPage>,
     /// Queue of URLs yet to be summarised.
@@ -355,6 +359,7 @@ impl ResearchState {
             search_queue: VecDeque::new(),
             search_results: BTreeMap::new(),
             fetch_queue: VecDeque::new(),
+            fetch_submitted: false,
             fetched: BTreeMap::new(),
             summarize_queue: VecDeque::new(),
             summaries: BTreeMap::new(),
@@ -404,6 +409,7 @@ mod tests {
         s.config.max_tokens_per_call = Some(2048);
         s.config.investigation_turns = 3;
         s.config.clarification_wait_secs = Some(600);
+        s.fetch_submitted = true;
         s.clarification = Some(Clarification {
             question: "Which edition?".to_string(),
             asked_at: Utc::now(),
@@ -454,6 +460,7 @@ mod tests {
         assert_eq!(back.query, "a query");
         assert_eq!(back.phase, Phase::Planning);
         assert_eq!(back.steps_completed, 0);
+        assert!(back.fetch_submitted);
         assert_eq!(
             back.fetched.get(&url).map(|p| p.text.as_str()),
             Some("page text")

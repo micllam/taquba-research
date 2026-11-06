@@ -107,6 +107,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code that refers to either type fails to compile. Await
   `WorkflowRuntime::wait` for the end of a run, and build a runtime without a
   hook argument.
+- **Breaking:** The fetching step submits its fetches as a job group and ends,
+  so the run waits for them without a worker or a lease, and
+  `ResearchStepRunner::with_queue` is removed. Remove the call.
 
 ### Fixed
 - The CLI keeps the workflow memos and the fetch job records of a `--store` URL

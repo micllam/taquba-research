@@ -2,15 +2,11 @@
 //! title and its whole extracted plain text, which the run result record of the
 //! job keeps.
 //!
-//! The [`Phase::Fetching`](crate::state::Phase::Fetching) step parallelises its
-//! work by submitting a `FetchPage` per URL with a deterministic
-//! `idempotency_key` and awaiting the handles with `try_join_all`. A retried
-//! step re-submits the same payloads, the job runner's result-aware idempotent
-//! submit short-circuits to the recorded results, and the awaits resolve
-//! without a second HTTP request.
-//!
-//! The fetching phase is a single workflow step for all URLs, and the
-//! idempotency key derived from `(run_id, url)` replaces a per-step `Memo`.
+//! The [`Phase::Fetching`](crate::state::Phase::Fetching) step submits a
+//! `FetchPage` per URL as the members of the fetch group of the run, and the
+//! run waits for the group without a worker. A retried step submits the same
+//! members again, which runs only the members without a success. The
+//! idempotency key derived from `(run_id, url)` is the member key.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,8 +14,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use taquba::Queue;
 use taquba::object_store::ObjectStore;
-use taquba_workflow::StepErrorKind;
 use taquba_workflow::jobs::{Job, JobContext, JobRunner, RunnerHandle};
+use taquba_workflow::{RunId, StepError, StepErrorKind};
 use thiserror::Error;
 use url::Url;
 
@@ -32,12 +28,12 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Logical queue name for fetch jobs, distinct from the workflow runtime's
 /// queue.
 pub const FETCH_QUEUE_NAME: &str = "research-fetch-jobs";
-/// How long a `FetchPage` run result record is retained after the job reaches a
-/// terminal state. An in-process idempotent re-submission (a workflow-step
-/// retry) of the same `(run_id, url)` short-circuits to the recorded result
-/// until this window elapses. After that the record is swept and a
-/// re-submission fetches the page again. The week exceeds every realistic run
-/// wall-time plus an inspection gap.
+/// How long a `FetchPage` run result record and a fetch group are retained
+/// after the job or the last member reaches a terminal state. An in-process
+/// idempotent re-submission (a workflow-step retry) of the same `(run_id, url)`
+/// short-circuits to the recorded result until this window elapses. After that
+/// the record is swept and a re-submission fetches the page again. The week
+/// exceeds every realistic run wall-time plus an inspection gap.
 const FETCH_RESULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Build a [`JobRunner`] with the internal `FetchPage` job registered and an
@@ -63,10 +59,17 @@ pub fn spawn_fetch_runner(
         .queue_name(FETCH_QUEUE_NAME)
         .state(http)
         .retention(FETCH_RESULT_RETENTION)
+        .group_retention(FETCH_RESULT_RETENTION)
         .register::<FetchPage>()
         .build();
     let handle = job_runner.spawn(std::future::pending::<()>());
     (job_runner, handle)
+}
+
+/// The id of the fetch group of the run `run_id`.
+pub(crate) fn fetch_group_id(run_id: &RunId) -> Result<RunId, StepError> {
+    RunId::new(format!("fetch-{run_id}"))
+        .map_err(|e| StepError::permanent(format!("fetch group id: {e}")))
 }
 
 /// One durable HTTP fetch.

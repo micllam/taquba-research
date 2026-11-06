@@ -182,7 +182,9 @@ store and delivers each step at least once. The crate adds these guarantees:
   of each completed model call, and a redelivered step reads the stored reply. A
   failed call stays out of the memo, so a retry calls the model again.
 - **A page is fetched once per run.** Each fetch is a job that uses the run and
-  the URL as its key, so a retried step receives the recorded page.
+  the URL as its key, so a retried step receives the recorded page. The run
+  waits for the fetches of the fetching step without a worker or a lease, and a
+  cancel of the run cancels them.
 - **A wait for the user ends the step.** The run waits for a reply without a
   worker or a lease, and the step after the wait reads the reply from its
   signal.

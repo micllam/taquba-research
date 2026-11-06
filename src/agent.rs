@@ -85,7 +85,6 @@ impl ResearchAgent {
             .runner
             .clone()
             .with_job_runner(job_runner)
-            .with_queue(queue.clone())
             .with_report_store(
                 object_store.clone(),
                 &taquba::object_store::path::Path::default(),

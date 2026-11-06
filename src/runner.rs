@@ -1,7 +1,7 @@
 //! [`ResearchStepRunner`]: the [`StepRunner`] that advances a research run
 //! through its seven phases.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,14 +19,14 @@ use rig_core::providers::{anthropic, ollama, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use taquba::LeaseHandle;
 use taquba::object_store::path::Path;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use taquba::{LeaseHandle, Queue};
-use taquba_workflow::jobs::{JobRunner, JoinError};
-use taquba_workflow::{Memo, Step, StepError, StepOutcome, StepRunner};
+use taquba_workflow::jobs::{GroupResult, Job, JobRunner};
+use taquba_workflow::{Memo, RunId, RunOptions, Step, StepError, StepOutcome, StepRunner};
 use url::Url;
 
-use crate::fetch_job::FetchPage;
+use crate::fetch_job::{FetchPage, fetch_group_id};
 use crate::host::{Ask, Host, TurnEnd};
 use crate::investigate::{self, FetchPageTool, Investigation};
 use crate::report::{Citation, Report, RunStats, render_markdown};
@@ -51,11 +51,13 @@ pub(crate) const SEARCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Upper bound on the canonical report blob write, covered by the lease the
 /// same way.
 const REPORT_PUT_TIMEOUT: Duration = Duration::from_secs(20);
-/// Lease extension applied before each fetch-handle await: one FetchPage job's
-/// full retry cycle (3 attempts of 20s each plus backoff) plus the wait for a
-/// runner slot while 16 concurrent jobs run, rounded up. Each completed handle
-/// re-extends, so the lease stays within one job completion of live progress.
+/// Lease extension applied before a wait for `FetchPage` jobs: one job's full
+/// retry cycle (3 attempts of 20s each plus backoff) plus the wait for a runner
+/// slot while 16 concurrent jobs run, rounded up.
 pub(crate) const FETCH_JOIN_LEASE: Duration = Duration::from_secs(150);
+/// Upper bound on the wait of the fetching step for its group of `FetchPage`
+/// jobs.
+const FETCH_GROUP_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// Memo user-keys for each phase's cached LLM response. Each is scoped per
 /// `(run_id, step_number)` by [`taquba_workflow::Memo`], so a plain string
@@ -77,7 +79,6 @@ pub struct ResearchStepRunner {
     models: Models,
     search: Arc<dyn SearchBackend>,
     job_runner: Option<JobRunner>,
-    queue: Option<Arc<Queue>>,
     report_store: Option<(Arc<dyn ObjectStore>, Path)>,
 }
 
@@ -144,28 +145,18 @@ impl ResearchStepRunner {
             models,
             search,
             job_runner: None,
-            queue: None,
             report_store: None,
         }
     }
 
     /// Attach the [`JobRunner`] the fetching phase submits per-URL `FetchPage`
     /// jobs to. Required when the workflow advances into `Phase::Fetching`: the
-    /// phase submits one job per URL and `try_join_all`s the handles. The
+    /// phase submits a group of a job per URL and waits for the group. The
     /// runner must already have `FetchPage` registered and an
     /// `Arc<reqwest::Client>` on its state. [`crate::spawn_fetch_runner`]
     /// builds one with both already attached.
     pub fn with_job_runner(mut self, job_runner: JobRunner) -> Self {
         self.job_runner = Some(job_runner);
-        self
-    }
-
-    /// Attach the underlying [`Queue`] so the fetching phase can call
-    /// `Queue::cancel(job_id)` on in-flight `FetchPage` jobs when the
-    /// surrounding run is cancelled. Without this, those jobs run to completion
-    /// (or to their reqwest timeout) after the run has already terminated.
-    pub fn with_queue(mut self, queue: Arc<Queue>) -> Self {
-        self.queue = Some(queue);
         self
     }
 
@@ -231,53 +222,6 @@ fn stage_progress(step: &Step, state: &ResearchState) -> Result<(), StepError> {
         .map_err(|e| StepError::permanent(format!("staging run progress: {e}")))
 }
 
-/// Drop-guard that fires `Queue::cancel` on a non-empty set of in-flight job
-/// IDs when dropped. `run_fetching` uses it to stop the FetchPage jobs of a
-/// research run that is cancelled mid-step, before the reqwest timeout. Call
-/// [`Self::disarm`] (which empties the ID list) on every controlled exit, so
-/// normal flows do not issue `Queue::cancel` calls.
-///
-/// `Queue::cancel` is fire-and-forget here: the surrounding step is being
-/// cancelled anyway, and a cancel call against an already-terminal job is a
-/// no-op, so any individual failure to cancel is logged at `warn` and ignored.
-struct PendingJobsGuard {
-    queue: Arc<Queue>,
-    job_ids: Vec<String>,
-}
-
-impl PendingJobsGuard {
-    fn new(queue: Arc<Queue>, job_ids: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            queue,
-            job_ids: job_ids.into_iter().collect(),
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.job_ids.clear();
-    }
-}
-
-impl Drop for PendingJobsGuard {
-    fn drop(&mut self) {
-        if self.job_ids.is_empty() {
-            return;
-        }
-        let queue = self.queue.clone();
-        let ids = std::mem::take(&mut self.job_ids);
-        // Drop is sync, so the awaits run on a background task. The task
-        // persists across the current step's cancellation and sends the cancels
-        // to taquba before in-flight handlers can run to completion.
-        tokio::spawn(async move {
-            for id in ids {
-                if let Err(e) = queue.cancel(&id).await {
-                    tracing::warn!(job_id = %id, error = %e, "failed to cancel fetch job");
-                }
-            }
-        });
-    }
-}
-
 #[derive(Debug, Clone)]
 struct SynthesisDocument {
     /// The numbered source this document backs.
@@ -298,7 +242,16 @@ impl ResearchStepRunner {
         match state.phase {
             Phase::Planning => self.run_planning(step, state).await?,
             Phase::Searching => self.run_searching(step, state).await?,
-            Phase::Fetching => self.run_fetching(step, state).await?,
+            Phase::Fetching => {
+                // A wait is not a completed step.
+                if let Some(group_id) = self.run_fetching(step, state).await? {
+                    return Ok(StepOutcome::continue_on_group(
+                        state.to_bytes(),
+                        group_id,
+                        FETCH_GROUP_WAIT,
+                    ));
+                }
+            }
             Phase::Summarizing => self.run_summarizing(step, state).await?,
             Phase::Investigating => {
                 // A wait is not a completed step.
@@ -428,83 +381,75 @@ impl ResearchStepRunner {
         Ok(())
     }
 
-    async fn run_fetching(&self, step: &Step, state: &mut ResearchState) -> Result<(), StepError> {
+    /// Submit the fetch group of the run and return its id for the wait, or, in
+    /// the step after the wait, record the results of the group.
+    async fn run_fetching(
+        &self,
+        step: &Step,
+        state: &mut ResearchState,
+    ) -> Result<Option<RunId>, StepError> {
         if state.fetch_queue.is_empty() {
             state.phase = Phase::Summarizing;
-            return Ok(());
+            return Ok(None);
         }
         let job_runner = self
             .job_runner
             .as_ref()
             .ok_or_else(|| StepError::permanent("fetching phase requires a JobRunner"))?;
-        let queue = self
-            .queue
-            .as_ref()
-            .ok_or_else(|| StepError::permanent("fetching phase requires a Queue"))?;
-
-        // Submit one FetchPage job per URL. Result-aware idempotent submit
-        // means a retry of this step re-submits the same payloads and either
-        // dedup-hits a still-pending submission or short-circuits to a cached
-        // result blob. Either way, no URL is fetched twice.
-        let urls: Vec<Url> = state.fetch_queue.iter().cloned().collect();
-        tracing::info!("fetching {} URLs in parallel", urls.len());
-        let mut handles = Vec::with_capacity(urls.len());
-        for url in &urls {
-            let job = FetchPage {
+        let group = job_runner.group::<FetchPage>(fetch_group_id(&step.run_id)?);
+        let jobs: Vec<FetchPage> = state
+            .fetch_queue
+            .iter()
+            .map(|url| FetchPage {
                 run_id: step.run_id.to_string(),
                 url: url.clone(),
-            };
-            let handle = job_runner
-                .submit(job)
-                .await
-                .map_err(|e| StepError::transient(format!("fetch submit: {e}")))?;
-            handles.push(handle);
+            })
+            .collect();
+
+        // A retry of this step submits the same members again, which runs only
+        // the members without a success.
+        if !state.fetch_submitted {
+            tracing::info!("fetching {} URLs in parallel", jobs.len());
+            group.submit_with(jobs, owned_by(step)).await?;
+            state.fetch_submitted = true;
+            return Ok(Some(group.id().clone()));
         }
 
-        // Arm a guard that cancels any still-in-flight jobs if this future is
-        // dropped before completing, which happens when the surrounding run was
-        // cancelled and the outer `run_step` is propagating
-        // `StepOutcome::Cancel`. Disarmed on every controlled exit (success,
-        // infra error), so normal flows do not issue `Queue::cancel` calls.
-        let mut guard =
-            PendingJobsGuard::new(queue.clone(), handles.iter().map(|h| h.id().to_string()));
-
-        // Await all the handles. A per-URL handler failure (`JoinError::Job`)
-        // is logged and skipped. An infrastructure error (`JoinError::Infra`)
-        // fails the step transiently so taquba re-delivers it.
-        for (url, handle) in urls.iter().zip(handles) {
-            // Each completed handle is a progress point: re-extend the lease to
-            // cover the next job's worst-case completion.
-            if let Err(e) = step.lease.ensure_at_least(FETCH_JOIN_LEASE) {
-                // Let the still-in-flight jobs finish: a superseding delivery's
-                // idempotent re-submits await these same job ids.
-                guard.disarm();
-                return Err(lease_step_err(e));
-            }
-            match handle.await {
+        // The wait ends at the timeout with members still active.
+        let status = group.status().await?;
+        if status.pending > 0 {
+            tracing::warn!(pending = status.pending, "fetch wait elapsed, cancelling");
+            group
+                .cancel(Some("the fetch wait elapsed".to_string()))
+                .await?;
+        }
+        let results = under_lease(&step.lease, FETCH_JOIN_LEASE, "fetch join", async {
+            Ok(group.join().await?)
+        })
+        .await?;
+        let urls: HashMap<String, Url> = jobs
+            .into_iter()
+            .filter_map(|job| Some((job.idempotency_key()?, job.url)))
+            .collect();
+        for GroupResult { key, result } in results {
+            let Some(url) = urls.get(&key) else {
+                continue;
+            };
+            match result {
                 Ok(page) => {
                     state.summarize_queue.push_back(url.clone());
                     state
                         .fetched
                         .insert(url.clone(), page.first_chunk(state.config.max_page_chars));
                 }
-                Err(JoinError::Job(je)) => {
-                    tracing::warn!(url = %url, error = %je, "fetch failed, skipping page");
-                }
-                Err(JoinError::Infra(infra)) => {
-                    // The step is retried. Let the still-in-flight jobs finish
-                    // so the retry's idempotent submits short-circuit to their
-                    // cached results.
-                    guard.disarm();
-                    return Err(StepError::transient(format!("fetch infra: {infra}")));
-                }
+                Err(e) => tracing::warn!(url = %url, error = %e, "fetch failed, skipping page"),
             }
         }
 
-        guard.disarm();
         state.fetch_queue.clear();
+        state.fetch_submitted = false;
         state.phase = Phase::Summarizing;
-        Ok(())
+        Ok(None)
     }
 
     async fn run_summarizing(
@@ -573,7 +518,7 @@ impl ResearchStepRunner {
             .job_runner
             .as_ref()
             .ok_or_else(|| StepError::permanent("investigating phase requires a JobRunner"))?;
-        let run_id = step.run_id.to_string();
+        let run_id = &step.run_id;
         let max_chars = state.config.max_page_chars;
 
         let ask = match (
@@ -656,7 +601,7 @@ impl ResearchStepRunner {
                 continue;
             }
             let page = under_lease(&step.lease, FETCH_JOIN_LEASE, "fetch", async {
-                Ok(investigate::fetch_page(jobs, &run_id, url.clone()).await)
+                Ok(investigate::fetch_page(jobs, run_id, url.clone()).await)
             })
             .await?;
             let page = match page {
@@ -953,6 +898,15 @@ pub(crate) fn record_usage(total: &mut TokenUsage, call: &Usage) {
     add(&mut total.reasoning_tokens, call.reasoning_tokens);
 }
 
+/// The options of a group that `step` submits: the run of `step` owns its
+/// members, so the termination of the run cancels them.
+fn owned_by(step: &Step) -> RunOptions {
+    RunOptions {
+        owner: Some(step.owner.clone()),
+        ..RunOptions::default()
+    }
+}
+
 /// Extend `lease` to cover `bound`, then run `work` under a timeout of the same
 /// bound, so the delivery cannot outlive its lease mid-call. A timeout is a
 /// transient step error, and `what` identifies the call in the error message.
@@ -1164,9 +1118,10 @@ mod tests {
     use rig_core::http_client;
     use rig_core::test_utils::MockCompletionModel;
     use rig_core::{ErrorKind, ErrorReport, ProviderError, ProviderResponseError};
+    use taquba::Queue;
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
-    use taquba_workflow::{MemoStore, RunId, StepErrorKind};
+    use taquba_workflow::{MemoStore, StepErrorKind};
 
     /// Build a `Step` with a fresh in-memory `Memo` and otherwise inert fields,
     /// suitable for exercising memo-using helpers.
@@ -1506,6 +1461,216 @@ mod tests {
             .await
             .unwrap();
         assert!(!blob.is_empty());
+    }
+
+    /// A local HTTP server that returns an HTML page at `/page` and 404 at
+    /// every other path, with the count of requests for `/page`.
+    async fn page_server() -> (Url, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let response = if request.starts_with(b"GET /page ") {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = "<html><head><title>Page</title></head>\
+                                <body><p>The whole text of the page.</p></body></html>";
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (base, hits)
+    }
+
+    /// Runs the research runner while the run is in the fetching phase, and
+    /// succeeds with the state as the result once the run leaves it.
+    struct UntilFetched(ResearchStepRunner);
+
+    impl StepRunner for UntilFetched {
+        async fn run_step(&self, step: &Step) -> Result<StepOutcome, StepError> {
+            let state = ResearchState::from_bytes(&step.payload).unwrap();
+            if state.phase != Phase::Fetching {
+                return Ok(StepOutcome::Succeed {
+                    result: step.payload.clone(),
+                });
+            }
+            self.0.run_step(step).await
+        }
+    }
+
+    /// Run the fetching phase of a run over `urls` through a workflow runtime
+    /// and the fetch runner, and return the fetch runner, the run id and the
+    /// state after the phase.
+    async fn run_fetching_phase(urls: Vec<Url>) -> (JobRunner, RunId, ResearchState) {
+        use taquba_workflow::{RunSpec, TerminalStatus, WorkflowRuntime};
+
+        let object_store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let queue = Arc::new(Queue::open(object_store.clone(), "q").await.unwrap());
+        let run_id = RunId::new("01RUNIDX").unwrap();
+        let mut state = ResearchState::new("a query", ResearchConfig::new("m"));
+        state.phase = Phase::Fetching;
+        state.fetch_queue = urls.into();
+
+        let (jobs, jobs_handle) = crate::spawn_fetch_runner(&queue, &object_store);
+        let runner = ResearchStepRunner::new_ollama(
+            rig_core::providers::ollama::Ollama::from_env().unwrap(),
+            Arc::new(NoSearch),
+        )
+        .with_job_runner(jobs.clone());
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), object_store.clone(), UntilFetched(runner))
+                .queue_name("test-workflow")
+                .memo_prefix("test-memo")
+                .build()
+                .unwrap();
+        let worker = runtime.spawn(std::future::pending::<()>());
+        runtime
+            .submit(RunSpec {
+                run_id: Some(run_id.clone()),
+                input: state.to_bytes(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), runtime.wait(&run_id))
+            .await
+            .expect("the run terminates in time")
+            .unwrap();
+        assert_eq!(outcome.termination.status, TerminalStatus::Succeeded);
+        worker.shutdown().await.unwrap();
+        jobs_handle.shutdown().await.unwrap();
+        let state = ResearchState::from_bytes(&outcome.result.unwrap()).unwrap();
+        (jobs, run_id, state)
+    }
+
+    #[tokio::test]
+    async fn the_fetching_step_waits_for_its_group_and_keeps_the_fetched_pages() {
+        let (base, _) = page_server().await;
+        let page = base.join("page").unwrap();
+        let missing = base.join("missing").unwrap();
+
+        let (_, _, state) = run_fetching_phase(vec![page.clone(), missing.clone()]).await;
+
+        assert_eq!(state.phase, Phase::Summarizing);
+        assert!(state.fetch_queue.is_empty());
+        assert!(!state.fetch_submitted);
+        assert_eq!(state.summarize_queue, std::slice::from_ref(&page));
+        assert_eq!(state.fetched[&page].title, "Page");
+        assert!(!state.fetched.contains_key(&missing));
+    }
+
+    #[tokio::test]
+    async fn fetch_page_reads_a_page_of_the_fetch_group_without_a_request() {
+        let (base, hits) = page_server().await;
+        let page = base.join("page").unwrap();
+        let (jobs, run_id, _) = run_fetching_phase(vec![page.clone()]).await;
+
+        // The fetch runner has shut down, so a submitted job would never end.
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(5),
+            investigate::fetch_page(&jobs, &run_id, page),
+        )
+        .await
+        .expect("the page comes from the group")
+        .unwrap();
+
+        assert!(fetched.text.contains("The whole text of the page."));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_of_a_run_during_the_fetch_wait_cancels_its_fetches() {
+        use taquba_workflow::{RunSpec, RunState, TerminalStatus, WorkflowRuntime};
+
+        // A server that accepts each request and never replies.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/page", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            loop {
+                sockets.push(listener.accept().await.unwrap());
+            }
+        });
+
+        let object_store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let queue = Arc::new(Queue::open(object_store.clone(), "q").await.unwrap());
+        let run_id = RunId::new("01RUNIDX").unwrap();
+        let mut state = ResearchState::new("a query", ResearchConfig::new("m"));
+        state.phase = Phase::Fetching;
+        state.fetch_queue = vec![url].into();
+
+        let (jobs, jobs_handle) = crate::spawn_fetch_runner(&queue, &object_store);
+        let runner = ResearchStepRunner::new_ollama(
+            rig_core::providers::ollama::Ollama::from_env().unwrap(),
+            Arc::new(NoSearch),
+        )
+        .with_job_runner(jobs.clone());
+        let runtime =
+            WorkflowRuntime::builder(queue.clone(), object_store.clone(), UntilFetched(runner))
+                .queue_name("test-workflow")
+                .memo_prefix("test-memo")
+                .build()
+                .unwrap();
+        let worker = runtime.spawn(std::future::pending::<()>());
+        runtime
+            .submit(RunSpec {
+                run_id: Some(run_id.clone()),
+                input: state.to_bytes(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !matches!(
+                runtime
+                    .view()
+                    .status(&run_id)
+                    .await
+                    .unwrap()
+                    .map(|s| s.state),
+                Some(RunState::WaitingForGroup { .. })
+            ) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the run waits for its fetch group");
+
+        runtime.cancel(&run_id, None).await.unwrap();
+        let outcome = runtime.wait(&run_id).await.unwrap();
+        assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
+        // The fetch ends well before its timeout of 20 seconds.
+        let group = jobs.group::<FetchPage>(fetch_group_id(&run_id).unwrap());
+        let results = tokio::time::timeout(Duration::from_secs(10), group.join())
+            .await
+            .expect("the cancel of the run ends its fetch")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].result.is_err());
+        worker.shutdown().await.unwrap();
+        jobs_handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
