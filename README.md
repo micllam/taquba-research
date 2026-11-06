@@ -3,13 +3,15 @@
 taquba-research runs [Rig](https://crates.io/crates/rig-core) agents as durable
 workflows on the [taquba](https://crates.io/crates/taquba) stack. Its host, the
 code that moves an agent run between steps, gives each workflow step one model
-call and the tool calls of its reply. The crate includes a research pipeline
-with a command-line interface as a worked example of the host.
+call. The tool calls of the reply run as durable jobs between two steps. The
+crate includes a research pipeline with a command-line interface as a worked
+example of the host.
 
-The step memo records the model reply and every tool result of a step, so a step
-that runs again after a crash reuses them without calling the model or a tool
-again. When the agent asks the user a question, the step ends and the run waits
-without holding a worker. The reply then resumes the run in a later step.
+The step memo records the model reply of a step, and a job records the result of
+each tool call. A step that runs again after a crash reuses them without calling
+the model or a tool again. The run waits for the tool calls of a reply, and for
+the reply of the user to a question, without holding a worker. A later step
+passes the results to the model.
 
 The research pipeline starts from a question and ends with a cited report. On
 the way, it plans, searches the web, fetches and summarises pages, investigates
@@ -139,8 +141,8 @@ follows use.
 `ResearchStepRunner` is the low-level surface, a `taquba_workflow::StepRunner`
 for a caller's own `taquba_workflow::WorkflowRuntime`. That runtime can combine
 research steps with other workflow steps, share a worker pool or install its own
-terminal hook. It must also attach the fetch runner that `spawn_fetch_runner`
-builds.
+terminal hook. It must also attach the tool runner that
+`ResearchStepRunner::spawn_tool_runner` builds.
 
 ## Embed in a Rig app
 
@@ -181,18 +183,23 @@ store and delivers each step at least once. The crate adds these guarantees:
 - **A retry does not pay for a model call again.** Each step memoizes the reply
   of each completed model call, and a redelivered step reads the stored reply. A
   failed call stays out of the memo, so a retry calls the model again.
-- **A page is fetched once per run.** Each fetch is a job that uses the run and
-  the URL as its key, so a retried step receives the recorded page. The run
-  waits for the fetches of the fetching step without a worker or a lease, and a
-  cancel of the run cancels them.
+- **A page is fetched once per run.** Each fetch is a member of a job group of
+  the run, with the URL as its key. A retried step and a later call for the page
+  receive the recorded page.
+- **A wait for tool calls ends the step.** The fetches of the fetching step and
+  the tool calls of each reply of the agent run as the members of a job group of
+  the run. The run waits for the group without a worker or a lease, and a cancel
+  of the run cancels the members. The step after the wait reads the result of
+  each member.
 - **A wait for the user ends the step.** The run waits for a reply without a
   worker or a lease, and the step after the wait reads the reply from its
   signal.
 - **Rig classifies each model failure.** A failure that Rig reports as retryable
   is a transient step error, which taquba retries up to `max_attempts`. Any
   other model failure dead-letters the run at once.
-- **A hung call fails the step.** Every model and search call runs under a
-  timeout within the lease of its step, and a timeout is a transient step error.
+- **A hung call fails.** Every model and search call runs under a timeout within
+  the lease of its step or its job, and a timeout is a transient error. A tool
+  call that fails on every attempt reaches the model as a failed result.
 
 The store of taquba allows one writer at a time, so all workers of a queue must
 run in one process and share one `Arc<Queue>`.

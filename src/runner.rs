@@ -19,16 +19,17 @@ use rig_core::providers::{anthropic, ollama, openai};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use taquba::LeaseHandle;
 use taquba::object_store::path::Path;
 use taquba::object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use taquba_workflow::jobs::{GroupResult, Job, JobRunner};
-use taquba_workflow::{Memo, RunId, RunOptions, Step, StepError, StepOutcome, StepRunner};
+use taquba::{LeaseHandle, Queue};
+use taquba_workflow::jobs::{GroupResult, Job, JobRunner, RunnerHandle};
+use taquba_workflow::{
+    Memo, RunId, RunOptions, Step, StepError, StepErrorKind, StepOutcome, StepRunner,
+};
 use url::Url;
 
-use crate::fetch_job::{FetchPage, fetch_group_id};
 use crate::host::{Ask, Host, TurnEnd};
-use crate::investigate::{self, FetchPageTool, Investigation};
+use crate::investigate::{self, Investigation, ResearchTools};
 use crate::report::{Citation, Report, RunStats, render_markdown};
 use crate::search::{SearchBackend, SearchError};
 use crate::state::{
@@ -36,6 +37,7 @@ use crate::state::{
     SynthesisOutput, TokenUsage,
 };
 use crate::store::{PROGRESS_KEY, RunProgress};
+use crate::tool_job::{Artifact, ToolJob, fetch_group_id, search_kind};
 
 /// Preamble applied to every Rig agent built by the runner. The per-phase
 /// prompts contain the task-specific instructions.
@@ -51,13 +53,12 @@ pub(crate) const SEARCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Upper bound on the canonical report blob write, covered by the lease the
 /// same way.
 const REPORT_PUT_TIMEOUT: Duration = Duration::from_secs(20);
-/// Lease extension applied before a wait for `FetchPage` jobs: one job's full
+/// Lease extension applied before a wait for `ToolJob` jobs: one fetch's full
 /// retry cycle (3 attempts of 20s each plus backoff) plus the wait for a runner
 /// slot while 16 concurrent jobs run, rounded up.
 pub(crate) const FETCH_JOIN_LEASE: Duration = Duration::from_secs(150);
-/// Upper bound on the wait of the fetching step for its group of `FetchPage`
-/// jobs.
-const FETCH_GROUP_WAIT: Duration = Duration::from_secs(15 * 60);
+/// Upper bound on the wait of a run for a group of `ToolJob` jobs.
+const GROUP_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// Memo user-keys for each phase's cached LLM response. Each is scoped per
 /// `(run_id, step_number)` by [`taquba_workflow::Memo`], so a plain string
@@ -149,12 +150,26 @@ impl ResearchStepRunner {
         }
     }
 
-    /// Attach the [`JobRunner`] the fetching phase submits per-URL `FetchPage`
-    /// jobs to. Required when the workflow advances into `Phase::Fetching`: the
-    /// phase submits a group of a job per URL and waits for the group. The
-    /// runner must already have `FetchPage` registered and an
-    /// `Arc<reqwest::Client>` on its state. [`crate::spawn_fetch_runner`]
-    /// builds one with both already attached.
+    /// Build the [`JobRunner`] of the fetches of the fetching phase and of the
+    /// tool calls of the investigating phase, with the search backend of this
+    /// runner, and spawn its worker. Returns the `JobRunner` for
+    /// [`Self::with_job_runner`] and a [`RunnerHandle`] for graceful shutdown.
+    ///
+    /// The job runner shares `queue` and `object_store` with the surrounding
+    /// workflow runtime, on the queue [`crate::TOOL_QUEUE_NAME`]. It must shut
+    /// down after the workflow worker.
+    pub fn spawn_tool_runner(
+        &self,
+        queue: &Arc<Queue>,
+        object_store: &Arc<dyn ObjectStore>,
+    ) -> (JobRunner, RunnerHandle) {
+        crate::tool_job::spawn_tool_runner(queue, object_store, self.search.clone())
+    }
+
+    /// Attach the [`JobRunner`] that [`Self::spawn_tool_runner`] builds.
+    /// Required when the workflow advances into `Phase::Fetching` or
+    /// `Phase::Investigating`: each phase submits its jobs as a group and waits
+    /// for the group.
     pub fn with_job_runner(mut self, job_runner: JobRunner) -> Self {
         self.job_runner = Some(job_runner);
         self
@@ -222,6 +237,15 @@ fn stage_progress(step: &Step, state: &ResearchState) -> Result<(), StepError> {
         .map_err(|e| StepError::permanent(format!("staging run progress: {e}")))
 }
 
+/// How a step of the investigating phase waits.
+enum Wait {
+    /// For the reply of the user, at most this long.
+    Reply(Duration),
+    /// For the tool calls of the reply of the step, as the members of this
+    /// group.
+    Group(RunId),
+}
+
 #[derive(Debug, Clone)]
 struct SynthesisDocument {
     /// The numbered source this document backs.
@@ -248,17 +272,27 @@ impl ResearchStepRunner {
                     return Ok(StepOutcome::continue_on_group(
                         state.to_bytes(),
                         group_id,
-                        FETCH_GROUP_WAIT,
+                        GROUP_WAIT,
                     ));
                 }
             }
             Phase::Summarizing => self.run_summarizing(step, state).await?,
-            Phase::Investigating => {
-                // A wait is not a completed step.
-                if let Some(wait) = self.run_investigating(step, state).await? {
+            Phase::Investigating => match self.run_investigating(step, state).await? {
+                None => {}
+                // A wait for the user is not a completed step.
+                Some(Wait::Reply(wait)) => {
                     return Ok(StepOutcome::continue_on_signal(state.to_bytes(), wait));
                 }
-            }
+                // A wait for the tool calls follows the model call of the step.
+                Some(Wait::Group(group_id)) => {
+                    state.steps_completed += 1;
+                    return Ok(StepOutcome::continue_on_group(
+                        state.to_bytes(),
+                        group_id,
+                        GROUP_WAIT,
+                    ));
+                }
+            },
             Phase::Synthesizing => self.run_synthesizing(step, state).await?,
             Phase::Writing => {
                 let report = self.run_writing(step, state).await?;
@@ -396,14 +430,11 @@ impl ResearchStepRunner {
             .job_runner
             .as_ref()
             .ok_or_else(|| StepError::permanent("fetching phase requires a JobRunner"))?;
-        let group = job_runner.group::<FetchPage>(fetch_group_id(&step.run_id)?);
-        let jobs: Vec<FetchPage> = state
+        let group = job_runner.group::<ToolJob>(fetch_group_id(&step.run_id)?);
+        let jobs: Vec<ToolJob> = state
             .fetch_queue
             .iter()
-            .map(|url| FetchPage {
-                run_id: step.run_id.to_string(),
-                url: url.clone(),
-            })
+            .map(|url| ToolJob::Fetch { url: url.clone() })
             .collect();
 
         // A retry of this step submits the same members again, which runs only
@@ -427,21 +458,26 @@ impl ResearchStepRunner {
             Ok(group.join().await?)
         })
         .await?;
-        let urls: HashMap<String, Url> = jobs
-            .into_iter()
-            .filter_map(|job| Some((job.idempotency_key()?, job.url)))
+        let urls: HashMap<String, Url> = state
+            .fetch_queue
+            .iter()
+            .filter_map(|url| {
+                let key = ToolJob::Fetch { url: url.clone() }.idempotency_key()?;
+                Some((key, url.clone()))
+            })
             .collect();
         for GroupResult { key, result } in results {
             let Some(url) = urls.get(&key) else {
                 continue;
             };
             match result {
-                Ok(page) => {
+                Ok(Artifact::Page(page)) => {
                     state.summarize_queue.push_back(url.clone());
                     state
                         .fetched
                         .insert(url.clone(), page.first_chunk(state.config.max_page_chars));
                 }
+                Ok(Artifact::Results(_)) => {}
                 Err(e) => tracing::warn!(url = %url, error = %e, "fetch failed, skipping page"),
             }
         }
@@ -508,7 +544,7 @@ impl ResearchStepRunner {
         &self,
         step: &Step,
         state: &mut ResearchState,
-    ) -> Result<Option<Duration>, StepError> {
+    ) -> Result<Option<Wait>, StepError> {
         let turns = state.config.investigation_turns;
         if turns == 0 {
             state.phase = Phase::Synthesizing;
@@ -537,15 +573,13 @@ impl ResearchStepRunner {
         tracing::info!("investigating gaps in {} sources", state.summaries.len());
 
         let can_ask = !matches!(ask, Ask::Off);
-        let tools = investigate::tools(
-            self.search.clone(),
-            FetchPageTool {
-                jobs: jobs.clone(),
-                run_id: run_id.clone(),
-                chunk_chars: max_chars,
-            },
-        );
-        let mut definitions = tools.tool_definitions();
+        let tools = ResearchTools {
+            jobs: jobs.clone(),
+            run_id: run_id.clone(),
+            fetching: state.fetched.keys().cloned().collect(),
+            chunk_chars: max_chars,
+        };
+        let mut definitions = investigate::definitions(max_chars);
         if can_ask {
             definitions.push(Arc::new(investigate::ask_user()));
         }
@@ -555,8 +589,10 @@ impl ResearchStepRunner {
             spec: &spec,
             tools: &tools,
             definitions,
-            bound: investigate::bound,
             ask,
+            jobs,
+            group_options: owned_by(step),
+            run_id,
             memo: &step.memo,
             lease: &step.lease,
         };
@@ -564,6 +600,7 @@ impl ResearchStepRunner {
         let agent = state.investigation.get_or_insert_default();
         let findings = match host.step(agent, &prompt, &mut state.token_usage).await? {
             TurnEnd::Continue => return Ok(None),
+            TurnEnd::Group { group_id } => return Ok(Some(Wait::Group(group_id))),
             TurnEnd::Wait { question } => {
                 tracing::info!(
                     %question,
@@ -575,7 +612,7 @@ impl ResearchStepRunner {
                     reply: None,
                 });
                 let wait = state.config.clarification_wait_secs.unwrap_or_default();
-                return Ok(Some(Duration::from_secs(wait)));
+                return Ok(Some(Wait::Reply(Duration::from_secs(wait))));
             }
             TurnEnd::Done { output } => {
                 serde_json::from_str::<Investigation>(&output)
@@ -587,29 +624,26 @@ impl ResearchStepRunner {
                 Vec::new()
             }
         };
-        let fetched = investigate::fetched(&agent.transcript);
-        state.investigation = None;
+        let transcript = state
+            .investigation
+            .take()
+            .map(|agent| agent.transcript)
+            .unwrap_or_default();
+        let fetched = investigate::fetched(&transcript);
 
         // A finding enters the run only for a page that `fetch_page` returned.
-        // The page text comes from the recorded result of its `FetchPage` job.
+        // The page text comes from the recorded result of its member.
         let mut added = 0;
         for finding in findings {
             let Ok(url) = Url::parse(&finding.url) else {
                 continue;
             };
-            if !fetched.contains(&url) || state.summaries.contains_key(&url) {
+            if !fetched.contains_key(&url) || state.summaries.contains_key(&url) {
                 continue;
             }
-            let page = under_lease(&step.lease, FETCH_JOIN_LEASE, "fetch", async {
-                Ok(investigate::fetch_page(jobs, run_id, url.clone()).await)
-            })
-            .await?;
-            let page = match page {
-                Ok(page) => page,
-                Err(e) => {
-                    tracing::warn!(url = %url, error = %e, "fetch failed, skipping finding");
-                    continue;
-                }
+            let Some(page) = tools.page(&url, &transcript).await? else {
+                tracing::warn!(url = %url, "page of a finding not found, skipping finding");
+                continue;
             };
             state.summaries.insert(
                 url.clone(),
@@ -910,7 +944,7 @@ fn owned_by(step: &Step) -> RunOptions {
 /// Extend `lease` to cover `bound`, then run `work` under a timeout of the same
 /// bound, so the delivery cannot outlive its lease mid-call. A timeout is a
 /// transient step error, and `what` identifies the call in the error message.
-async fn under_lease<T, F>(
+pub(crate) async fn under_lease<T, F>(
     lease: &LeaseHandle,
     bound: Duration,
     what: &str,
@@ -977,17 +1011,9 @@ pub(crate) fn classify_rig_err(err: PromptError) -> StepError {
 
 impl From<SearchError> for StepError {
     fn from(e: SearchError) -> Self {
-        match e {
-            SearchError::RateLimit { retry_after } => {
-                StepError::transient(format!("search rate-limited (retry after {retry_after:?})"))
-            }
-            SearchError::Transport(err) => {
-                StepError::transient(format!("search transport error: {err}"))
-            }
-            SearchError::AuthFailed => {
-                StepError::permanent("search authentication failed".to_string())
-            }
-            SearchError::Other(msg) => StepError::transient(format!("search error: {msg}")),
+        match search_kind(&e) {
+            StepErrorKind::Transient => StepError::transient(e.to_string()),
+            StepErrorKind::Permanent => StepError::permanent(e.to_string()),
         }
     }
 }
@@ -1114,6 +1140,7 @@ pub(crate) fn classify_structured_err(err: StructuredOutputError) -> StepError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{Plan as CallPlan, Record, RecordedCall, TurnTools};
     use reqwest::StatusCode;
     use rig_core::http_client;
     use rig_core::test_utils::MockCompletionModel;
@@ -1121,7 +1148,7 @@ mod tests {
     use taquba::Queue;
     use taquba::object_store::memory::InMemory;
     use taquba::object_store::path::Path;
-    use taquba_workflow::{MemoStore, StepErrorKind};
+    use taquba_workflow::MemoStore;
 
     /// Build a `Step` with a fresh in-memory `Memo` and otherwise inert fields,
     /// suitable for exercising memo-using helpers.
@@ -1532,12 +1559,12 @@ mod tests {
         state.phase = Phase::Fetching;
         state.fetch_queue = urls.into();
 
-        let (jobs, jobs_handle) = crate::spawn_fetch_runner(&queue, &object_store);
         let runner = ResearchStepRunner::new_ollama(
             rig_core::providers::ollama::Ollama::from_env().unwrap(),
             Arc::new(NoSearch),
-        )
-        .with_job_runner(jobs.clone());
+        );
+        let (jobs, jobs_handle) = runner.spawn_tool_runner(&queue, &object_store);
+        let runner = runner.with_job_runner(jobs.clone());
         let runtime =
             WorkflowRuntime::builder(queue.clone(), object_store.clone(), UntilFetched(runner))
                 .queue_name("test-workflow")
@@ -1582,25 +1609,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_page_reads_a_page_of_the_fetch_group_without_a_request() {
-        let (base, hits) = page_server().await;
-        let page = base.join("page").unwrap();
-        let (jobs, run_id, _) = run_fetching_phase(vec![page.clone()]).await;
-
-        // The fetch runner has shut down, so a submitted job would never end.
-        let fetched = tokio::time::timeout(
-            Duration::from_secs(5),
-            investigate::fetch_page(&jobs, &run_id, page),
-        )
-        .await
-        .expect("the page comes from the group")
-        .unwrap();
-
-        assert!(fetched.text.contains("The whole text of the page."));
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
     async fn a_cancel_of_a_run_during_the_fetch_wait_cancels_its_fetches() {
         use taquba_workflow::{RunSpec, RunState, TerminalStatus, WorkflowRuntime};
 
@@ -1621,12 +1629,12 @@ mod tests {
         state.phase = Phase::Fetching;
         state.fetch_queue = vec![url].into();
 
-        let (jobs, jobs_handle) = crate::spawn_fetch_runner(&queue, &object_store);
         let runner = ResearchStepRunner::new_ollama(
             rig_core::providers::ollama::Ollama::from_env().unwrap(),
             Arc::new(NoSearch),
-        )
-        .with_job_runner(jobs.clone());
+        );
+        let (jobs, jobs_handle) = runner.spawn_tool_runner(&queue, &object_store);
+        let runner = runner.with_job_runner(jobs.clone());
         let runtime =
             WorkflowRuntime::builder(queue.clone(), object_store.clone(), UntilFetched(runner))
                 .queue_name("test-workflow")
@@ -1662,7 +1670,7 @@ mod tests {
         let outcome = runtime.wait(&run_id).await.unwrap();
         assert_eq!(outcome.termination.status, TerminalStatus::Cancelled);
         // The fetch ends well before its timeout of 20 seconds.
-        let group = jobs.group::<FetchPage>(fetch_group_id(&run_id).unwrap());
+        let group = jobs.group::<ToolJob>(fetch_group_id(&run_id).unwrap());
         let results = tokio::time::timeout(Duration::from_secs(10), group.join())
             .await
             .expect("the cancel of the run ends its fetch")
@@ -1671,6 +1679,92 @@ mod tests {
         assert!(results[0].result.is_err());
         worker.shutdown().await.unwrap();
         jobs_handle.shutdown().await.unwrap();
+    }
+
+    fn fetch_call(id: &str, url: &Url, chunk: usize) -> RecordedCall {
+        RecordedCall {
+            id: id.to_string(),
+            name: "fetch_page".to_string(),
+            arguments: serde_json::json!({ "url": url, "chunk": chunk }),
+        }
+    }
+
+    /// The chunk of `plan`, which must be a result without a member.
+    fn planned_chunk(plan: CallPlan<ToolJob>) -> serde_json::Value {
+        match plan {
+            CallPlan::Result(result) => result.output().as_json().cloned().expect("a JSON chunk"),
+            CallPlan::Member(job) => panic!("a member for a fetched page: {job:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fetch_page_call_reads_a_page_of_the_fetch_group_without_a_member() {
+        let (base, hits) = page_server().await;
+        let page = base.join("page").unwrap();
+        let (jobs, run_id, _) = run_fetching_phase(vec![page.clone()]).await;
+        let tools = ResearchTools {
+            jobs,
+            run_id,
+            fetching: HashSet::from([page.clone()]),
+            chunk_chars: 1000,
+        };
+
+        let plan = tools
+            .plan(&fetch_call("call_1", &page, 1), &[])
+            .await
+            .unwrap();
+
+        let chunk = planned_chunk(plan);
+        assert!(chunk["text"].as_str().unwrap().contains("The whole text"));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fetch_page_call_reads_a_page_of_an_earlier_turn_without_a_member() {
+        let (base, hits) = page_server().await;
+        let page = base.join("page").unwrap();
+        let object_store: Arc<dyn taquba::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let queue = Arc::new(Queue::open(object_store.clone(), "q").await.unwrap());
+        let (jobs, _handle) =
+            crate::tool_job::spawn_tool_runner(&queue, &object_store, Arc::new(NoSearch));
+        let run_id = RunId::new("01RUNIDX").unwrap();
+        let group = jobs.group::<ToolJob>(crate::host::turn_group_id(&run_id, 1).unwrap());
+        group
+            .submit([ToolJob::Fetch { url: page.clone() }])
+            .await
+            .unwrap();
+        group.join().await.unwrap();
+        let earlier = [
+            Record::User {
+                text: "query".to_string(),
+            },
+            Record::Assistant {
+                text: String::new(),
+                calls: vec![fetch_call("call_1", &page, 1)],
+            },
+            Record::Results {
+                results: vec![crate::host::RecordedResult {
+                    id: "call_1".to_string(),
+                    name: "fetch_page".to_string(),
+                    text: String::new(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let tools = ResearchTools {
+            jobs,
+            run_id,
+            fetching: HashSet::new(),
+            chunk_chars: 10,
+        };
+
+        let plan = tools
+            .plan(&fetch_call("call_2", &page, 2), &earlier)
+            .await
+            .unwrap();
+
+        assert_eq!(planned_chunk(plan)["chunk"], 2);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

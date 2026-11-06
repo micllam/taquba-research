@@ -5,12 +5,16 @@ use rig_core::completion::Usage;
 use rig_core::message::{AssistantContent, ToolCall, ToolFunction, ToolName};
 use rig_core::test_utils::{MockCompletionModel, MockTurn};
 use serde_json::json;
+use taquba::Queue;
+use taquba::object_store::ObjectStore;
 use taquba::object_store::memory::InMemory;
+use taquba_workflow::jobs::RunnerHandle;
 use taquba_workflow::{MemoStore, RunId, StepErrorKind};
 
 use super::*;
-use crate::investigate::{self, WebSearch};
+use crate::investigate::{self, ResearchTools};
 use crate::search::{SearchBackend, SearchError, SearchResult};
+use crate::tool_job::{ToolJob, spawn_tool_runner};
 
 #[derive(Default)]
 struct CountingSearch(AtomicUsize);
@@ -47,10 +51,18 @@ fn spec(turns: usize) -> RunSpec {
     spec
 }
 
-fn tools(search: Arc<dyn SearchBackend>) -> ToolSet {
-    let mut tools = ToolSet::default();
-    tools.add_tool(WebSearch { search });
-    tools
+/// The tools of the run `run` over `search`, with a running tool runner.
+async fn tools(search: Arc<dyn SearchBackend>) -> (ResearchTools, RunnerHandle) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let queue = Arc::new(Queue::open(store.clone(), "q").await.unwrap());
+    let (jobs, handle) = spawn_tool_runner(&queue, &store, search);
+    let tools = ResearchTools {
+        jobs,
+        run_id: RunId::new("run").unwrap(),
+        fetching: HashSet::new(),
+        chunk_chars: 1000,
+    };
+    (tools, handle)
 }
 
 fn search_call(id: &str) -> MockTurn {
@@ -69,17 +81,40 @@ fn ask_call(id: &str, question: &str) -> MockTurn {
 }
 
 /// A step of a host over `model` and `tools`, with `ask_user` unless `ask` is
-/// `Off`.
+/// `Off`. After a step that ends at a group, the helper waits for the group, as
+/// the runtime does.
 async fn step(
     model: &MockCompletionModel,
     spec: &RunSpec,
-    tools: &ToolSet,
+    tools: &ResearchTools,
     ask: Ask,
     memo: &Memo,
     state: &mut AgentState,
     usage: &mut TokenUsage,
 ) -> Result<TurnEnd, StepError> {
-    let mut definitions = tools.tool_definitions();
+    let end = step_without_wait(model, spec, tools, ask, memo, state, usage).await?;
+    if let TurnEnd::Group { group_id } = &end {
+        tools
+            .jobs
+            .group::<ToolJob>(group_id.clone())
+            .join()
+            .await
+            .unwrap();
+    }
+    Ok(end)
+}
+
+/// A step as in [`step`], without the wait for a group.
+async fn step_without_wait(
+    model: &MockCompletionModel,
+    spec: &RunSpec,
+    tools: &ResearchTools,
+    ask: Ask,
+    memo: &Memo,
+    state: &mut AgentState,
+    usage: &mut TokenUsage,
+) -> Result<TurnEnd, StepError> {
+    let mut definitions = investigate::definitions(tools.chunk_chars);
     if !matches!(ask, Ask::Off) {
         definitions.push(Arc::new(investigate::ask_user()));
     }
@@ -89,12 +124,20 @@ async fn step(
         spec,
         tools,
         definitions,
-        bound: investigate::bound,
         ask,
+        jobs: &tools.jobs,
+        group_options: RunOptions::default(),
+        run_id: &tools.run_id,
         memo,
         lease: &lease,
     };
     host.step(state, "query", usage).await
+}
+
+fn group(turn: usize) -> TurnEnd {
+    TurnEnd::Group {
+        group_id: turn_group_id(&RunId::new("run").unwrap(), turn).unwrap(),
+    }
 }
 
 /// The debug form of the request `index` that `model` received.
@@ -103,10 +146,10 @@ fn request(model: &MockCompletionModel, index: usize) -> String {
 }
 
 #[tokio::test]
-async fn a_step_makes_one_model_call_and_its_tool_calls() {
+async fn a_step_makes_one_model_call_and_submits_its_tool_calls_as_the_group_of_the_turn() {
     let model = MockCompletionModel::from_turns([search_call("call_1"), MockTurn::text("done")]);
     let search = Arc::new(CountingSearch::default());
-    let tools = tools(search.clone());
+    let (tools, _runner) = tools(search.clone()).await;
     let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
 
     let first = step(
@@ -119,7 +162,7 @@ async fn a_step_makes_one_model_call_and_its_tool_calls() {
         &mut usage,
     )
     .await;
-    assert_eq!(first.unwrap(), TurnEnd::Continue);
+    assert_eq!(first.unwrap(), group(1));
     assert_eq!(model.request_count(), 1);
     assert_eq!(search.0.load(Ordering::SeqCst), 1);
 
@@ -135,6 +178,7 @@ async fn a_step_makes_one_model_call_and_its_tool_calls() {
     .await;
     let output = "done".to_string();
     assert_eq!(second.unwrap(), TurnEnd::Done { output });
+    assert!(request(&model, 1).contains("fills the gap"));
     let roles: Vec<&str> = state
         .transcript
         .iter()
@@ -148,20 +192,20 @@ async fn a_step_makes_one_model_call_and_its_tool_calls() {
 }
 
 #[tokio::test]
-async fn a_redelivered_step_reuses_the_model_reply_and_the_tool_results() {
+async fn a_redelivered_step_reuses_the_model_reply_and_the_group() {
     let memo = step_memo(1);
     let model = MockCompletionModel::from_turns([
         search_call("call_1").with_usage(Usage::new().input_tokens(10))
     ]);
     let search = Arc::new(CountingSearch::default());
+    let (tools, _runner) = tools(search.clone()).await;
     let spec = spec(4);
     let mut first_state = AgentState::default();
     let mut first_usage = TokenUsage::default();
-    let tools_first = tools(search.clone());
     step(
         &model,
         &spec,
-        &tools_first,
+        &tools,
         Ask::Off,
         &memo,
         &mut first_state,
@@ -172,28 +216,26 @@ async fn a_redelivered_step_reuses_the_model_reply_and_the_tool_results() {
 
     // A model without a script fails each call, so the redelivery must reuse.
     let replay = MockCompletionModel::from_turns(Vec::<MockTurn>::new());
-    let replay_search = Arc::new(CountingSearch::default());
-    let replay_tools = tools(replay_search.clone());
     let (mut state, mut usage) = (AgentState::default(), TokenUsage::default());
     let end = step(
         &replay,
         &spec,
-        &replay_tools,
+        &tools,
         Ask::Off,
         &memo,
         &mut state,
         &mut usage,
     )
     .await;
-    assert_eq!(end.unwrap(), TurnEnd::Continue);
+    assert_eq!(end.unwrap(), group(1));
     assert_eq!(replay.request_count(), 0);
-    assert_eq!(replay_search.0.load(Ordering::SeqCst), 0);
+    assert_eq!(search.0.load(Ordering::SeqCst), 1);
     assert_eq!(state.transcript, first_state.transcript);
     assert_eq!(usage.input_tokens, 10);
 }
 
 #[tokio::test]
-async fn a_question_waits_after_the_other_calls_and_the_reply_resolves_it() {
+async fn a_question_waits_after_the_group_of_the_other_calls_and_the_reply_resolves_it() {
     let model = MockCompletionModel::from_turns([
         MockTurn::from_contents([
             call("call_1", "web_search", json!({ "query": "gaps" })),
@@ -202,10 +244,10 @@ async fn a_question_waits_after_the_other_calls_and_the_reply_resolves_it() {
         MockTurn::text("done"),
     ]);
     let search = Arc::new(CountingSearch::default());
-    let tools = tools(search.clone());
+    let (tools, _runner) = tools(search.clone()).await;
     let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
 
-    let asked = step(
+    let dispatched = step(
         &model,
         &spec,
         &tools,
@@ -215,8 +257,20 @@ async fn a_question_waits_after_the_other_calls_and_the_reply_resolves_it() {
         &mut usage,
     )
     .await;
+    assert_eq!(dispatched.unwrap(), group(1));
+    let asked = step(
+        &model,
+        &spec,
+        &tools,
+        Ask::Open,
+        &step_memo(2),
+        &mut state,
+        &mut usage,
+    )
+    .await;
     let question = "Which edition?".to_string();
     assert_eq!(asked.unwrap(), TurnEnd::Wait { question });
+    assert_eq!(model.request_count(), 1);
     assert_eq!(search.0.load(Ordering::SeqCst), 1);
 
     let reply = Ask::Replied("the 2024 edition".to_string());
@@ -225,14 +279,16 @@ async fn a_question_waits_after_the_other_calls_and_the_reply_resolves_it() {
         &spec,
         &tools,
         reply,
-        &step_memo(2),
+        &step_memo(3),
         &mut state,
         &mut usage,
     )
     .await;
     let output = "done".to_string();
     assert_eq!(after.unwrap(), TurnEnd::Done { output });
-    assert!(request(&model, 1).contains("the 2024 edition"));
+    let follow_up = request(&model, 1);
+    assert!(follow_up.contains("the 2024 edition"));
+    assert!(follow_up.contains("fills the gap"));
 }
 
 #[tokio::test]
@@ -242,7 +298,7 @@ async fn a_second_question_receives_a_skipped_result() {
         ask_call("call_2", "Which year?"),
         MockTurn::text("done"),
     ]);
-    let tools = tools(Arc::new(CountingSearch::default()));
+    let (tools, _runner) = tools(Arc::new(CountingSearch::default())).await;
     let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
     step(
         &model,
@@ -285,7 +341,7 @@ async fn a_second_question_receives_a_skipped_result() {
 #[tokio::test]
 async fn a_call_to_a_tool_without_a_definition_fails_the_step_permanently() {
     let model = MockCompletionModel::from_turns([ask_call("call_1", "Which edition?")]);
-    let tools = tools(Arc::new(CountingSearch::default()));
+    let (tools, _runner) = tools(Arc::new(CountingSearch::default())).await;
     let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
     let end = step(
         &model,
@@ -308,7 +364,7 @@ async fn a_failed_model_call_fails_the_step_transiently() {
         "overloaded",
         "request-1",
     )]);
-    let tools = tools(Arc::new(CountingSearch::default()));
+    let (tools, _runner) = tools(Arc::new(CountingSearch::default())).await;
     let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
     let memo = step_memo(1);
     let err = step(
@@ -343,7 +399,7 @@ async fn a_failed_model_call_fails_the_step_transiently() {
 #[tokio::test]
 async fn a_run_past_its_model_calls_ends_out_of_turns() {
     let model = MockCompletionModel::from_turns([search_call("call_1")]);
-    let tools = tools(Arc::new(CountingSearch::default()));
+    let (tools, _runner) = tools(Arc::new(CountingSearch::default())).await;
     let (spec, mut state, mut usage) = (spec(1), AgentState::default(), TokenUsage::default());
     step(
         &model,
@@ -370,9 +426,9 @@ async fn a_run_past_its_model_calls_ends_out_of_turns() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_tool_call_past_its_bound_returns_a_failed_result() {
+async fn a_tool_call_past_its_bound_fails_its_member() {
     let model = MockCompletionModel::from_turns([search_call("call_1"), MockTurn::text("done")]);
-    let tools = tools(Arc::new(StalledSearch));
+    let (tools, _runner) = tools(Arc::new(StalledSearch)).await;
     let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
     for number in 1..=2 {
         step(
@@ -394,6 +450,43 @@ async fn a_tool_call_past_its_bound_returns_a_failed_result() {
     );
 }
 
+#[tokio::test]
+async fn a_step_after_the_wait_cancels_the_active_members_of_the_group() {
+    let model = MockCompletionModel::from_turns([search_call("call_1"), MockTurn::text("done")]);
+    let (tools, _runner) = tools(Arc::new(StalledSearch)).await;
+    let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
+    let memo = step_memo(1);
+    let first = step_without_wait(
+        &model,
+        &spec,
+        &tools,
+        Ask::Off,
+        &memo,
+        &mut state,
+        &mut usage,
+    )
+    .await;
+    assert_eq!(first.unwrap(), group(1));
+
+    let end = step(
+        &model,
+        &spec,
+        &tools,
+        Ask::Off,
+        &step_memo(2),
+        &mut state,
+        &mut usage,
+    )
+    .await;
+    let output = "done".to_string();
+    assert_eq!(end.unwrap(), TurnEnd::Done { output });
+    let follow_up = request(&model, 1);
+    assert!(
+        follow_up.contains("the wait for the tool calls elapsed"),
+        "the model must read the cancellation: {follow_up}"
+    );
+}
+
 /// Replace the format of the serialized run of `state`, so the run does not
 /// decode.
 fn refuse_decode(state: &mut AgentState) {
@@ -404,7 +497,7 @@ fn refuse_decode(state: &mut AgentState) {
 #[tokio::test]
 async fn a_run_that_does_not_decode_continues_from_its_transcript() {
     let model = MockCompletionModel::from_turns([search_call("call_1"), MockTurn::text("done")]);
-    let tools = tools(Arc::new(CountingSearch::default()));
+    let (tools, _runner) = tools(Arc::new(CountingSearch::default())).await;
     let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
     step(
         &model,
@@ -444,7 +537,7 @@ async fn a_rebuild_during_a_wait_resolves_the_question_with_the_reply() {
         ask_call("call_1", "Which edition?"),
         MockTurn::text("done"),
     ]);
-    let tools = tools(Arc::new(CountingSearch::default()));
+    let (tools, _runner) = tools(Arc::new(CountingSearch::default())).await;
     let (spec, mut state, mut usage) = (spec(4), AgentState::default(), TokenUsage::default());
     step(
         &model,

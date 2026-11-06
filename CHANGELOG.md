@@ -110,6 +110,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** The fetching step submits its fetches as a job group and ends,
   so the run waits for them without a worker or a lease, and
   `ResearchStepRunner::with_queue` is removed. Remove the call.
+- **Breaking:** `spawn_fetch_runner` and `FETCH_QUEUE_NAME` become
+  `ResearchStepRunner::spawn_tool_runner` and `TOOL_QUEUE_NAME`, because the job
+  runner also runs the `web_search` calls of the investigating agent with the
+  search backend of the runner. Call `runner.spawn_tool_runner(&queue, &store)`
+  and pass the `JobRunner` to `with_job_runner`.
+- The tool calls of a reply of the investigating agent run concurrently as a job
+  group, and the step releases its worker and its lease until the last call
+  ends. A transient failure of `web_search` retries with the attempts of the
+  queue before the model reads it, and a deployment keeps its configuration.
 
 ### Fixed
 - The CLI keeps the workflow memos and the fetch job records of a `--store` URL

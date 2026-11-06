@@ -49,9 +49,9 @@ use taquba_research::workflow::{
     TerminatedRun, WorkflowRuntime, WorkflowView,
 };
 use taquba_research::{
-    FETCH_QUEUE_NAME, Record, ResearchConfig, ResearchStepRunner, RunRecord,
+    Record, ResearchConfig, ResearchStepRunner, RunRecord, TOOL_QUEUE_NAME,
     search::{SearchBackend, Tavily},
-    spawn_fetch_runner, summarize_state,
+    summarize_state,
 };
 use taquba_workflow::{CancelCommand, CommandState};
 use tokio::sync::oneshot;
@@ -600,7 +600,7 @@ async fn writer_is_live(reader: &QueueReader) -> Result<bool> {
 /// recent claim.
 async fn count_claimed_jobs(reader: &QueueReader) -> Result<usize> {
     let mut claimed = 0usize;
-    for queue in [WORKFLOW_QUEUE_NAME, FETCH_QUEUE_NAME] {
+    for queue in [WORKFLOW_QUEUE_NAME, TOOL_QUEUE_NAME] {
         claimed += reader
             .view()
             .list_jobs(queue, JobStatus::Claimed, None, 1)
@@ -731,8 +731,7 @@ async fn spawn_runtime(
     runner: ResearchStepRunner,
     interrupt: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(WorkflowRuntime<ResearchStepRunner>, WorkerHandles)> {
-    // Build the JobRunner the Fetching step submits FetchPage jobs to.
-    let (job_runner, job_handle) = spawn_fetch_runner(&queue, &store_ctx.object_store);
+    let (job_runner, job_handle) = runner.spawn_tool_runner(&queue, &store_ctx.object_store);
     let runner = runner
         .with_job_runner(job_runner)
         .with_report_store(store_ctx.object_store.clone(), &ObjectPath::default());
@@ -914,16 +913,17 @@ async fn close_queue(queue: Arc<Queue>) -> Result<()> {
 }
 
 /// Handles tied to a running `WorkflowRuntime` worker task and its paired
-/// fetch-job `JobRunner`.
+/// tool-job `JobRunner`.
 struct WorkerHandles {
     /// Spawned workflow worker task.
     worker: tokio::task::JoinHandle<taquba_workflow::Result<()>>,
     /// Sends a clean-shutdown signal so the workflow worker stops polling once
     /// the run is done (without waiting for Ctrl+C).
     shutdown_tx: oneshot::Sender<()>,
-    /// Handle to the fetch JobRunner's worker task. It must shut down only
-    /// after the workflow worker drains. The workflow step that submits a
-    /// FetchPage awaits it, so no fetch work remains then.
+    /// Handle to the tool JobRunner's worker task. It must shut down only after
+    /// the workflow worker drains, because a draining step can join a group of
+    /// tool jobs. A tool job left in the queue runs at the next `run` or
+    /// `resume`.
     job_handle: RunnerHandle,
 }
 
@@ -980,7 +980,7 @@ async fn finalize(
             }
         }
     };
-    // The workflow worker stopped (terminal or Ctrl+C). Drain the fetch
+    // The workflow worker stopped (terminal or Ctrl+C). Drain the tool
     // JobRunner so its task exits before this fn returns.
     let _ = job_handle.shutdown().await;
     result

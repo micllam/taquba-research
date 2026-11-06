@@ -102,22 +102,34 @@ pub(crate) fn records(messages: &[Message]) -> Vec<Record> {
 }
 
 fn recorded_result(result: &ToolResult) -> RecordedResult {
-    let text = result
-        .content
-        .iter()
+    RecordedResult {
+        id: result.call.wire().into_owned(),
+        name: result.name.as_str().to_string(),
+        text: text_of(result.content.iter()),
+        is_error: result.is_error,
+    }
+}
+
+/// The record of the result `result` of `call`.
+pub(crate) fn recorded(call: &RecordedCall, result: &rig_core::tool::ToolResult) -> RecordedResult {
+    RecordedResult {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        text: text_of(result.output().as_content().iter()),
+        is_error: result.is_error(),
+    }
+}
+
+/// The text that the model reads of `content`.
+fn text_of<'a>(content: impl Iterator<Item = &'a ToolResultContent>) -> String {
+    content
         .map(|content| match content {
             ToolResultContent::Text(text) => text.text.clone(),
             ToolResultContent::Json { value, .. } => value.to_string(),
             ToolResultContent::Image(_) => "[image]".to_string(),
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    RecordedResult {
-        id: result.call.wire().into_owned(),
-        name: result.name.as_str().to_string(),
-        text,
-        is_error: result.is_error,
-    }
+        .join("\n")
 }
 
 /// Remove the result of the call `id` from `records`, and a results record that

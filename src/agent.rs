@@ -14,7 +14,6 @@ use taquba_workflow::{RunId, RunOptions, RunSpec, TerminalStatus, WorkflowRuntim
 use tokio::sync::oneshot;
 
 use crate::Report;
-use crate::fetch_job::spawn_fetch_runner;
 use crate::runner::{
     Models, ResearchStepRunner, RunRecord, anthropic_models, ollama_models, openai_models,
 };
@@ -77,10 +76,9 @@ impl ResearchAgent {
             );
         }
 
-        // Build the JobRunner the Fetching step submits FetchPage jobs to. It
-        // shares the same Queue + ObjectStore as the workflow runtime,
-        // distinguished by queue_name.
-        let (job_runner, job_handle) = spawn_fetch_runner(&queue, &object_store);
+        // The JobRunner of the tool jobs shares the Queue and the ObjectStore
+        // of the workflow runtime, distinguished by queue_name.
+        let (job_runner, job_handle) = self.runner.spawn_tool_runner(&queue, &object_store);
         let runner = self
             .runner
             .clone()
@@ -163,9 +161,8 @@ impl ResearchAgent {
                 })
             }
         };
-        // Stop the JobRunner only after the workflow worker exits: the workflow
-        // step that submits a FetchPage awaits it, so at this point the job
-        // worker does not have a FetchPage in flight.
+        // Stop the JobRunner only after the workflow worker exits, because a
+        // draining step can join a group of tool jobs.
         let _ = job_handle.shutdown().await;
         let outcome = outcome?;
 

@@ -153,6 +153,39 @@ async fn a_reply_reaches_the_waiting_run_of_a_live_writer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_run_waits_for_the_group_of_a_tool_call_and_passes_its_result_to_the_model() {
+    let model = MockCompletionModel::from_turns([
+        MockTurn::text(json!({ "sub_questions": ["test sub-question"] }).to_string()),
+        MockTurn::tool_call("call_1", "web_search", json!({ "query": "test gap" })),
+        MockTurn::text(json!({ "findings": [] }).to_string()),
+        MockTurn::text("test synthesis"),
+        MockTurn::text("test report"),
+    ]);
+    let ctx = StoreCtx {
+        object_store: Arc::new(InMemory::new()),
+        source: "memory".to_string(),
+    };
+    let replies = model.clone();
+    let runner = ResearchStepRunner::new(move |_| replies.clone().into(), Arc::new(NoResults));
+    let cli = cli(&[QUERY]);
+    let run = tokio::spawn(async move {
+        cmd_run(
+            &cli,
+            &ctx,
+            runner,
+            QUERY.to_string(),
+            std::future::pending(),
+        )
+        .await
+    });
+
+    join(run).await;
+    assert_eq!(model.request_count(), 5);
+    let follow_up = format!("{:?}", model.requests()[2].chat_history);
+    assert!(follow_up.contains("is_error: false"), "{follow_up}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_reply_without_a_writer_takes_effect_at_resume() {
     let harness = Harness::start();
     let (interrupt, interrupted) = oneshot::channel::<()>();
